@@ -80,8 +80,8 @@ without affecting it.
   seconds. Lower the viscosity or raise the speed for livelier flow.
 - Fans are strongest when painted as short strips facing open space.
 - Erasing a wall mid-flow is fine — uncovered cells restart from rest.
-- Rotating the device rebuilds the grid for the new aspect ratio (your
-  drawing is cleared).
+- Rotating the device rebuilds the grid for the new aspect ratio; your
+  drawn geometry is resampled into it (the flow itself restarts).
 
 ## License
 

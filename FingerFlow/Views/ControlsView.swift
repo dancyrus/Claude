@@ -108,6 +108,9 @@ struct ToolbarView: View {
                 ForEach(Tool.allCases) { tool in
                     Button {
                         sim.tool = tool
+                        // Smoke is only visible in the Smoke view; switch
+                        // so the stroke gives immediate feedback.
+                        if tool == .dye { sim.renderMode = .dye }
                     } label: {
                         VStack(spacing: 3) {
                             Image(systemName: tool.icon)

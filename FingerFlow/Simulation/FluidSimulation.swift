@@ -127,7 +127,11 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
     private var metal: MetalState?
     private var grid: Grid?
     private var didLoadInitialScene = false
-    private var lastFanDir = SIMD2<Float>(0, -1) // default: blow "up" the screen
+    private var lastFanDir = SIMD2<Float>(0, -1)
+    private var strokeHasDirection = false
+    /// Most recently committed frame; CPU-side buffer writes wait on it so
+    /// they never race the GPU passes that read the same shared buffers.
+    private var inFlight: MTLCommandBuffer?
 
     private static let weights: [Float] = [
         4.0 / 9.0,
@@ -158,6 +162,14 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
 
     // MARK: - Grid lifecycle
 
+    /// Blocks until the last committed frame finishes so CPU writes to the
+    /// shared buffers cannot interleave with in-flight GPU passes. Frames
+    /// take ~1-2 ms, so this is imperceptible on user actions.
+    private func waitForGPU() {
+        inFlight?.waitUntilCompleted()
+        inFlight = nil
+    }
+
     private func rebuildGridIfNeeded(drawableSize: CGSize) {
         guard let ms = metal, drawableSize.width > 0, drawableSize.height > 0 else { return }
         let scale = Self.targetResolution / Double(min(drawableSize.width, drawableSize.height))
@@ -166,6 +178,13 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
         w = max(64, min(w, 640))
         h = max(64, min(h, 640))
         if let g = grid, abs(g.w - w) <= 4, abs(g.h - h) <= 4 { return }
+
+        waitForGPU()
+
+        // Strip tunnel edge cells from the old grid so they aren't
+        // resampled into the interior of the new one.
+        if grid != nil, windTunnel { applyWindTunnel(false) }
+        let old = grid
 
         let n = w * h
         guard
@@ -184,11 +203,36 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
                     cellType: cellType, fanDir: fanDir,
                     dyeA: dyeA, dyeB: dyeB, dyeSrc: dyeSrc)
         clearGeometry()
+        if let old, let new = grid {
+            resample(from: old, into: new)
+        }
         resetFlow()
         if windTunnel { applyWindTunnel(true) }
         if !didLoadInitialScene {
             didLoadInitialScene = true
             apply(preset: .cylinder)
+        }
+    }
+
+    /// Nearest-neighbour copy of the drawn scene (walls, fans, drains, dye
+    /// sources) into a freshly sized grid, so rotation doesn't wipe it.
+    private func resample(from old: Grid, into new: Grid) {
+        let oct = old.cellType.contents().bindMemory(to: UInt8.self, capacity: old.n)
+        let ofan = old.fanDir.contents().bindMemory(to: SIMD2<Float>.self, capacity: old.n)
+        let osrc = old.dyeSrc.contents().bindMemory(to: SIMD4<Float>.self, capacity: old.n)
+        let nct = cellTypePtr(new)
+        let nfan = fanDirPtr(new)
+        let nsrc = dyeSrcPtr(new)
+        for y in 0..<new.h {
+            let oy = min(old.h - 1, y * old.h / new.h)
+            for x in 0..<new.w {
+                let ox = min(old.w - 1, x * old.w / new.w)
+                let oi = oy * old.w + ox
+                let ni = y * new.w + x
+                nct[ni] = oct[oi]
+                nfan[ni] = ofan[oi]
+                nsrc[ni] = osrc[oi]
+            }
         }
     }
 
@@ -209,6 +253,7 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
     /// Reinitialise the flow to rest without touching the drawn geometry.
     func resetFlow() {
         guard let g = grid else { return }
+        waitForGPU()
         let n = g.n
         let fA = g.fA.contents().bindMemory(to: Float.self, capacity: 9 * n)
         let fB = g.fB.contents().bindMemory(to: Float.self, capacity: 9 * n)
@@ -246,6 +291,7 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
 
     /// Clear everything and start from a still, empty domain.
     func clearAll() {
+        waitForGPU()
         clearGeometry()
         resetFlow()
         if windTunnel { applyWindTunnel(true) }
@@ -257,6 +303,7 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
     /// seeded at the inlet.
     private func applyWindTunnel(_ enable: Bool) {
         guard let g = grid else { return }
+        waitForGPU()
         let ct = cellTypePtr(g)
         let fan = fanDirPtr(g)
         let src = dyeSrcPtr(g)
@@ -309,6 +356,7 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
 
     func apply(preset: Preset) {
         guard let g = grid else { return }
+        waitForGPU()
         clearGeometry()
         resetFlow()
         if !windTunnel {
@@ -396,10 +444,23 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
 
     // MARK: - Painting
 
+    /// Marks the start of a new finger stroke (resets the per-stroke fan
+    /// direction so a tap doesn't inherit an old stroke's direction).
+    func beginStroke() {
+        strokeHasDirection = false
+    }
+
+    /// Fan direction used for taps: along the wind tunnel's flow axis.
+    private var defaultFanDir: SIMD2<Float> {
+        guard let g = grid else { return SIMD2<Float>(0, -1) }
+        return g.h >= g.w ? SIMD2<Float>(0, -1) : SIMD2<Float>(1, 0)
+    }
+
     /// Paint a stroke segment. Points are in the MTKView's coordinate space
     /// (points, origin top-left); `viewSize` is the view's bounds size.
     func paint(from a: CGPoint, to b: CGPoint, in viewSize: CGSize) {
         guard let g = grid, viewSize.width > 0, viewSize.height > 0 else { return }
+        waitForGPU()
         let sx = CGFloat(g.w) / viewSize.width
         let sy = CGFloat(g.h) / viewSize.height
         let p0 = SIMD2<Float>(Float(a.x * sx), Float(a.y * sy))
@@ -407,9 +468,15 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
         let delta = p1 - p0
         let len = simd_length(delta)
 
-        // Fans blow along the stroke direction.
-        if tool == .fan, len > 1.0 {
-            lastFanDir = delta / len
+        // Fans blow along the stroke direction; a plain tap blows along
+        // the tunnel axis instead of inheriting an old stroke's direction.
+        if tool == .fan {
+            if len > 1.0 {
+                lastFanDir = delta / len
+                strokeHasDirection = true
+            } else if !strokeHasDirection {
+                lastFanDir = defaultFanDir
+            }
         }
 
         let r = Float(max(1.5, brushRadius))
@@ -454,10 +521,14 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
                         src[i] = SIMD4<Float>(rgb.x, rgb.y, rgb.z, 1.0)
                     }
                 case .eraser:
+                    // Only reinitialise cells that were solid or boundary;
+                    // erasing over open fluid must not punch a still hole
+                    // into the flow.
+                    let wasFluid = ct[i] == UInt8(CELL_FLUID)
                     ct[i] = UInt8(CELL_FLUID)
                     fan[i] = .zero
                     src[i] = .zero
-                    resetCell(i, grid: g)
+                    if !wasFluid { resetCell(i, grid: g) }
                 }
             }
         }
@@ -473,6 +544,10 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
             fA[k * n + i] = Self.weights[k]
             fB[k * n + i] = Self.weights[k]
         }
+        // Keep the derived fields consistent even while paused (they are
+        // otherwise only rewritten by the collide kernel).
+        g.vel.contents().bindMemory(to: SIMD2<Float>.self, capacity: n)[i] = .zero
+        g.rho.contents().bindMemory(to: Float.self, capacity: n)[i] = 1
     }
 
     private var dyeRGB: SIMD3<Float> {
@@ -521,8 +596,7 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
             inletSpeed: Float(flowSpeed),
             dyeDt: Float(steps),
             dyeDecay: isPaused ? 1.0 : Float(dyeFade),
-            renderMode: renderMode.rawValue,
-            gridScale: Float(g.w) / Float(max(drawable.texture.width, 1))
+            renderMode: renderMode.rawValue
         )
 
         // LBM steps (ping-pong the distribution buffers).
@@ -572,6 +646,7 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
 
         cmd.present(drawable)
         cmd.commit()
+        inFlight = cmd
         grid = g // persist the ping-pong swaps
     }
 

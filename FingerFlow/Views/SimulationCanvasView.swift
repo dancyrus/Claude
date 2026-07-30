@@ -32,26 +32,47 @@ struct SimulationCanvasView: UIViewRepresentable {
 final class TouchMTKView: MTKView {
     weak var sim: FluidSimulation?
     private var lastPoint: CGPoint?
+    /// Fan strokes defer their first stamp until the drag direction is
+    /// known, so the whole stroke blows the way the finger moved.
+    private var pendingFanStart: CGPoint?
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
         let p = touch.location(in: self)
-        sim?.paint(from: p, to: p, in: bounds.size)
+        sim?.beginStroke()
+        if sim?.tool == .fan {
+            pendingFanStart = p
+        } else {
+            sim?.paint(from: p, to: p, in: bounds.size)
+        }
         lastPoint = p
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
         let p = touch.location(in: self)
-        sim?.paint(from: lastPoint ?? p, to: p, in: bounds.size)
+        if let start = pendingFanStart {
+            // Wait for a clear direction before stamping the fan stroke.
+            guard hypot(p.x - start.x, p.y - start.y) >= 8 else { return }
+            pendingFanStart = nil
+            sim?.paint(from: start, to: p, in: bounds.size)
+        } else {
+            sim?.paint(from: lastPoint ?? p, to: p, in: bounds.size)
+        }
         lastPoint = p
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let start = pendingFanStart {
+            // A tap: stamp with the tunnel-aligned default direction.
+            pendingFanStart = nil
+            sim?.paint(from: start, to: start, in: bounds.size)
+        }
         lastPoint = nil
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        pendingFanStart = nil
         lastPoint = nil
     }
 }

@@ -30,7 +30,6 @@ typedef struct {
     float dyeDt;        // lattice time advanced this frame (dye advection)
     float dyeDecay;     // per-frame dye retention multiplier
     int   renderMode;   // RENDER_* constant
-    float gridScale;    // grid cells per output-texture pixel
 } SimParams;
 
 #endif /* SimTypes_h */

@@ -185,7 +185,17 @@ kernel void advectDye(
     }
 
     const float2 pos = float2(gid) + 0.5f - velocity[idx] * P.dyeDt;
-    float4 d = sampleDye(dyeIn, pos, W, H) * P.dyeDecay;
+
+    // Don't pull dye through a solid: if the backtraced point lands inside
+    // a wall cell, keep the local dye instead of sampling across it.
+    const int bx = clamp(int(floor(pos.x)), 0, W - 1);
+    const int by = clamp(int(floor(pos.y)), 0, H - 1);
+    float4 d;
+    if (cellType[by * W + bx] == CELL_WALL) {
+        d = dyeIn[idx] * P.dyeDecay;
+    } else {
+        d = sampleDye(dyeIn, pos, W, H) * P.dyeDecay;
+    }
 
     const float4 src = dyeSrc[idx];
     if (src.a > 0.0f) {
@@ -233,7 +243,11 @@ kernel void renderField(
 
     const int W = P.width;
     const int H = P.height;
-    const float2 g = (float2(gid) + 0.5f) * P.gridScale;
+    // Per-axis pixel-to-grid mapping so display stays aligned with painting
+    // even when grid and drawable aspect ratios drift slightly.
+    const float2 scale = float2(float(W) / float(outTex.get_width()),
+                                float(H) / float(outTex.get_height()));
+    const float2 g = (float2(gid) + 0.5f) * scale;
     const int cx = clamp(int(g.x), 0, W - 1);
     const int cy = clamp(int(g.y), 0, H - 1);
     const int idx = cy * W + cx;
