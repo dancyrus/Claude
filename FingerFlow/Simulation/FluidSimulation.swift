@@ -181,11 +181,6 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
 
         waitForGPU()
 
-        // Strip tunnel edge cells from the old grid so they aren't
-        // resampled into the interior of the new one.
-        if grid != nil, windTunnel { applyWindTunnel(false) }
-        let old = grid
-
         let n = w * h
         guard
             let fA = ms.device.makeBuffer(length: 9 * n * MemoryLayout<Float>.stride, options: .storageModeShared),
@@ -198,6 +193,13 @@ final class FluidSimulation: NSObject, ObservableObject, MTKViewDelegate {
             let dyeB = ms.device.makeBuffer(length: n * MemoryLayout<SIMD4<Float>>.stride, options: .storageModeShared),
             let dyeSrc = ms.device.makeBuffer(length: n * MemoryLayout<SIMD4<Float>>.stride, options: .storageModeShared)
         else { return }
+
+        // Allocation succeeded — only now mutate the old grid: strip its
+        // tunnel edge cells so they aren't resampled into the interior of
+        // the new one. (Mutating before the guard would leave a live grid
+        // missing its tunnel if an allocation failed.)
+        if grid != nil, windTunnel { applyWindTunnel(false) }
+        let old = grid
 
         grid = Grid(w: w, h: h, fA: fA, fB: fB, vel: vel, rho: rho,
                     cellType: cellType, fanDir: fanDir,
