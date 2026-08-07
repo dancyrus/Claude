@@ -96,13 +96,16 @@ pub fn generate_airfoil(p: &AirfoilParams) -> GeoRegion {
     let (sin_a, cos_a) = alpha.sin_cos();
     for y in 0..h {
         for x in 0..w {
-            // Cell centre relative to the pivot in stamp coords.
-            let dx = x as f32 + 0.5 - (cx - (0.5 - pivot) * chord) - pivot * chord;
+            // Cell centre relative to the quarter-chord pivot, which sits
+            // a quarter chord left of the stamp centre so the chord ends
+            // up centred at cx.
+            let dx = x as f32 + 0.5 - (cx - (0.5 - pivot) * chord);
             let dy = y as f32 + 0.5 - cy;
-            // Un-rotate by -AoA (positive AoA pitches the nose up, i.e.
-            // rotates the airfoil clockwise on a y-down grid).
-            let xr = dx * cos_a - dy * sin_a + pivot * chord;
-            let yr = dx * sin_a + dy * cos_a;
+            // Sample through R(-alpha): positive AoA pitches the nose up
+            // (trailing edge down) for flow moving in +x on a y-down grid,
+            // matching the Selection tool's rotation convention.
+            let xr = dx * cos_a + dy * sin_a + pivot * chord;
+            let yr = -dx * sin_a + dy * cos_a;
             let xn = xr / chord;
             if !(0.0..=1.0).contains(&xn) {
                 continue;
@@ -223,7 +226,8 @@ pub fn generate_nozzle(p: &NozzleParams) -> GeoRegion {
     let chamber_len = (rc * 1.2).max(p.throat_cells);
 
     let total_len = chamber_len + conv_len + div_len;
-    let w = total_len.ceil() as usize + 4;
+    let back_wall = p.wall_cells.ceil();
+    let w = (total_len + back_wall).ceil() as usize + 4;
     let h = (2.0 * (rmax + p.wall_cells)).ceil() as usize + 4;
     let cy = h as f32 * 0.5;
 
@@ -231,30 +235,45 @@ pub fn generate_nozzle(p: &NozzleParams) -> GeoRegion {
     let mut fan = vec![[0.0f32; 2]; w * h];
     let mut dye_src = vec![[0.0f32; 4]; w * h];
 
+    // Inner half-width at any axial position (clamped into the nozzle).
+    let half_at = |ax: f32| -> f32 {
+        let ax = ax.clamp(0.0, total_len);
+        if ax < chamber_len {
+            rc
+        } else {
+            nozzle_half_width(p, conv_len, div_len, ax - chamber_len)
+        }
+    };
+
     for y in 0..h {
         for x in 0..w {
-            let ax = x as f32 + 0.5 - 2.0; // axial position, chamber wall at 0
+            // Axial position: the chamber's back wall spans [-wall, 0).
+            let ax = x as f32 + 0.5 - 2.0 - back_wall;
             let ay = (y as f32 + 0.5 - cy).abs();
             let i = y * w + x;
 
-            if ax < -1.0 || ax > chamber_len + conv_len + div_len {
+            if ax < -back_wall || ax > total_len {
                 continue;
             }
-            // Back wall of the chamber (flow enters through the fan).
+            // Back wall of the chamber, as thick as the side walls (flow
+            // enters through the fan strip).
             if ax < 0.0 {
                 if ay <= rc + p.wall_cells {
                     cell[i] = CELL_WALL;
                 }
                 continue;
             }
-            let half = if ax < chamber_len {
-                rc
-            } else {
-                nozzle_half_width(p, conv_len, div_len, ax - chamber_len)
-            };
-            if ay > half && ay <= half + p.wall_cells {
+            // Watertight wall band: use the neighbouring columns' contour
+            // too, so steep bell sections can't step past the wall
+            // thickness and leave diagonal holes.
+            let h0 = half_at(ax - 1.0);
+            let h1 = half_at(ax);
+            let h2 = half_at(ax + 1.0);
+            let hmin = h0.min(h1).min(h2);
+            let hmax = h0.max(h1).max(h2);
+            if ay > hmin && ay <= hmax + p.wall_cells {
                 cell[i] = CELL_WALL;
-            } else if ay <= half && p.chamber_fan && ax < 3.0 {
+            } else if ay <= h1 && p.chamber_fan && ax < 3.0 {
                 // Fan strip across the chamber entrance, blowing +x, with
                 // a little smoke so the plume is visible immediately.
                 cell[i] = CELL_INLET;

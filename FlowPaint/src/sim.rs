@@ -127,6 +127,11 @@ struct PartParamsRaw {
     frame: u32,
     dt: f32,
     _pad0: f32,
+    // Respawn window (full-grid cells): the visible area plus an
+    // upstream band, so tracer density on screen doesn't drop as the
+    // off-screen margin grows.
+    spawn_min: [u32; 2],
+    spawn_max: [u32; 2],
     _pad1: f32,
     _pad2: f32,
 }
@@ -858,7 +863,7 @@ impl GpuSim {
 
     /// Stroke snapshots can capture tunnel edge cells; after restoring one,
     /// re-assert the tunnel so the boundary matches the toggle.
-    fn reassert_tunnel(&mut self) {
+    pub fn reassert_tunnel(&mut self) {
         if self.settings.wind_tunnel {
             self.geo.apply_wind_tunnel(true);
         }
@@ -930,6 +935,9 @@ impl GpuSim {
         self.queue.write_buffer(&self.sim_uniform, 0, bytemuck::bytes_of(&params));
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
+        // Spawn tracers over the visible window plus an upstream band a
+        // quarter of the visible width deep (bounded by the margin).
+        let band = self.margin.min(self.vis_w / 4);
         let part_params = PartParamsRaw {
             width: w as u32,
             height: h as u32,
@@ -937,6 +945,11 @@ impl GpuSim {
             frame: self.frame_counter,
             dt: steps as f32,
             _pad0: 0.0,
+            spawn_min: [(self.margin - band) as u32, self.margin as u32],
+            spawn_max: [
+                (self.margin + self.vis_w) as u32,
+                (self.margin + self.vis_h) as u32,
+            ],
             _pad1: 0.0,
             _pad2: 0.0,
         };
@@ -1187,7 +1200,10 @@ impl GpuSim {
         {
             return Err("corrupt scene file".into());
         }
-        let mut loaded = Geometry {
+        // Scene files never contain tunnel cells (save_scene stores the
+        // visible window and strips edges in the margin-zero case), so
+        // the content is used as-is; the tunnel is re-applied below.
+        let loaded = Geometry {
             w: sw,
             h: sh,
             cell: scene.cell,
@@ -1195,12 +1211,6 @@ impl GpuSim {
             dye_src: scene.dye_src,
             dirty: None,
         };
-        // Old files (or margin-zero saves from other builds) may carry
-        // tunnel edges inside the content; strip them so they aren't
-        // smeared into ghost columns. The tunnel is re-applied below.
-        if scene.wind_tunnel {
-            loaded.apply_wind_tunnel(false);
-        }
         // Resample into the visible window of the current grid.
         let mut tmp = Geometry::new(self.vis_w, self.vis_h);
         tmp.resample_from(&loaded);

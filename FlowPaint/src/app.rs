@@ -291,13 +291,13 @@ impl eframe::App for FlowPaintApp {
             }
         };
 
+        self.keyboard(ctx, &mut cmds);
         // A selection only lives under the Select tool; switching away
-        // commits it.
+        // commits it. This runs AFTER keyboard() so a same-frame tool
+        // hotkey still gets the commit queued before any canvas commands.
         if self.selection.is_some() && self.tool != Tool::Select {
             cmds.push(Cmd::SelectCommit);
         }
-
-        self.keyboard(ctx, &mut cmds);
         self.menu_bar(ctx, &mut cmds);
         self.side_panel(ctx, snapshot, &mut cmds);
         self.status_bar(ctx);
@@ -495,11 +495,18 @@ fn start_selection(sim: &mut GpuSim, app: &mut FlowPaintApp, source: GeoRegion, 
     selection_update(sim, app);
 }
 
+/// Largest raster (in cells) `bake_selection` will produce.
+const MAX_BAKE_CELLS: usize = 16 << 20;
+
 /// Bake the selection's current transform into a flat raster (for copy).
-fn bake_selection(sel: &Selection) -> GeoRegion {
+/// Returns None when the transformed footprint is unreasonably large.
+fn bake_selection(sel: &Selection) -> Option<GeoRegion> {
     let (ex, ey) = sel.half_extents();
     let bw = (2.0 * ex).ceil() as usize + 2;
     let bh = (2.0 * ey).ceil() as usize + 2;
+    if bw.saturating_mul(bh) > MAX_BAKE_CELLS {
+        return None;
+    }
     let src_w = (sel.source.rect.2 - sel.source.rect.0) as usize;
     let mut out = GeoRegion {
         rect: (0, 0, bw as i32, bh as i32),
@@ -536,7 +543,7 @@ fn bake_selection(sel: &Selection) -> GeoRegion {
             }
         }
     }
-    out
+    Some(out)
 }
 
 fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
@@ -544,19 +551,32 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::TogglePause => sim.settings.paused = !sim.settings.paused,
         Cmd::ResetFlow => sim.reset_flow(),
         Cmd::ClearAll => {
+            commit_selection(sim, app);
             clear_stroke_state(app);
             sim.clear_all();
         }
-        Cmd::SetWindTunnel(on) => sim.set_wind_tunnel(on),
+        Cmd::SetWindTunnel(on) => {
+            // Resolve the selection first so its session snapshots can't
+            // resurrect stale tunnel cells later.
+            commit_selection(sim, app);
+            sim.set_wind_tunnel(on);
+        }
         Cmd::Preset(p) => {
+            commit_selection(sim, app);
             clear_stroke_state(app);
             sim.apply_preset(p);
         }
         Cmd::SetResolution(i) => {
+            // Commit (not abandon) the selection: set_resolution may
+            // no-op (same size clicked) or the rebuild may clamp to the
+            // same grid, and an abandoned session would leave the stamp
+            // baked with no undo entry.
+            commit_selection(sim, app);
             clear_stroke_state(app);
             sim.set_resolution(i);
         }
         Cmd::SetMargin(i) => {
+            commit_selection(sim, app);
             clear_stroke_state(app);
             sim.set_margin_frac(MARGIN_CHOICES[i].1);
         }
@@ -572,8 +592,17 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::SetParticleSize(v) => sim.settings.particle_size = v,
         Cmd::SetParticleBrightness(v) => sim.settings.particle_brightness = v,
         Cmd::SetSpongeStrength(v) => sim.settings.sponge_strength = v,
-        Cmd::Undo => sim.undo_action(),
-        Cmd::Redo => sim.redo_action(),
+        Cmd::Undo => {
+            // A floating selection must be resolved first: undoing under
+            // it would desynchronize its background snapshot and session
+            // tiles from the grid.
+            commit_selection(sim, app);
+            sim.undo_action();
+        }
+        Cmd::Redo => {
+            commit_selection(sim, app);
+            sim.redo_action();
+        }
         Cmd::SaveScene(p) => {
             app.status = match sim.save_scene(&p) {
                 Ok(()) => format!("Saved {}", p.display()),
@@ -581,6 +610,7 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             };
         }
         Cmd::LoadScene(p) => {
+            commit_selection(sim, app);
             clear_stroke_state(app);
             app.status = match sim.load_scene(&p) {
                 Ok(()) => format!("Loaded {}", p.display()),
@@ -653,12 +683,15 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::SelectCut { a, b } => {
             commit_selection(sim, app);
             let m = sim.margin() as f32;
+            // Clamp the marquee to the visible window: at margin 0 this
+            // keeps the wind tunnel's edge columns out of the cut.
             let rect = GridRect {
                 x0: (a[0].min(b[0]) + m).floor() as i32,
                 y0: (a[1].min(b[1]) + m).floor() as i32,
                 x1: (a[0].max(b[0]) + m).ceil() as i32,
                 y1: (a[1].max(b[1]) + m).ceil() as i32,
             }
+            .intersect(sim.vis_rect())
             .clampped(sim.geo.w, sim.geo.h);
             if rect.is_empty() {
                 return;
@@ -708,6 +741,9 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
                 }
                 app.selection_bg = None;
                 app.pending_stroke_rect = GridRect::empty();
+                // Snapshots can contain tunnel edge cells; keep the
+                // boundary consistent with the toggle.
+                sim.reassert_tunnel();
             }
         }
         Cmd::SelectDelete => {
@@ -716,12 +752,21 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
                     sim.geo.restore(&bg);
                 }
                 push_stroke_undo(sim, app); // the cut area stays cleared
+                sim.reassert_tunnel();
             }
         }
         Cmd::CopySelection => {
             if let Some(sel) = app.selection.as_ref() {
-                app.clipboard = Some(bake_selection(sel));
-                app.status = "Selection copied.".into();
+                match bake_selection(sel) {
+                    Some(baked) => {
+                        app.clipboard = Some(baked);
+                        app.status = "Selection copied.".into();
+                    }
+                    None => {
+                        app.status =
+                            "Selection too large to copy — reduce its scale first.".into();
+                    }
+                }
             }
         }
         Cmd::PasteClipboard => {
@@ -738,11 +783,12 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
                 "Inserted — drag to place, rotate/scale in the panel, Enter to apply.".into();
         }
         Cmd::SetMapping(m) => {
-            // Refit against the sim's authoritative grid size: on a
+            // Refit against the sim's authoritative VISIBLE size: on a
             // resolution-switch frame the UI computed this mapping from
-            // last frame's dimensions.
-            sim.mapping =
-                ViewportMapping::fit(m.vp_origin, m.vp_size, sim.geo.w, sim.geo.h);
+            // last frame's dimensions. (The letterbox maps the visible
+            // window, never the full margin-inclusive grid.)
+            let (vw, vh) = sim.grid_size();
+            sim.mapping = ViewportMapping::fit(m.vp_origin, m.vp_size, vw, vh);
             sim.write_render_uniform();
         }
     }
@@ -838,7 +884,11 @@ impl FlowPaintApp {
                 }
             });
         }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+        // Paste only when no stroke is in flight: starting a selection
+        // session mid-drag would conflate the two undo sessions.
+        if self.drag.is_none()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
+        {
             cmds.push(Cmd::PasteClipboard);
         }
         let dragging = self.drag.is_some();
@@ -1354,6 +1404,11 @@ impl FlowPaintApp {
                         sel_move: hit,
                     });
                 } else {
+                    // Belt and braces: a painting drag must never start
+                    // over an unresolved selection session.
+                    if self.selection.is_some() {
+                        cmds.push(Cmd::SelectCommit);
+                    }
                     let freehand = matches!(self.tool, Tool::Brush | Tool::Eraser);
                     // Fan brush strokes wait for a direction before stamping.
                     let fan_deferred = freehand
@@ -1631,12 +1686,14 @@ impl FlowPaintApp {
                     egui::Slider::new(&mut p.chord_cells, 60.0..=600.0)
                         .text("chord (cells)"),
                 );
+                let pos_digit = if p.camber > 0.0 {
+                    (p.camber_pos / 10.0).round()
+                } else {
+                    0.0 // symmetric airfoils are NACA 00xx
+                };
                 ui.label(format!(
                     "≈ NACA {:.0}{:.0}{:02.0} at {:.1}°",
-                    p.camber,
-                    (p.camber_pos / 10.0).round(),
-                    p.thickness,
-                    p.aoa_deg
+                    p.camber, pos_digit, p.thickness, p.aoa_deg
                 ));
                 ui.add_space(6.0);
                 if ui.button("Insert into scene").clicked() {

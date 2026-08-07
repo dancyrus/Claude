@@ -13,6 +13,8 @@ struct PartParams {
     frame: u32,   // frame counter, salts the respawn hash
     dt: f32,      // lattice steps advanced this frame
     _pad0: f32,
+    spawn_min: vec2u, // respawn window (visible area + upstream band)
+    spawn_max: vec2u,
     _pad1: f32,
     _pad2: f32,
 };
@@ -71,8 +73,9 @@ fn update(@builtin(global_invocation_id) gid: vec3u) {
 
     if (respawn) {
         let s = i * 0x9E3779B9u + PP.frame * 0x85EBCA6Bu;
-        p.x = rand01(s) * f32(W);
-        p.y = rand01(s ^ 0xB5297A4Du) * f32(H);
+        let span = vec2f(PP.spawn_max - PP.spawn_min);
+        p.x = f32(PP.spawn_min.x) + rand01(s) * span.x;
+        p.y = f32(PP.spawn_min.y) + rand01(s ^ 0xB5297A4Du) * span.y;
         p.z = 0.0;
         p.w = 200.0 + 600.0 * rand01(s ^ 0x68E31DA4u);
     } else {

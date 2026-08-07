@@ -51,6 +51,14 @@ impl GridRect {
             y1: self.y1.max(o.y1),
         }
     }
+    pub fn intersect(&self, o: GridRect) -> GridRect {
+        GridRect {
+            x0: self.x0.max(o.x0),
+            y0: self.y0.max(o.y0),
+            x1: self.x1.min(o.x1),
+            y1: self.y1.min(o.y1),
+        }
+    }
     pub fn clampped(&self, w: usize, h: usize) -> GridRect {
         GridRect {
             x0: self.x0.max(0),
