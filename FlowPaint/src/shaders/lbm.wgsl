@@ -11,6 +11,9 @@ struct SimParams {
     inlet_speed: f32,  // lattice speed at fan/inlet cells
     dye_dt: f32,       // lattice time advanced this frame (dye advection)
     dye_decay: f32,    // per-frame dye retention
+    sponge_width: f32,    // absorbing-layer thickness in cells (0 = off)
+    sponge_strength: f32, // absorbing-layer blend strength
+    free_u: vec2f,        // freestream velocity the sponge relaxes toward
     _pad0: f32,
     _pad1: f32,
 };
@@ -132,10 +135,31 @@ fn collide(@builtin(global_invocation_id) gid: vec3u) {
     let sp = length(u);
     if (sp > MAX_LATTICE_SPEED) { u *= MAX_LATTICE_SPEED / sp; }
 
+    // Absorbing sponge layer near the domain edges: blend post-collision
+    // populations toward the freestream equilibrium with a quadratic ramp,
+    // so outgoing pressure waves die instead of reflecting back into the
+    // visible region.
+    var sponge = 0.0;
+    if (P.sponge_width > 0.5) {
+        let dedge = f32(min(
+            min(gid.x, W - 1u - gid.x),
+            min(gid.y, H - 1u - gid.y),
+        ));
+        if (dedge < P.sponge_width) {
+            let t = 1.0 - dedge / P.sponge_width;
+            sponge = P.sponge_strength * t * t;
+        }
+    }
+    let free_usq = dot(P.free_u, P.free_u);
+
     let usq = dot(u, u);
     for (var i = 0u; i < 9u; i++) {
         let fe = equilibrium(i, rho, u, usq);
-        f_out[i * n + idx] = f[i] + P.omega * (fe - f[i]);
+        var fnew = f[i] + P.omega * (fe - f[i]);
+        if (sponge > 0.0) {
+            fnew = mix(fnew, equilibrium(i, 1.0, P.free_u, free_usq), sponge);
+        }
+        f_out[i * n + idx] = fnew;
     }
     velocity[idx] = u;
     density[idx] = rho;

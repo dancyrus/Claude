@@ -3,15 +3,28 @@
 //! `CallbackResources`; the app mutates it during `update`, and the paint
 //! callback encodes the compute + render work each frame.
 
-use crate::geometry::{Geometry, UndoStack};
+use crate::geometry::{Geometry, GridRect, UndoStack};
 use std::sync::{mpsc, Arc};
 
+/// Visible-canvas resolutions; the simulated grid is larger by the margin.
 pub const RESOLUTIONS: [(&str, usize, usize); 4] = [
     ("Low (960 x 480)", 960, 480),
     ("Medium (1440 x 720)", 1440, 720),
     ("High (1920 x 960)", 1920, 960),
     ("Ultra (2560 x 1280)", 2560, 1280),
 ];
+
+/// Off-screen simulation margin around the visible canvas, as a fraction
+/// of the visible height added on EACH side. A larger margin pushes the
+/// domain boundaries (and their artifacts) away from what you see; the
+/// outermost cells also get an absorbing sponge layer.
+pub const MARGIN_CHOICES: [(&str, f32); 4] = [
+    ("None", 0.0),
+    ("Small (+25 %)", 0.25),
+    ("Medium (+50 %)", 0.5),
+    ("Large (+100 %)", 1.0),
+];
+pub const DEFAULT_MARGIN_INDEX: usize = 2;
 
 pub const PARTICLE_CHOICES: [(&str, u32); 5] = [
     ("Off", 0),
@@ -54,6 +67,16 @@ pub struct Settings {
     pub render_mode: RenderMode,
     pub particle_count: u32,
     pub boundary_tints: bool,
+    /// Gain on the speed/vorticity/pressure color mapping.
+    pub display_gain: f32,
+    /// Gain on smoke brightness in the Smoke view.
+    pub smoke_gain: f32,
+    /// Particle quad half-size in framebuffer pixels.
+    pub particle_size: f32,
+    /// Peak particle alpha.
+    pub particle_brightness: f32,
+    /// Absorbing-layer blend strength at the domain edge.
+    pub sponge_strength: f32,
 }
 
 impl Default for Settings {
@@ -66,8 +89,13 @@ impl Default for Settings {
             steps_per_frame: 8,
             dye_fade: 0.995,
             render_mode: RenderMode::Dye,
-            particle_count: 500_000,
+            particle_count: 0, // tracers are opt-in
             boundary_tints: true,
+            display_gain: 1.0,
+            smoke_gain: 1.0,
+            particle_size: 1.6,
+            particle_brightness: 0.3,
+            sponge_strength: 0.08,
         }
     }
 }
@@ -83,6 +111,9 @@ struct SimParamsRaw {
     inlet_speed: f32,
     dye_dt: f32,
     dye_decay: f32,
+    sponge_width: f32,
+    sponge_strength: f32,
+    free_u: [f32; 2],
     _pad0: f32,
     _pad1: f32,
 }
@@ -112,6 +143,12 @@ struct RenderParamsRaw {
     lb_origin: [f32; 2],
     px_per_cell: f32,
     inlet_speed: f32,
+    vis_origin: [u32; 2],
+    vis_size: [u32; 2],
+    display_gain: f32,
+    smoke_gain: f32,
+    particle_size: f32,
+    particle_brightness: f32,
 }
 
 /// Per-frame viewport mapping computed by the app from the canvas rect.
@@ -197,6 +234,11 @@ pub struct GpuSim {
     bufs: GridBuffers,
 
     pub geo: Geometry,
+    /// Visible-canvas size in cells; the full grid is vis + 2 * margin.
+    vis_w: usize,
+    vis_h: usize,
+    margin: usize,
+    margin_frac: f32,
     pub undo: UndoStack,
     pub settings: Settings,
     pub mapping: ViewportMapping,
@@ -206,6 +248,36 @@ pub struct GpuSim {
     pending_clear_dye: bool,
     /// Steps actually encoded last frame (for stats/particle dt).
     pub steps_last_frame: u32,
+}
+
+/// Margin size in cells for a visible size and margin fraction, clamped so
+/// the largest storage buffer (an f distribution buffer) stays within the
+/// device's binding limits.
+fn margin_cells(device: &wgpu::Device, vis_w: usize, vis_h: usize, frac: f32) -> usize {
+    let mut margin = (vis_h as f32 * frac).round().max(0.0) as usize;
+    let limits = device.limits();
+    let cap = (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+    loop {
+        let w = (vis_w + 2 * margin) as u64;
+        let h = (vis_h + 2 * margin) as u64;
+        if w * h * 9 * 4 <= cap || margin == 0 {
+            break;
+        }
+        margin = margin.saturating_sub(32);
+    }
+    margin
+}
+
+fn geometry_from_region(r: &crate::geometry::GeoRegion) -> Geometry {
+    let (x0, y0, x1, y1) = r.rect;
+    Geometry {
+        w: (x1 - x0).max(0) as usize,
+        h: (y1 - y0).max(0) as usize,
+        cell: r.cell.clone(),
+        fan: r.fan.clone(),
+        dye_src: r.dye_src.clone(),
+        dirty: None,
+    }
 }
 
 fn storage_entry(binding: u32, read_only: bool, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -241,7 +313,14 @@ impl GpuSim {
         target_format: wgpu::TextureFormat,
         res_index: usize,
     ) -> Self {
-        let (_, w, h) = RESOLUTIONS[res_index];
+        let (_, vis_w, vis_h) = RESOLUTIONS[res_index];
+        let margin = margin_cells(
+            &device,
+            vis_w,
+            vis_h,
+            MARGIN_CHOICES[DEFAULT_MARGIN_INDEX].1,
+        );
+        let (w, h) = (vis_w + 2 * margin, vis_h + 2 * margin);
 
         let lbm_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("lbm"),
@@ -489,6 +568,10 @@ impl GpuSim {
             particle_bind_group1,
             bufs,
             geo,
+            vis_w,
+            vis_h,
+            margin,
+            margin_frac: MARGIN_CHOICES[DEFAULT_MARGIN_INDEX].1,
             undo: UndoStack::default(),
             settings: Settings::default(),
             mapping: ViewportMapping::default(),
@@ -498,7 +581,8 @@ impl GpuSim {
             steps_last_frame: 0,
         };
         sim.geo.apply_wind_tunnel(true);
-        sim.geo.stamp_preset(crate::geometry::Preset::Cylinder);
+        let vis = sim.vis_rect();
+        sim.geo.stamp_preset(crate::geometry::Preset::Cylinder, vis);
         sim
     }
 
@@ -621,8 +705,28 @@ impl GpuSim {
 
     // --- Public control ----------------------------------------------
 
+    /// Visible-canvas size in cells (what painting and rendering map to).
     pub fn grid_size(&self) -> (usize, usize) {
+        (self.vis_w, self.vis_h)
+    }
+
+    /// Full simulated size including the off-screen margin.
+    pub fn full_size(&self) -> (usize, usize) {
         (self.geo.w, self.geo.h)
+    }
+
+    pub fn margin(&self) -> usize {
+        self.margin
+    }
+
+    /// The visible window inside the full grid.
+    pub fn vis_rect(&self) -> GridRect {
+        GridRect {
+            x0: self.margin as i32,
+            y0: self.margin as i32,
+            x1: (self.margin + self.vis_w) as i32,
+            y1: (self.margin + self.vis_h) as i32,
+        }
     }
 
     /// Queue a full flow reset (populations to rest, dye cleared).
@@ -646,32 +750,71 @@ impl GpuSim {
     }
 
     pub fn apply_preset(&mut self, preset: crate::geometry::Preset) {
+        let vis = self.vis_rect();
         self.geo.clear();
         self.settings.wind_tunnel = true;
         self.geo.apply_wind_tunnel(true);
-        self.geo.stamp_preset(preset);
+        self.geo.stamp_preset(preset, vis);
         self.undo.clear();
         self.reset_flow();
     }
 
-    /// Switch grid resolution, resampling the current scene into it.
+    /// Switch grid resolution, resampling the current visible scene.
     pub fn set_resolution(&mut self, res_index: usize) {
-        let (_, w, h) = RESOLUTIONS[res_index];
-        if (w, h) == (self.geo.w, self.geo.h) {
+        let (_, vis_w, vis_h) = RESOLUTIONS[res_index];
+        if (vis_w, vis_h) == (self.vis_w, self.vis_h) {
             return;
         }
-        // Strip tunnel edge cells first so they aren't smeared into ghost
-        // inlet/outlet columns by the resample; they are re-applied on the
-        // new grid below.
+        let margin = margin_cells(&self.device, vis_w, vis_h, self.margin_frac);
+        self.rebuild_grid(vis_w, vis_h, margin);
+    }
+
+    /// Change the off-screen margin, preserving the visible scene.
+    pub fn set_margin_frac(&mut self, frac: f32) {
+        self.margin_frac = frac;
+        let margin = margin_cells(&self.device, self.vis_w, self.vis_h, frac);
+        if margin == self.margin {
+            return;
+        }
+        self.rebuild_grid(self.vis_w, self.vis_h, margin);
+    }
+
+    /// Rebuild the full grid at a new visible size and/or margin, carrying
+    /// the visible content across (nearest-neighbour when scaling).
+    fn rebuild_grid(&mut self, vis_w: usize, vis_h: usize, margin: usize) {
+        // Strip tunnel edges first so they aren't captured or smeared into
+        // ghost columns; the tunnel is re-applied on the new grid.
         if self.settings.wind_tunnel {
             self.geo.apply_wind_tunnel(false);
         }
-        let mut new_geo = Geometry::new(w, h);
-        new_geo.resample_from(&self.geo);
+        let old_vis = self.geo.extract(self.vis_rect());
+        let old_vis_geo = geometry_from_region(&old_vis);
+
+        self.vis_w = vis_w;
+        self.vis_h = vis_h;
+        self.margin = margin;
+        let (w, h) = (vis_w + 2 * margin, vis_h + 2 * margin);
+
+        let mut tmp = Geometry::new(vis_w, vis_h);
+        tmp.resample_from(&old_vis_geo);
+        let mut geo = Geometry::new(w, h);
+        geo.restore(&crate::geometry::GeoRegion {
+            rect: (
+                margin as i32,
+                margin as i32,
+                (margin + vis_w) as i32,
+                (margin + vis_h) as i32,
+            ),
+            cell: tmp.cell,
+            fan: tmp.fan,
+            dye_src: tmp.dye_src,
+        });
         if self.settings.wind_tunnel {
-            new_geo.apply_wind_tunnel(true);
+            geo.apply_wind_tunnel(true);
         }
-        self.geo = new_geo;
+        geo.dirty = Some(GridRect::full(w, h));
+        self.geo = geo;
+
         self.bufs = Self::create_grid_buffers(
             &self.device,
             w,
@@ -774,6 +917,13 @@ impl GpuSim {
             inlet_speed: self.settings.flow_speed,
             dye_dt: steps as f32,
             dye_decay: if self.settings.paused { 1.0 } else { self.settings.dye_fade },
+            sponge_width: (self.margin.min(96)) as f32,
+            sponge_strength: self.settings.sponge_strength,
+            free_u: if self.settings.wind_tunnel {
+                [self.settings.flow_speed, 0.0]
+            } else {
+                [0.0, 0.0]
+            },
             _pad0: 0.0,
             _pad1: 0.0,
         };
@@ -849,6 +999,12 @@ impl GpuSim {
             lb_origin: self.mapping.lb_origin,
             px_per_cell: self.mapping.px_per_cell,
             inlet_speed: self.settings.flow_speed,
+            vis_origin: [self.margin as u32, self.margin as u32],
+            vis_size: [self.vis_w as u32, self.vis_h as u32],
+            display_gain: self.settings.display_gain,
+            smoke_gain: self.settings.smoke_gain,
+            particle_size: self.settings.particle_size,
+            particle_brightness: self.settings.particle_brightness,
         };
         self.queue.write_buffer(&self.render_uniform, 0, bytemuck::bytes_of(&p));
     }
@@ -870,10 +1026,10 @@ impl GpuSim {
 
     // --- PNG export ---------------------------------------------------
 
-    /// Render the field at 1 px per cell into an offscreen texture and
-    /// save it as a PNG. Blocks until the readback completes.
+    /// Render the visible window at 1 px per cell into an offscreen
+    /// texture and save it as a PNG. Blocks until the readback completes.
     pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
-        let (w, h) = (self.geo.w as u32, self.geo.h as u32);
+        let (w, h) = (self.vis_w as u32, self.vis_h as u32);
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("export"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -897,6 +1053,12 @@ impl GpuSim {
             lb_origin: [0.0, 0.0],
             px_per_cell: 1.0,
             inlet_speed: self.settings.flow_speed,
+            vis_origin: [self.margin as u32, self.margin as u32],
+            vis_size: [self.vis_w as u32, self.vis_h as u32],
+            display_gain: self.settings.display_gain,
+            smoke_gain: self.settings.smoke_gain,
+            particle_size: self.settings.particle_size,
+            particle_brightness: self.settings.particle_brightness,
         };
         self.queue.write_buffer(&self.render_uniform, 0, bytemuck::bytes_of(&p));
 
@@ -977,14 +1139,30 @@ impl GpuSim {
 
     // --- Scene files --------------------------------------------------
 
+    /// Scene files store the VISIBLE window's content only, so they are
+    /// portable across margin settings.
     pub fn save_scene(&self, path: &std::path::Path) -> Result<(), String> {
+        // Don't bake tunnel edges into the file when the margin is zero
+        // (they'd sit inside the visible window); reconstruct on load.
+        let vis = if self.margin == 0 && self.settings.wind_tunnel {
+            let mut g = geometry_from_region(&self.geo.extract(self.vis_rect()));
+            g.apply_wind_tunnel(false);
+            crate::geometry::GeoRegion {
+                rect: (0, 0, g.w as i32, g.h as i32),
+                cell: g.cell,
+                fan: g.fan,
+                dye_src: g.dye_src,
+            }
+        } else {
+            self.geo.extract(self.vis_rect())
+        };
         let scene = crate::geometry::SceneFile {
             version: crate::geometry::SCENE_VERSION,
-            w: self.geo.w as u32,
-            h: self.geo.h as u32,
-            cell: self.geo.cell.clone(),
-            fan: self.geo.fan.clone(),
-            dye_src: self.geo.dye_src.clone(),
+            w: self.vis_w as u32,
+            h: self.vis_h as u32,
+            cell: vis.cell,
+            fan: vis.fan,
+            dye_src: vis.dye_src,
             wind_tunnel: self.settings.wind_tunnel,
             flow_speed: self.settings.flow_speed,
             viscosity: self.settings.viscosity,
@@ -1017,14 +1195,28 @@ impl GpuSim {
             dye_src: scene.dye_src,
             dirty: None,
         };
-        // Strip the saved tunnel edges before resampling so they aren't
-        // smeared into ghost columns; the tunnel is re-applied below.
+        // Old files (or margin-zero saves from other builds) may carry
+        // tunnel edges inside the content; strip them so they aren't
+        // smeared into ghost columns. The tunnel is re-applied below.
         if scene.wind_tunnel {
             loaded.apply_wind_tunnel(false);
         }
-        // Resample into the current grid resolution.
+        // Resample into the visible window of the current grid.
+        let mut tmp = Geometry::new(self.vis_w, self.vis_h);
+        tmp.resample_from(&loaded);
         let mut geo = Geometry::new(self.geo.w, self.geo.h);
-        geo.resample_from(&loaded);
+        geo.restore(&crate::geometry::GeoRegion {
+            rect: (
+                self.margin as i32,
+                self.margin as i32,
+                (self.margin + self.vis_w) as i32,
+                (self.margin + self.vis_h) as i32,
+            ),
+            cell: tmp.cell,
+            fan: tmp.fan,
+            dye_src: tmp.dye_src,
+        });
+        geo.dirty = Some(GridRect::full(self.geo.w, self.geo.h));
         self.geo = geo;
         self.settings.wind_tunnel = scene.wind_tunnel;
         self.settings.flow_speed = scene.flow_speed;
@@ -1040,7 +1232,7 @@ impl GpuSim {
 
     /// Rough Reynolds number using a cylinder-preset-sized obstacle.
     pub fn reynolds_estimate(&self) -> u32 {
-        let l = 0.16 * self.geo.h as f32;
+        let l = 0.16 * self.vis_h as f32;
         (self.settings.flow_speed * l / self.settings.viscosity.max(1e-5)) as u32
     }
 }

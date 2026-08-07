@@ -16,20 +16,48 @@ On an RTX 3080 it happily pushes the **Ultra** grid (2560 × 1280 —
 - **Brush** (B) — freehand strokes; **Line** (L), **Rectangle** (R),
   **Ellipse** (E) — rubber-band previews, stamped on release;
   **Eraser** (X). Right-drag erases with any tool.
+- **Select** (S) — marquee-select any drawn region, then **move it live
+  through the flow**, rotate, scale, flip, copy/paste (Ctrl+C/V), nudge
+  with arrows, Delete, Enter to apply, Esc to cancel. The selection
+  stays physically present while you drag it, so the fluid reacts in
+  real time.
 - **Materials**: Wall (no-slip solid), Fan (inlet — blows along your
   stroke or line direction), Smoke (colored dye emitter, with color
   picker), Drain (pressure outlet).
 - **Undo/redo** (Ctrl+Z / Ctrl+Y) with region snapshots.
 - Brush size slider + `[` `]` keys; circle cursor preview.
 
+**Generators** (menu):
+- **Airfoil** — full NACA 4-digit generator (camber, camber position,
+  thickness, chord, angle of attack) with presets: NACA 0012, 2412
+  (Cessna 172), 4412, 0015, 6412, Clark Y, 0006. Inserts as a floating
+  selection you can position and rotate before committing.
+- **Rocket nozzle** — de Laval (converging-diverging) generator with
+  conical or parabolic-bell contours, wall thickness, and an optional
+  fan across the chamber so it self-propels. Presets use width ratios
+  derived from real engines: V-2, F-1, Merlin 1D, RS-25, Raptor,
+  RL10-B2. (The solver is incompressible, so you get the geometry and a
+  jet — not real choked compressible flow.)
+
 **Simulation:**
-- Wind-tunnel mode (left → right) with automatic smoke streaklines.
+- **Extended domain**: the simulation runs on a larger grid than you
+  see — a configurable off-screen margin (None / +25 % / +50 % / +100 %
+  per side, default +50 %) pushes the domain boundaries away from the
+  visible canvas, and an absorbing sponge layer at the far edges damps
+  outgoing pressure waves so boundary reflections don't contaminate
+  what you're watching.
+- Wind-tunnel mode (left → right) with automatic smoke streaklines
+  entering from the far upstream edge.
 - Presets: cylinder (von Kármán vortex street), NACA 0012 airfoil,
   venturi nozzle, backward-facing step, pinball field.
 - Live controls: flow speed, viscosity (Reynolds number readout),
-  solver sub-steps per frame, smoke persistence, pause (Space) / reset.
-- Grid resolutions from 960 × 480 to 2560 × 1280, resampling your
-  drawing on switch.
+  solver sub-steps per frame, smoke persistence, pause (Space) / reset,
+  plus advanced controls for display gain, smoke brightness, edge
+  damping, and particle size/brightness.
+- Visible resolutions from 960 × 480 to 2560 × 1280 (the simulated grid
+  is bigger by the margin), resampling your drawing on switch.
+- Tracer particles are **off by default** — enable them under
+  View → Particles.
 
 **Views:** Smoke, Speed (inferno), Vorticity, Pressure (diverging), with
 optional highlight tints on fans/drains, plus the particle layer.

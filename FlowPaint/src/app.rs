@@ -5,7 +5,8 @@ use crate::geometry::{
     BrushContext, GeoRegion, Geometry, GridRect, Material, Preset, UndoEntry,
 };
 use crate::sim::{
-    GpuSim, RenderMode, ViewportMapping, PARTICLE_CHOICES, RESOLUTIONS,
+    GpuSim, RenderMode, ViewportMapping, DEFAULT_MARGIN_INDEX, MARGIN_CHOICES,
+    PARTICLE_CHOICES, RESOLUTIONS,
 };
 use eframe::egui;
 
@@ -16,16 +17,100 @@ enum Tool {
     Rect,
     Ellipse,
     Eraser,
+    Select,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, &'static str); 5] = [
+    const ALL: [(Tool, &'static str, &'static str); 6] = [
         (Tool::Brush, "Brush", "B"),
         (Tool::Line, "Line", "L"),
         (Tool::Rect, "Rectangle", "R"),
         (Tool::Ellipse, "Ellipse", "E"),
         (Tool::Eraser, "Eraser", "X"),
+        (Tool::Select, "Select", "S"),
     ];
+}
+
+/// A floating selection: raster content lifted off the grid, live-stamped
+/// at its current transform so the fluid keeps reacting while you move it.
+pub struct Selection {
+    /// Source raster, rect based at (0, 0).
+    source: GeoRegion,
+    /// Centre position in visible-canvas cell coordinates.
+    pos: [f32; 2],
+    angle_deg: f32,
+    scale: f32,
+    flip_h: bool,
+    flip_v: bool,
+}
+
+impl Selection {
+    fn source_dims(&self) -> (f32, f32) {
+        let (x0, y0, x1, y1) = self.source.rect;
+        ((x1 - x0) as f32, (y1 - y0) as f32)
+    }
+
+    /// Rotated/scaled half-extents of the stamped footprint.
+    fn half_extents(&self) -> (f32, f32) {
+        let (sw, sh) = self.source_dims();
+        let (s, c) = self.angle_deg.to_radians().sin_cos();
+        let hx = sw * 0.5 * self.scale;
+        let hy = sh * 0.5 * self.scale;
+        ((hx * c).abs() + (hy * s).abs(), (hx * s).abs() + (hy * c).abs())
+    }
+
+    /// Map a point in visible-cell coordinates to source raster
+    /// coordinates (None if outside the source rect).
+    fn point_to_source(&self, p: [f32; 2]) -> Option<(usize, usize)> {
+        let (sw, sh) = self.source_dims();
+        let (s, c) = self.angle_deg.to_radians().sin_cos();
+        let dx = p[0] - self.pos[0];
+        let dy = p[1] - self.pos[1];
+        // Inverse rotation (y-down grid), then inverse scale and flips.
+        let rx = dx * c + dy * s;
+        let ry = -dx * s + dy * c;
+        let mut sx = rx / self.scale;
+        let mut sy = ry / self.scale;
+        if self.flip_h {
+            sx = -sx;
+        }
+        if self.flip_v {
+            sy = -sy;
+        }
+        let sx = sx + sw * 0.5;
+        let sy = sy + sh * 0.5;
+        if sx >= 0.0 && sy >= 0.0 && sx < sw && sy < sh {
+            Some((sx as usize, sy as usize))
+        } else {
+            None
+        }
+    }
+
+    /// Rotate a fan direction vector by the selection's transform.
+    fn transform_fan(&self, v: [f32; 2]) -> [f32; 2] {
+        let (s, c) = self.angle_deg.to_radians().sin_cos();
+        let vx = if self.flip_h { -v[0] } else { v[0] };
+        let vy = if self.flip_v { -v[1] } else { v[1] };
+        [vx * c - vy * s, vx * s + vy * c]
+    }
+
+    /// Outline corners in visible-cell coordinates (for the overlay).
+    fn corners(&self) -> [[f32; 2]; 4] {
+        let (sw, sh) = self.source_dims();
+        let (s, c) = self.angle_deg.to_radians().sin_cos();
+        let hx = sw * 0.5 * self.scale;
+        let hy = sh * 0.5 * self.scale;
+        let mut out = [[0.0f32; 2]; 4];
+        for (k, (lx, ly)) in
+            [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)].into_iter().enumerate()
+        {
+            out[k] = [
+                self.pos[0] + lx * c - ly * s,
+                self.pos[1] + lx * s + ly * c,
+            ];
+        }
+        out
+    }
 }
 
 /// An in-progress drag on the canvas. The tool, material and radius are
@@ -41,6 +126,9 @@ struct DragState {
     /// Fan brush strokes defer their first stamp until the drag direction
     /// is known, so the whole stroke blows the way the pointer moved.
     fan_deferred: bool,
+    /// Select tool: true when dragging the floating selection itself
+    /// (translate), false when rubber-banding a new marquee.
+    sel_move: bool,
 }
 
 impl DragState {
@@ -67,6 +155,11 @@ struct UiSnapshot {
     can_undo: bool,
     can_redo: bool,
     mode: RenderMode,
+    display_gain: f32,
+    smoke_gain: f32,
+    particle_size: f32,
+    particle_brightness: f32,
+    sponge_strength: f32,
 }
 
 pub struct FlowPaintApp {
@@ -84,13 +177,27 @@ pub struct FlowPaintApp {
     // the whole grid.
     pending_stroke_rect: GridRect,
     pending_stroke_tiles: std::collections::HashMap<(i32, i32), GeoRegion>,
+    // Floating selection state. `selection_bg` holds the pre-stamp content
+    // of the currently stamped footprint so moving the selection can
+    // restore what was underneath.
+    selection: Option<Selection>,
+    selection_bg: Option<GeoRegion>,
+    clipboard: Option<GeoRegion>,
+    // Generator dialogs.
+    show_airfoil_gen: bool,
+    show_nozzle_gen: bool,
+    airfoil_params: crate::generators::AirfoilParams,
+    nozzle_params: crate::generators::NozzleParams,
     show_about: bool,
     show_shortcuts: bool,
     res_index: usize,
     particle_index: usize,
+    margin_index: usize,
     status: String,
     // Stats copied out of the sim each frame.
     stats_grid: (usize, usize),
+    stats_full: (usize, usize),
+    stats_margin: usize,
     stats_mlups: f32,
     stats_re: u32,
 }
@@ -118,12 +225,22 @@ impl FlowPaintApp {
             drag: None,
             pending_stroke_rect: GridRect::empty(),
             pending_stroke_tiles: std::collections::HashMap::new(),
+            selection: None,
+            selection_bg: None,
+            clipboard: None,
+            show_airfoil_gen: false,
+            show_nozzle_gen: false,
+            airfoil_params: crate::generators::AirfoilParams::default(),
+            nozzle_params: crate::generators::NozzleParams::default(),
             show_about: false,
             show_shortcuts: false,
             res_index,
-            particle_index: 2,
+            particle_index: 0,
+            margin_index: DEFAULT_MARGIN_INDEX,
             status: String::from("Draw walls with the brush; hold right-click to erase."),
             stats_grid: (0, 0),
+            stats_full: (0, 0),
+            stats_margin: 0,
             stats_mlups: 0.0,
             stats_re: 0,
         }
@@ -166,15 +283,26 @@ impl eframe::App for FlowPaintApp {
                 can_undo: sim.undo.can_undo(),
                 can_redo: sim.undo.can_redo(),
                 mode: sim.settings.render_mode,
+                display_gain: sim.settings.display_gain,
+                smoke_gain: sim.settings.smoke_gain,
+                particle_size: sim.settings.particle_size,
+                particle_brightness: sim.settings.particle_brightness,
+                sponge_strength: sim.settings.sponge_strength,
             }
         };
+
+        // A selection only lives under the Select tool; switching away
+        // commits it.
+        if self.selection.is_some() && self.tool != Tool::Select {
+            cmds.push(Cmd::SelectCommit);
+        }
 
         self.keyboard(ctx, &mut cmds);
         self.menu_bar(ctx, &mut cmds);
         self.side_panel(ctx, snapshot, &mut cmds);
         self.status_bar(ctx);
         self.canvas(ctx, &mut cmds);
-        self.windows(ctx);
+        self.windows(ctx, &mut cmds);
 
         // Apply everything to the sim.
         let Some(rs) = frame.wgpu_render_state() else { return };
@@ -188,8 +316,10 @@ impl eframe::App for FlowPaintApp {
 
         // Copy stats out for the status bar next frame.
         self.stats_grid = sim.grid_size();
+        self.stats_full = sim.full_size();
+        self.stats_margin = sim.margin();
         let dt = ctx.input(|i| i.stable_dt).max(1e-4);
-        let n = (self.stats_grid.0 * self.stats_grid.1) as f32;
+        let n = (self.stats_full.0 * self.stats_full.1) as f32;
         self.stats_mlups = n * sim.steps_last_frame as f32 / dt / 1.0e6;
         self.stats_re = sim.reynolds_estimate();
     }
@@ -203,6 +333,7 @@ enum Cmd {
     SetWindTunnel(bool),
     Preset(Preset),
     SetResolution(usize),
+    SetMargin(usize),
     SetParticles(u32),
     SetRenderMode(RenderMode),
     SetFlowSpeed(f32),
@@ -210,6 +341,11 @@ enum Cmd {
     SetSteps(u32),
     SetDyeFade(f32),
     SetBoundaryTints(bool),
+    SetDisplayGain(f32),
+    SetSmokeGain(f32),
+    SetParticleSize(f32),
+    SetParticleBrightness(f32),
+    SetSpongeStrength(f32),
     Undo,
     Redo,
     SaveScene(std::path::PathBuf),
@@ -221,6 +357,16 @@ enum Cmd {
     StrokeBegin,
     StrokeEnd,
     SetMapping(ViewportMapping),
+    // Selection (coordinates in visible cells).
+    SelectCut { a: [f32; 2], b: [f32; 2] },
+    SelectUpdate,
+    SelectCommit,
+    SelectCancel,
+    SelectDelete,
+    CopySelection,
+    PasteClipboard,
+    /// Insert generated content as a new floating selection.
+    InsertStamp(GeoRegion),
 }
 
 /// Tile edge length for lazy pre-stroke capture.
@@ -232,6 +378,165 @@ fn clear_stroke_state(app: &mut FlowPaintApp) {
     app.pending_stroke_rect = GridRect::empty();
     app.pending_stroke_tiles.clear();
     app.drag = None;
+    // A floating selection is abandoned outright: the grid it was stamped
+    // into is being replaced wholesale.
+    app.selection = None;
+    app.selection_bg = None;
+}
+
+/// Capture the pre-session contents of every 64x64 tile `rect` overlaps
+/// that has not been captured yet this stroke/selection session.
+fn capture_tiles(app: &mut FlowPaintApp, sim: &GpuSim, rect: GridRect) {
+    if rect.is_empty() {
+        return;
+    }
+    for ty in (rect.y0 / UNDO_TILE)..=((rect.y1 - 1) / UNDO_TILE) {
+        for tx in (rect.x0 / UNDO_TILE)..=((rect.x1 - 1) / UNDO_TILE) {
+            app.pending_stroke_tiles.entry((tx, ty)).or_insert_with(|| {
+                sim.geo.extract(GridRect {
+                    x0: tx * UNDO_TILE,
+                    y0: ty * UNDO_TILE,
+                    x1: (tx + 1) * UNDO_TILE,
+                    y1: (ty + 1) * UNDO_TILE,
+                })
+            });
+        }
+    }
+}
+
+/// Finish the current undo session: build one entry from the captured
+/// tiles and the current grid over the accumulated union rect.
+fn push_stroke_undo(sim: &mut GpuSim, app: &mut FlowPaintApp) {
+    let rect = app.pending_stroke_rect.clampped(sim.geo.w, sim.geo.h);
+    app.pending_stroke_rect = GridRect::empty();
+    let tiles = std::mem::take(&mut app.pending_stroke_tiles);
+    if rect.is_empty() {
+        return;
+    }
+    let before = assemble_before(&sim.geo, &tiles, rect);
+    let after = sim.geo.extract(rect);
+    sim.undo.push(UndoEntry { before, after });
+}
+
+/// Re-stamp the floating selection at its current transform: restore what
+/// was under the previous stamp, then stamp at the new position.
+fn selection_update(sim: &mut GpuSim, app: &mut FlowPaintApp) {
+    let m = sim.margin() as f32;
+    let Some(sel) = app.selection.as_ref() else { return };
+
+    if let Some(bg) = app.selection_bg.take() {
+        sim.geo.restore(&bg);
+    }
+
+    let (ex, ey) = sel.half_extents();
+    let center = [sel.pos[0] + m, sel.pos[1] + m];
+    let bbox = GridRect {
+        x0: (center[0] - ex).floor() as i32 - 1,
+        y0: (center[1] - ey).floor() as i32 - 1,
+        x1: (center[0] + ex).ceil() as i32 + 1,
+        y1: (center[1] + ey).ceil() as i32 + 1,
+    }
+    .clampped(sim.geo.w, sim.geo.h);
+    if bbox.is_empty() {
+        return; // dragged fully off the grid; nothing stamped
+    }
+
+    capture_tiles(app, sim, bbox);
+    let sel = app.selection.as_ref().unwrap();
+    app.selection_bg = Some(sim.geo.extract(bbox));
+
+    let src = &sel.source;
+    let src_w = (src.rect.2 - src.rect.0) as usize;
+    let gw = sim.geo.w;
+    for y in bbox.y0..bbox.y1 {
+        for x in bbox.x0..bbox.x1 {
+            let p_vis = [x as f32 + 0.5 - m, y as f32 + 0.5 - m];
+            let Some((sx, sy)) = sel.point_to_source(p_vis) else { continue };
+            let si = sy * src_w + sx;
+            let non_empty = src.cell[si] != crate::geometry::CELL_FLUID
+                || src.dye_src[si][3] > 0.0;
+            if !non_empty {
+                continue; // fluid is transparent
+            }
+            let gi = (y as usize) * gw + x as usize;
+            sim.geo.cell[gi] = src.cell[si];
+            sim.geo.fan[gi] = sel.transform_fan(src.fan[si]);
+            sim.geo.dye_src[gi] = src.dye_src[si];
+        }
+    }
+    sim.geo.touch(bbox);
+    app.pending_stroke_rect = app.pending_stroke_rect.union(bbox);
+}
+
+/// Commit the floating selection: its stamp stays, one undo entry covers
+/// the whole session.
+fn commit_selection(sim: &mut GpuSim, app: &mut FlowPaintApp) {
+    if app.selection.take().is_some() {
+        app.selection_bg = None;
+        push_stroke_undo(sim, app);
+    }
+}
+
+/// Start a new selection session around `source` (already based at 0,0).
+fn start_selection(sim: &mut GpuSim, app: &mut FlowPaintApp, source: GeoRegion, pos: [f32; 2]) {
+    commit_selection(sim, app);
+    app.pending_stroke_rect = GridRect::empty();
+    app.pending_stroke_tiles.clear();
+    app.selection = Some(Selection {
+        source,
+        pos,
+        angle_deg: 0.0,
+        scale: 1.0,
+        flip_h: false,
+        flip_v: false,
+    });
+    app.selection_bg = None;
+    app.tool = Tool::Select;
+    selection_update(sim, app);
+}
+
+/// Bake the selection's current transform into a flat raster (for copy).
+fn bake_selection(sel: &Selection) -> GeoRegion {
+    let (ex, ey) = sel.half_extents();
+    let bw = (2.0 * ex).ceil() as usize + 2;
+    let bh = (2.0 * ey).ceil() as usize + 2;
+    let src_w = (sel.source.rect.2 - sel.source.rect.0) as usize;
+    let mut out = GeoRegion {
+        rect: (0, 0, bw as i32, bh as i32),
+        cell: vec![crate::geometry::CELL_FLUID; bw * bh],
+        fan: vec![[0.0; 2]; bw * bh],
+        dye_src: vec![[0.0; 4]; bw * bh],
+    };
+    // Sample through a probe selection centred in the bake raster.
+    let probe = Selection {
+        source: GeoRegion {
+            rect: sel.source.rect,
+            cell: Vec::new(), // not used by point_to_source
+            fan: Vec::new(),
+            dye_src: Vec::new(),
+        },
+        pos: [bw as f32 * 0.5, bh as f32 * 0.5],
+        angle_deg: sel.angle_deg,
+        scale: sel.scale,
+        flip_h: sel.flip_h,
+        flip_v: sel.flip_v,
+    };
+    for y in 0..bh {
+        for x in 0..bw {
+            let p = [x as f32 + 0.5, y as f32 + 0.5];
+            let Some((sx, sy)) = probe.point_to_source(p) else { continue };
+            let si = sy * src_w + sx;
+            if sel.source.cell[si] != crate::geometry::CELL_FLUID
+                || sel.source.dye_src[si][3] > 0.0
+            {
+                let di = y * bw + x;
+                out.cell[di] = sel.source.cell[si];
+                out.fan[di] = sel.transform_fan(sel.source.fan[si]);
+                out.dye_src[di] = sel.source.dye_src[si];
+            }
+        }
+    }
+    out
 }
 
 fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
@@ -251,6 +556,10 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             clear_stroke_state(app);
             sim.set_resolution(i);
         }
+        Cmd::SetMargin(i) => {
+            clear_stroke_state(app);
+            sim.set_margin_frac(MARGIN_CHOICES[i].1);
+        }
         Cmd::SetParticles(nn) => sim.settings.particle_count = nn,
         Cmd::SetRenderMode(m) => sim.settings.render_mode = m,
         Cmd::SetFlowSpeed(v) => sim.settings.flow_speed = v,
@@ -258,6 +567,11 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::SetSteps(v) => sim.settings.steps_per_frame = v,
         Cmd::SetDyeFade(v) => sim.settings.dye_fade = v,
         Cmd::SetBoundaryTints(v) => sim.settings.boundary_tints = v,
+        Cmd::SetDisplayGain(v) => sim.settings.display_gain = v,
+        Cmd::SetSmokeGain(v) => sim.settings.smoke_gain = v,
+        Cmd::SetParticleSize(v) => sim.settings.particle_size = v,
+        Cmd::SetParticleBrightness(v) => sim.settings.particle_brightness = v,
+        Cmd::SetSpongeStrength(v) => sim.settings.sponge_strength = v,
         Cmd::Undo => sim.undo_action(),
         Cmd::Redo => sim.redo_action(),
         Cmd::SaveScene(p) => {
@@ -280,30 +594,25 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             };
         }
         Cmd::StampSegment { a, b, r, material } => {
+            // Canvas coordinates are visible-window relative; offset into
+            // the full grid.
+            let m = sim.margin() as f32;
+            let a = [a[0] + m, a[1] + m];
+            let b = [b[0] + m, b[1] + m];
             // Capture the pre-stroke contents of every tile this stamp can
             // touch before stamping (first touch wins, so tiles keep their
             // true pre-stroke data for the whole stroke).
             let bound =
                 Geometry::capsule_bounds(a, b, r).clampped(sim.geo.w, sim.geo.h);
-            if !bound.is_empty() {
-                for ty in (bound.y0 / UNDO_TILE)..=((bound.y1 - 1) / UNDO_TILE) {
-                    for tx in (bound.x0 / UNDO_TILE)..=((bound.x1 - 1) / UNDO_TILE) {
-                        app.pending_stroke_tiles.entry((tx, ty)).or_insert_with(|| {
-                            sim.geo.extract(GridRect {
-                                x0: tx * UNDO_TILE,
-                                y0: ty * UNDO_TILE,
-                                x1: (tx + 1) * UNDO_TILE,
-                                y1: (ty + 1) * UNDO_TILE,
-                            })
-                        });
-                    }
-                }
-            }
+            capture_tiles(app, sim, bound);
             let ctx = app.brush_ctx();
             let rect = sim.geo.stamp_capsule(a, b, r, material, &ctx);
             app.pending_stroke_rect = app.pending_stroke_rect.union(rect);
         }
         Cmd::ShapeCommit { tool, a, b, r, material } => {
+            let m = sim.margin() as f32;
+            let a = [a[0] + m, a[1] + m];
+            let b = [b[0] + m, b[1] + m];
             let ctx = app.brush_ctx();
             // Dense undo for one-shot shapes.
             let bound = match tool {
@@ -339,15 +648,94 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             app.pending_stroke_tiles.clear();
         }
         Cmd::StrokeEnd => {
-            let rect = app.pending_stroke_rect.clampped(sim.geo.w, sim.geo.h);
-            app.pending_stroke_rect = GridRect::empty();
-            let tiles = std::mem::take(&mut app.pending_stroke_tiles);
+            push_stroke_undo(sim, app);
+        }
+        Cmd::SelectCut { a, b } => {
+            commit_selection(sim, app);
+            let m = sim.margin() as f32;
+            let rect = GridRect {
+                x0: (a[0].min(b[0]) + m).floor() as i32,
+                y0: (a[1].min(b[1]) + m).floor() as i32,
+                x1: (a[0].max(b[0]) + m).ceil() as i32,
+                y1: (a[1].max(b[1]) + m).ceil() as i32,
+            }
+            .clampped(sim.geo.w, sim.geo.h);
             if rect.is_empty() {
                 return;
             }
-            let before = assemble_before(&sim.geo, &tiles, rect);
-            let after = sim.geo.extract(rect);
-            sim.undo.push(UndoEntry { before, after });
+            // Begin the session, lift the content, clear the area.
+            app.pending_stroke_rect = GridRect::empty();
+            app.pending_stroke_tiles.clear();
+            capture_tiles(app, sim, rect);
+            let mut source = sim.geo.extract(rect);
+            let w = rect.x1 - rect.x0;
+            let h = rect.y1 - rect.y0;
+            source.rect = (0, 0, w, h);
+            for y in rect.y0..rect.y1 {
+                for x in rect.x0..rect.x1 {
+                    let i = (y as usize) * sim.geo.w + x as usize;
+                    sim.geo.cell[i] = crate::geometry::CELL_FLUID;
+                    sim.geo.fan[i] = [0.0; 2];
+                    sim.geo.dye_src[i] = [0.0; 4];
+                }
+            }
+            sim.geo.touch(rect);
+            app.pending_stroke_rect = rect;
+            let pos = [
+                (rect.x0 + rect.x1) as f32 * 0.5 - m,
+                (rect.y0 + rect.y1) as f32 * 0.5 - m,
+            ];
+            app.selection = Some(Selection {
+                source,
+                pos,
+                angle_deg: 0.0,
+                scale: 1.0,
+                flip_h: false,
+                flip_v: false,
+            });
+            app.selection_bg = None;
+            selection_update(sim, app);
+        }
+        Cmd::SelectUpdate => selection_update(sim, app),
+        Cmd::SelectCommit => commit_selection(sim, app),
+        Cmd::SelectCancel => {
+            if app.selection.take().is_some() {
+                // Restore every captured tile: the grid returns exactly to
+                // its pre-session state.
+                let tiles = std::mem::take(&mut app.pending_stroke_tiles);
+                for tile in tiles.values() {
+                    sim.geo.restore(tile);
+                }
+                app.selection_bg = None;
+                app.pending_stroke_rect = GridRect::empty();
+            }
+        }
+        Cmd::SelectDelete => {
+            if app.selection.take().is_some() {
+                if let Some(bg) = app.selection_bg.take() {
+                    sim.geo.restore(&bg);
+                }
+                push_stroke_undo(sim, app); // the cut area stays cleared
+            }
+        }
+        Cmd::CopySelection => {
+            if let Some(sel) = app.selection.as_ref() {
+                app.clipboard = Some(bake_selection(sel));
+                app.status = "Selection copied.".into();
+            }
+        }
+        Cmd::PasteClipboard => {
+            if let Some(clip) = app.clipboard.clone() {
+                let (vw, vh) = sim.grid_size();
+                start_selection(sim, app, clip, [vw as f32 * 0.5, vh as f32 * 0.5]);
+                app.status = "Pasted — drag to place, Enter to apply.".into();
+            }
+        }
+        Cmd::InsertStamp(region) => {
+            let (vw, vh) = sim.grid_size();
+            start_selection(sim, app, region, [vw as f32 * 0.5, vh as f32 * 0.5]);
+            app.status =
+                "Inserted — drag to place, rotate/scale in the panel, Enter to apply.".into();
         }
         Cmd::SetMapping(m) => {
             // Refit against the sim's authoritative grid size: on a
@@ -401,15 +789,57 @@ impl FlowPaintApp {
         if ctx.wants_keyboard_input() {
             return;
         }
-        // Escape cancels an in-progress drag: shapes are dropped before
-        // they commit; freehand strokes just end (their paint is already
-        // down, so finalize the undo entry).
+        // Escape: cancel the floating selection if there is one, else
+        // cancel an in-progress drag (shapes are dropped before they
+        // commit; freehand strokes just end — their paint is already down).
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if let Some(drag) = self.drag.take() {
+            if self.selection.is_some() {
+                self.drag = None;
+                cmds.push(Cmd::SelectCancel);
+            } else if let Some(drag) = self.drag.take() {
                 if matches!(drag.tool, Tool::Brush | Tool::Eraser) {
                     cmds.push(Cmd::StrokeEnd);
                 }
             }
+        }
+
+        // Selection keys.
+        if self.selection.is_some() {
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::Enter) {
+                    cmds.push(Cmd::SelectCommit);
+                }
+                if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+                    cmds.push(Cmd::SelectDelete);
+                }
+                if i.modifiers.command && i.key_pressed(egui::Key::C) {
+                    cmds.push(Cmd::CopySelection);
+                }
+                let step = if i.modifiers.shift { 1.0 } else { 4.0 };
+                let mut nudge = [0.0f32; 2];
+                if i.key_pressed(egui::Key::ArrowLeft) {
+                    nudge[0] -= step;
+                }
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    nudge[0] += step;
+                }
+                if i.key_pressed(egui::Key::ArrowUp) {
+                    nudge[1] -= step;
+                }
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    nudge[1] += step;
+                }
+                if nudge != [0.0; 2] {
+                    if let Some(sel) = self.selection.as_mut() {
+                        sel.pos[0] += nudge[0];
+                        sel.pos[1] += nudge[1];
+                    }
+                    cmds.push(Cmd::SelectUpdate);
+                }
+            });
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+            cmds.push(Cmd::PasteClipboard);
         }
         let dragging = self.drag.is_some();
         ctx.input(|i| {
@@ -443,6 +873,9 @@ impl FlowPaintApp {
                 }
                 if i.key_pressed(egui::Key::X) {
                     self.tool = Tool::Eraser;
+                }
+                if i.key_pressed(egui::Key::S) {
+                    self.tool = Tool::Select;
                 }
             }
             if i.key_pressed(egui::Key::OpenBracket) {
@@ -538,6 +971,29 @@ impl FlowPaintApp {
                             }
                         }
                     });
+                    ui.menu_button("Domain margin", |ui| {
+                        ui.label("Extra simulated area around the canvas;")
+                            .on_hover_text("larger margins push boundary artifacts away");
+                        ui.label("edges also get an absorbing sponge layer.");
+                        ui.separator();
+                        for (i, (label, _)) in MARGIN_CHOICES.iter().enumerate() {
+                            if ui.radio(i == self.margin_index, *label).clicked() {
+                                self.margin_index = i;
+                                cmds.push(Cmd::SetMargin(i));
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                });
+                ui.menu_button("Generators", |ui| {
+                    if ui.button("Airfoil…").clicked() {
+                        self.show_airfoil_gen = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Rocket nozzle…").clicked() {
+                        self.show_nozzle_gen = true;
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("View", |ui| {
                     ui.menu_button("Particles", |ui| {
@@ -579,6 +1035,58 @@ impl FlowPaintApp {
                     }
                 }
             });
+
+            if self.selection.is_some() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.heading("Selection");
+                let mut changed = false;
+                {
+                    let sel = self.selection.as_mut().unwrap();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut sel.angle_deg, -180.0..=180.0)
+                                .text("rotate °"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut sel.scale, 0.25..=4.0)
+                                .logarithmic(true)
+                                .text("scale"),
+                        )
+                        .changed();
+                    ui.horizontal(|ui| {
+                        if ui.button("Flip H").clicked() {
+                            sel.flip_h = !sel.flip_h;
+                            changed = true;
+                        }
+                        if ui.button("Flip V").clicked() {
+                            sel.flip_v = !sel.flip_v;
+                            changed = true;
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Copy").clicked() {
+                        cmds.push(Cmd::CopySelection);
+                    }
+                    if ui.button("Delete").clicked() {
+                        cmds.push(Cmd::SelectDelete);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("✔ Apply").clicked() {
+                        cmds.push(Cmd::SelectCommit);
+                    }
+                    if ui.button("✖ Cancel").clicked() {
+                        cmds.push(Cmd::SelectCancel);
+                    }
+                });
+                if changed {
+                    cmds.push(Cmd::SelectUpdate);
+                }
+            }
 
             ui.add_space(6.0);
             ui.separator();
@@ -673,6 +1181,57 @@ impl FlowPaintApp {
             }
 
             ui.add_space(6.0);
+            egui::CollapsingHeader::new("Advanced").show(ui, |ui| {
+                let mut gain = snap.display_gain;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut gain, 0.25..=4.0)
+                            .logarithmic(true)
+                            .text("display gain"),
+                    )
+                    .on_hover_text("Scales the speed/vorticity/pressure color mapping")
+                    .changed()
+                {
+                    cmds.push(Cmd::SetDisplayGain(gain));
+                }
+                let mut sgain = snap.smoke_gain;
+                if ui
+                    .add(egui::Slider::new(&mut sgain, 0.25..=3.0).text("smoke brightness"))
+                    .changed()
+                {
+                    cmds.push(Cmd::SetSmokeGain(sgain));
+                }
+                let mut sponge = snap.sponge_strength;
+                if ui
+                    .add(egui::Slider::new(&mut sponge, 0.0..=0.3).text("edge damping"))
+                    .on_hover_text(
+                        "Absorbing sponge at the domain edge (needs a margin); \
+                         kills reflections of pressure waves",
+                    )
+                    .changed()
+                {
+                    cmds.push(Cmd::SetSpongeStrength(sponge));
+                }
+                let mut psize = snap.particle_size;
+                if ui
+                    .add(egui::Slider::new(&mut psize, 0.8..=5.0).text("particle size"))
+                    .changed()
+                {
+                    cmds.push(Cmd::SetParticleSize(psize));
+                }
+                let mut pbright = snap.particle_brightness;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut pbright, 0.05..=1.0)
+                            .text("particle brightness"),
+                    )
+                    .changed()
+                {
+                    cmds.push(Cmd::SetParticleBrightness(pbright));
+                }
+            });
+
+            ui.add_space(6.0);
             ui.separator();
             ui.horizontal(|ui| {
                 if ui
@@ -703,8 +1262,14 @@ impl FlowPaintApp {
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
-                        "grid {} x {}   |   {:.0} MLUPS   |   Re ≈ {}",
-                        self.stats_grid.0, self.stats_grid.1, self.stats_mlups, self.stats_re
+                        "canvas {} x {} (sim {} x {}, +{} margin)   |   {:.0} MLUPS   |   Re ≈ {}",
+                        self.stats_grid.0,
+                        self.stats_grid.1,
+                        self.stats_full.0,
+                        self.stats_full.1,
+                        self.stats_margin,
+                        self.stats_mlups,
+                        self.stats_re
                     ));
                 });
             });
@@ -768,33 +1333,56 @@ impl FlowPaintApp {
         if response.drag_started() {
             if let Some(pos) = pointer {
                 let cell = to_cell(pos);
-                let freehand = matches!(self.tool, Tool::Brush | Tool::Eraser);
-                // Fan brush strokes wait for a direction before stamping.
-                let fan_deferred = freehand
-                    && !erase
-                    && self.tool == Tool::Brush
-                    && self.material == Material::Fan;
-                let drag = DragState {
-                    start_cell: cell,
-                    last_cell: cell,
-                    erase,
-                    tool: self.tool,
-                    material: self.material,
-                    radius: self.brush_radius,
-                    fan_deferred,
-                };
-                if freehand {
-                    cmds.push(Cmd::StrokeBegin);
-                    if !fan_deferred {
-                        cmds.push(Cmd::StampSegment {
-                            a: cell,
-                            b: cell,
-                            r: drag.radius,
-                            material: drag.effective_material(),
-                        });
+                if self.tool == Tool::Select {
+                    // Inside the floating selection: move it. Outside:
+                    // commit it (if any) and rubber-band a new marquee.
+                    let hit = self
+                        .selection
+                        .as_ref()
+                        .map_or(false, |s| s.point_to_source(cell).is_some());
+                    if !hit && self.selection.is_some() {
+                        cmds.push(Cmd::SelectCommit);
                     }
+                    self.drag = Some(DragState {
+                        start_cell: cell,
+                        last_cell: cell,
+                        erase: false,
+                        tool: Tool::Select,
+                        material: self.material,
+                        radius: self.brush_radius,
+                        fan_deferred: false,
+                        sel_move: hit,
+                    });
+                } else {
+                    let freehand = matches!(self.tool, Tool::Brush | Tool::Eraser);
+                    // Fan brush strokes wait for a direction before stamping.
+                    let fan_deferred = freehand
+                        && !erase
+                        && self.tool == Tool::Brush
+                        && self.material == Material::Fan;
+                    let drag = DragState {
+                        start_cell: cell,
+                        last_cell: cell,
+                        erase,
+                        tool: self.tool,
+                        material: self.material,
+                        radius: self.brush_radius,
+                        fan_deferred,
+                        sel_move: false,
+                    };
+                    if freehand {
+                        cmds.push(Cmd::StrokeBegin);
+                        if !fan_deferred {
+                            cmds.push(Cmd::StampSegment {
+                                a: cell,
+                                b: cell,
+                                r: drag.radius,
+                                material: drag.effective_material(),
+                            });
+                        }
+                    }
+                    self.drag = Some(drag);
                 }
-                self.drag = Some(drag);
             }
         }
 
@@ -802,7 +1390,7 @@ impl FlowPaintApp {
             if let Some(pos) = pointer {
                 let cell = to_cell(pos);
                 if self.drag.is_some() {
-                    let (a, radius, material, tool, deferred, start) = {
+                    let (a, radius, material, tool, deferred, start, sel_move) = {
                         let drag = self.drag.as_ref().unwrap();
                         (
                             drag.last_cell,
@@ -811,9 +1399,19 @@ impl FlowPaintApp {
                             drag.tool,
                             drag.fan_deferred,
                             drag.start_cell,
+                            drag.sel_move,
                         )
                     };
-                    if matches!(tool, Tool::Brush | Tool::Eraser) {
+                    if tool == Tool::Select {
+                        self.drag.as_mut().unwrap().last_cell = cell;
+                        if sel_move {
+                            if let Some(sel) = self.selection.as_mut() {
+                                sel.pos[0] += cell[0] - a[0];
+                                sel.pos[1] += cell[1] - a[1];
+                            }
+                            cmds.push(Cmd::SelectUpdate);
+                        }
+                    } else if matches!(tool, Tool::Brush | Tool::Eraser) {
                         if deferred {
                             // Wait until the pointer has moved a few cells,
                             // then stamp the whole run with that direction.
@@ -853,6 +1451,18 @@ impl FlowPaintApp {
         if response.drag_stopped() {
             if let Some(drag) = self.drag.take() {
                 match drag.tool {
+                    Tool::Select => {
+                        if !drag.sel_move {
+                            let w = (drag.last_cell[0] - drag.start_cell[0]).abs();
+                            let h = (drag.last_cell[1] - drag.start_cell[1]).abs();
+                            if w >= 2.0 && h >= 2.0 {
+                                cmds.push(Cmd::SelectCut {
+                                    a: drag.start_cell,
+                                    b: drag.last_cell,
+                                });
+                            }
+                        }
+                    }
                     Tool::Brush | Tool::Eraser => {
                         if drag.fan_deferred {
                             // A tap: blow along the tunnel axis.
@@ -913,6 +1523,39 @@ impl FlowPaintApp {
             }
         }
 
+        // Floating-selection outline (rotated, dashed).
+        if let Some(sel) = &self.selection {
+            let corners = sel.corners();
+            let pts: Vec<egui::Pos2> =
+                corners.iter().map(|&c| cell_to_pos(c)).collect();
+            let dash_stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 220, 255));
+            for k in 0..4 {
+                let seg = [pts[k], pts[(k + 1) % 4]];
+                painter.extend(egui::Shape::dashed_line(&seg, dash_stroke, 6.0, 4.0));
+            }
+        }
+
+        // Marquee preview while rubber-banding a new selection.
+        if let Some(drag) = &self.drag {
+            if drag.tool == Tool::Select && !drag.sel_move {
+                let a = cell_to_pos(drag.start_cell);
+                let b = cell_to_pos(drag.last_cell);
+                let rect = egui::Rect::from_two_pos(a, b);
+                let dash_stroke =
+                    egui::Stroke::new(1.0, egui::Color32::from_white_alpha(200));
+                let c = [
+                    rect.left_top(),
+                    rect.right_top(),
+                    rect.right_bottom(),
+                    rect.left_bottom(),
+                ];
+                for k in 0..4 {
+                    let seg = [c[k], c[(k + 1) % 4]];
+                    painter.extend(egui::Shape::dashed_line(&seg, dash_stroke, 5.0, 4.0));
+                }
+            }
+        }
+
         // Shape preview while dragging; sized and filled to match what
         // will actually be stamped.
         if let Some(drag) = &self.drag {
@@ -955,7 +1598,119 @@ impl FlowPaintApp {
         }
     }
 
-    fn windows(&mut self, ctx: &egui::Context) {
+    fn generator_windows(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
+        use crate::generators as gen;
+
+        let mut show = self.show_airfoil_gen;
+        egui::Window::new("Airfoil generator")
+            .open(&mut show)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let p = &mut self.airfoil_params;
+                egui::ComboBox::from_label("Famous airfoils")
+                    .selected_text("Choose a preset…")
+                    .show_ui(ui, |ui| {
+                        for (name, m, cp, t, aoa) in gen::AIRFOIL_PRESETS {
+                            if ui.selectable_label(false, name).clicked() {
+                                p.camber = m;
+                                p.camber_pos = if cp > 0.0 { cp } else { 40.0 };
+                                p.thickness = t;
+                                p.aoa_deg = aoa;
+                            }
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.add(egui::Slider::new(&mut p.camber, 0.0..=9.0).text("camber %"));
+                ui.add(
+                    egui::Slider::new(&mut p.camber_pos, 15.0..=70.0)
+                        .text("camber position %"),
+                );
+                ui.add(egui::Slider::new(&mut p.thickness, 4.0..=24.0).text("thickness %"));
+                ui.add(egui::Slider::new(&mut p.aoa_deg, -15.0..=20.0).text("angle of attack °"));
+                ui.add(
+                    egui::Slider::new(&mut p.chord_cells, 60.0..=600.0)
+                        .text("chord (cells)"),
+                );
+                ui.label(format!(
+                    "≈ NACA {:.0}{:.0}{:02.0} at {:.1}°",
+                    p.camber,
+                    (p.camber_pos / 10.0).round(),
+                    p.thickness,
+                    p.aoa_deg
+                ));
+                ui.add_space(6.0);
+                if ui.button("Insert into scene").clicked() {
+                    cmds.push(Cmd::InsertStamp(gen::generate_airfoil(p)));
+                }
+            });
+        self.show_airfoil_gen = show;
+
+        let mut show = self.show_nozzle_gen;
+        egui::Window::new("Rocket nozzle generator")
+            .open(&mut show)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let p = &mut self.nozzle_params;
+                egui::ComboBox::from_label("Famous engines")
+                    .selected_text("Choose a preset…")
+                    .show_ui(ui, |ui| {
+                        for (name, eps, contour) in gen::NOZZLE_PRESETS {
+                            if ui.selectable_label(false, name).clicked() {
+                                // Planar 2D analogue of an axisymmetric area
+                                // ratio: width ratio = sqrt(eps).
+                                p.exit_ratio = eps.sqrt().clamp(1.2, 20.0);
+                                p.contour = contour;
+                                p.div_ratio =
+                                    (1.5 * (p.exit_ratio - 1.0)).clamp(2.0, 16.0);
+                            }
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Slider::new(&mut p.throat_cells, 12.0..=100.0)
+                        .text("throat width (cells)"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.exit_ratio, 1.2..=20.0)
+                        .text("exit / throat width"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.chamber_ratio, 1.5..=4.0)
+                        .text("chamber / throat width"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.conv_ratio, 1.0..=4.0)
+                        .text("converging length / throat"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.div_ratio, 2.0..=16.0)
+                        .text("bell length / throat"),
+                );
+                ui.add(egui::Slider::new(&mut p.wall_cells, 3.0..=12.0).text("wall (cells)"));
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut p.contour, gen::NozzleContour::Bell, "Bell");
+                    ui.radio_value(&mut p.contour, gen::NozzleContour::Conical, "Conical (15°-style)");
+                });
+                ui.checkbox(&mut p.chamber_fan, "Fan in the chamber (self-powered)");
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Note: this solver is incompressible (low Mach), so you get \
+                         the shape and a jet, not real choked-nozzle gas dynamics.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(6.0);
+                if ui.button("Insert into scene").clicked() {
+                    cmds.push(Cmd::InsertStamp(gen::generate_nozzle(p)));
+                }
+            });
+        self.show_nozzle_gen = show;
+    }
+
+    fn windows(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
+        self.generator_windows(ctx, cmds);
         egui::Window::new("About FlowPaint")
             .open(&mut self.show_about)
             .collapsible(false)
@@ -983,10 +1738,14 @@ impl FlowPaintApp {
                     for (k, v) in [
                         ("Space", "pause / resume"),
                         ("Ctrl+Z / Ctrl+Y", "undo / redo"),
-                        ("B / L / R / E / X", "brush / line / rect / ellipse / eraser"),
+                        ("B / L / R / E / X / S", "brush / line / rect / ellipse / eraser / select"),
                         ("[ / ]", "brush size"),
                         ("Right-drag", "erase with any tool"),
-                        ("Esc", "cancel an in-progress shape"),
+                        ("Esc", "cancel shape / selection"),
+                        ("Enter", "apply the floating selection"),
+                        ("Del", "delete the selection"),
+                        ("Arrows (+Shift)", "nudge the selection"),
+                        ("Ctrl+C / Ctrl+V", "copy / paste selection"),
                     ] {
                         ui.label(k);
                         ui.label(v);

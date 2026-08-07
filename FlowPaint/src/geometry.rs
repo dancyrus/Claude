@@ -166,6 +166,12 @@ impl Geometry {
         self.w * self.h
     }
 
+    /// Public dirty-marking for callers that write the layer vectors
+    /// directly (e.g. the selection tool).
+    pub fn touch(&mut self, r: GridRect) {
+        self.mark_dirty(r);
+    }
+
     fn mark_dirty(&mut self, r: GridRect) {
         let r = r.clampped(self.w, self.h);
         if r.is_empty() {
@@ -452,10 +458,13 @@ impl Preset {
 impl Geometry {
     /// Stamp a preset's walls. Assumes the flow axis is horizontal
     /// (left to right); only overwrites fluid cells, so tunnel edges
-    /// survive.
-    pub fn stamp_preset(&mut self, preset: Preset) {
-        let w = self.w as f32;
-        let h = self.h as f32;
+    /// survive. Shape proportions are relative to the VISIBLE window
+    /// `vis`, but stamping iterates the full grid so channel-style
+    /// presets (venturi, step) extend their walls through the margin
+    /// instead of letting flow sneak around them.
+    pub fn stamp_preset(&mut self, preset: Preset, vis: GridRect) {
+        let w = (vis.x1 - vis.x0) as f32;
+        let h = (vis.y1 - vis.y0) as f32;
 
         let circle = |cx: f32, cy: f32, r: f32, x: f32, y: f32| -> bool {
             let dx = x - cx * w;
@@ -516,7 +525,9 @@ impl Geometry {
 
         for y in 0..self.h {
             for x in 0..self.w {
-                if is_wall(x as f32 + 0.5, y as f32 + 0.5) {
+                let sx = x as f32 + 0.5 - vis.x0 as f32;
+                let sy = y as f32 + 0.5 - vis.y0 as f32;
+                if is_wall(sx, sy) {
                     let i = y * self.w + x;
                     if self.cell[i] == CELL_FLUID {
                         self.cell[i] = CELL_WALL;

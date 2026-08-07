@@ -9,15 +9,21 @@
 // NOTE: keep RenderParams in sync with sim.rs (RenderParamsRaw).
 
 struct RenderParams {
-    width: u32,        // grid cells in x
-    height: u32,       // grid cells in y
+    width: u32,        // full grid cells in x (including margin)
+    height: u32,       // full grid cells in y
     mode: u32,         // 0 dye, 1 speed, 2 vorticity, 3 pressure
     flags: u32,        // bit 0: draw boundary tints
     vp_origin: vec2f,  // canvas viewport origin, framebuffer px
     vp_size: vec2f,    // canvas viewport size, framebuffer px
-    lb_origin: vec2f,  // letterboxed grid origin, framebuffer px
+    lb_origin: vec2f,  // letterboxed visible-window origin, framebuffer px
     px_per_cell: f32,
     inlet_speed: f32,
+    vis_origin: vec2u, // visible window offset into the full grid (margin)
+    vis_size: vec2u,   // visible window size in cells
+    display_gain: f32, // user gain on speed/vorticity/pressure mapping
+    smoke_gain: f32,   // user gain on smoke brightness
+    particle_size: f32,        // half-size of a particle quad, px
+    particle_brightness: f32,  // peak particle alpha
 };
 
 const CELL_FLUID: u32 = 0u;
@@ -104,12 +110,14 @@ fn vs_fullscreen(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
 fn fs_field(@builtin(position) frag: vec4f) -> @location(0) vec4f {
     let W = i32(R.width);
     let H = i32(R.height);
-    let g = (frag.xy - R.lb_origin) / R.px_per_cell;
-
-    // Outside the letterboxed grid: canvas background.
-    if (g.x < 0.0 || g.y < 0.0 || g.x >= f32(W) || g.y >= f32(H)) {
+    // Map the pixel into the VISIBLE window, then offset into the full
+    // grid (the margin ring around the window is simulated but not shown).
+    let gv = (frag.xy - R.lb_origin) / R.px_per_cell;
+    if (gv.x < 0.0 || gv.y < 0.0
+        || gv.x >= f32(R.vis_size.x) || gv.y >= f32(R.vis_size.y)) {
         return vec4f(0.09, 0.10, 0.12, 1.0);
     }
+    let g = gv + vec2f(R.vis_origin);
 
     let cx = clamp(i32(g.x), 0, W - 1);
     let cy = clamp(i32(g.y), 0, H - 1);
@@ -139,7 +147,7 @@ fn fs_field(@builtin(position) frag: vec4f) -> @location(0) vec4f {
         switch R.mode {
             case MODE_SPEED: {
                 let s = length(sample_vel(g));
-                col = inferno_map(s / max(R.inlet_speed * 1.6, 1e-3));
+                col = inferno_map(s * R.display_gain / max(R.inlet_speed * 1.6, 1e-3));
             }
             case MODE_VORTICITY: {
                 let vr = sample_vel(g + vec2f(1.0, 0.0));
@@ -147,15 +155,15 @@ fn fs_field(@builtin(position) frag: vec4f) -> @location(0) vec4f {
                 let vu = sample_vel(g + vec2f(0.0, 1.0));
                 let vd = sample_vel(g - vec2f(0.0, 1.0));
                 let curl = 0.5 * ((vr.y - vl.y) - (vu.x - vd.x));
-                col = coolwarm_map(curl * (4.0 / max(R.inlet_speed, 0.02)));
+                col = coolwarm_map(curl * R.display_gain * (4.0 / max(R.inlet_speed, 0.02)));
             }
             case MODE_PRESSURE: {
                 let p = density[idx] - 1.0;
-                col = coolwarm_map(p * 25.0);
+                col = coolwarm_map(p * R.display_gain * 25.0);
             }
             default: { // MODE_DYE
                 let bg = vec3f(0.030, 0.040, 0.070);
-                let d = sample_dye_rgb(g);
+                let d = clamp(sample_dye_rgb(g) * R.smoke_gain, vec3f(0.0), vec3f(1.0));
                 col = 1.0 - (1.0 - bg) * (1.0 - d); // screen blend
             }
         }
@@ -190,6 +198,19 @@ fn vs_particles(@builtin(vertex_index) vi: u32) -> ParticleVsOut {
     let corner = QUAD[vi % 6u];
     let p = particles[pi];
 
+    var out: ParticleVsOut;
+
+    // Cull particles that live in the off-screen margin ring: the letterbox
+    // bars are inside the scissor rect, so they must not be drawn there.
+    let pv = p.xy - vec2f(R.vis_origin);
+    if (pv.x < 0.0 || pv.y < 0.0
+        || pv.x >= f32(R.vis_size.x) || pv.y >= f32(R.vis_size.y)) {
+        out.pos = vec4f(-10.0, -10.0, 0.0, 1.0);
+        out.uv = corner;
+        out.alpha = 0.0;
+        return out;
+    }
+
     let W = i32(R.width);
     let H = i32(R.height);
     let cx = clamp(i32(p.x), 0, W - 1);
@@ -200,13 +221,13 @@ fn vs_particles(@builtin(vertex_index) vi: u32) -> ParticleVsOut {
     let life = max(p.w, 1.0);
     let t = clamp(p.z / life, 0.0, 1.0);
     let envelope = smoothstep(0.0, 0.08, t) * (1.0 - smoothstep(0.75, 1.0, t));
-    let alpha = envelope * clamp(speed / max(R.inlet_speed, 0.02), 0.06, 1.0) * 0.30;
+    let alpha = envelope
+        * clamp(speed / max(R.inlet_speed, 0.02), 0.06, 1.0)
+        * R.particle_brightness;
 
-    let half_px = 1.6;
-    let px = R.lb_origin + p.xy * R.px_per_cell + corner * half_px;
+    let px = R.lb_origin + pv * R.px_per_cell + corner * R.particle_size;
     let ndc = (px - R.vp_origin) / R.vp_size * 2.0 - 1.0;
 
-    var out: ParticleVsOut;
     out.pos = vec4f(ndc.x, -ndc.y, 0.0, 1.0);
     out.uv = corner;
     out.alpha = alpha;

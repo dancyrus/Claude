@@ -11,6 +11,9 @@ struct SimParams {
     inlet_speed: f32,
     dye_dt: f32,
     dye_decay: f32,
+    sponge_width: f32,
+    sponge_strength: f32,
+    free_u: vec2f,
     _pad0: f32,
     _pad1: f32,
 };
