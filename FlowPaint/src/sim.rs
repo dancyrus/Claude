@@ -114,7 +114,7 @@ struct SimParamsRaw {
     sponge_width: f32,
     sponge_strength: f32,
     free_u: [f32; 2],
-    _pad0: f32,
+    time: f32, // lattice steps elapsed (drives fan gusts)
     _pad1: f32,
 }
 
@@ -249,6 +249,8 @@ pub struct GpuSim {
     pub mapping: ViewportMapping,
 
     frame_counter: u32,
+    /// Lattice time (steps) elapsed, fed to the fan-gust animation.
+    lattice_time: f32,
     pending_reset: bool,
     pending_clear_dye: bool,
     /// Steps actually encoded last frame (for stats/particle dt).
@@ -581,6 +583,7 @@ impl GpuSim {
             settings: Settings::default(),
             mapping: ViewportMapping::default(),
             frame_counter: 0,
+            lattice_time: 0.0,
             pending_reset: true,
             pending_clear_dye: true,
             steps_last_frame: 0,
@@ -619,7 +622,7 @@ impl GpuSim {
         let vel = mk("velocity", n * 8);
         let rho = mk("density", n * 4);
         let cell = mk("cell type", n * 4);
-        let fan = mk("fan dir", n * 8);
+        let fan = mk("fan physics", n * 16);
         let dye_a = mk("dye a", n * 16);
         let dye_b = mk("dye b", n * 16);
         let dye_src = mk("dye src", n * 16);
@@ -883,7 +886,7 @@ impl GpuSim {
             let a = row + rect.x0 as usize;
             let b = row + rect.x1 as usize;
             let off_cell = (a * 4) as u64;
-            let off_fan = (a * 8) as u64;
+            let off_fan = (a * 16) as u64;
             let off_src = (a * 16) as u64;
             self.queue.write_buffer(
                 &self.bufs.cell,
@@ -929,9 +932,12 @@ impl GpuSim {
             } else {
                 [0.0, 0.0]
             },
-            _pad0: 0.0,
+            time: self.lattice_time,
             _pad1: 0.0,
         };
+        // Advance after building the params; wrap far below f32 precision
+        // loss (the gust frequencies are ~0.01-0.05 rad/step).
+        self.lattice_time = (self.lattice_time + steps as f32) % 1.0e6;
         self.queue.write_buffer(&self.sim_uniform, 0, bytemuck::bytes_of(&params));
 
         self.frame_counter = self.frame_counter.wrapping_add(1);

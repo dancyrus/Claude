@@ -14,7 +14,7 @@ struct SimParams {
     sponge_width: f32,    // absorbing-layer thickness in cells (0 = off)
     sponge_strength: f32, // absorbing-layer blend strength
     free_u: vec2f,        // freestream velocity the sponge relaxes toward
-    _pad0: f32,
+    time: f32,            // lattice steps elapsed (drives fan gusts)
     _pad1: f32,
 };
 
@@ -29,7 +29,9 @@ const MAX_LATTICE_SPEED: f32 = 0.3;
 @group(0) @binding(1) var<storage, read> f_in: array<f32>;
 @group(0) @binding(2) var<storage, read_write> f_out: array<f32>;
 @group(0) @binding(3) var<storage, read> cell_type: array<u32>;
-@group(0) @binding(4) var<storage, read> fan_dir: array<vec2f>;
+// Fan physics per cell: xy = direction * speed multiplier,
+// z = gustiness (0..1), w = gust phase.
+@group(0) @binding(4) var<storage, read> fan_dir: array<vec4f>;
 @group(0) @binding(5) var<storage, read_write> velocity: array<vec2f>;
 @group(0) @binding(6) var<storage, read_write> density: array<f32>;
 
@@ -94,7 +96,29 @@ fn collide(@builtin(global_invocation_id) gid: vec3u) {
     // --- Boundary cells ----------------------------------------------
     if (ct == CELL_INLET) {
         // Fan: force equilibrium at the painted direction and speed.
-        let u = fan_dir[idx] * P.inlet_speed;
+        // The stored vector's magnitude is a per-fan speed multiplier;
+        // gustiness adds a slow, coherent wander in direction and
+        // strength (two incommensurate sines per quantity).
+        let f4 = fan_dir[idx];
+        var dir = f4.xy;
+        let turb = f4.z;
+        if (turb > 0.0) {
+            let ph = f4.w * 6.2831853;
+            let t = P.time;
+            let ang = turb
+                * (0.55 * sin(0.041 * t + ph)
+                    + 0.30 * sin(0.0127 * t + 2.7 * ph + 1.7));
+            let ca = cos(ang);
+            let sa = sin(ang);
+            dir = vec2f(dir.x * ca - dir.y * sa, dir.x * sa + dir.y * ca);
+            let mag = 1.0 + turb
+                * (0.30 * sin(0.0273 * t + 1.9 * ph + 0.6)
+                    + 0.15 * sin(0.0091 * t + 0.8 * ph + 3.9));
+            dir *= max(mag, 0.0);
+        }
+        var u = dir * P.inlet_speed;
+        let usp = length(u);
+        if (usp > MAX_LATTICE_SPEED) { u *= MAX_LATTICE_SPEED / usp; }
         let usq = dot(u, u);
         for (var i = 0u; i < 9u; i++) { f_out[i * n + idx] = equilibrium(i, 1.0, u, usq); }
         velocity[idx] = u;

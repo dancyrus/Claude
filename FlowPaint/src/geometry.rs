@@ -73,17 +73,23 @@ impl GridRect {
 }
 
 /// A dense rectangular snapshot of the three geometry layers.
+///
+/// Fan cells pack their physics into 4 components:
+/// `[dir.x * speed_mult, dir.y * speed_mult, gustiness, gust_phase]` —
+/// the vector's magnitude is the per-fan speed multiplier on the global
+/// flow speed, gustiness in 0..1 adds time-varying direction/strength
+/// wander, and the phase decorrelates different fans' gusts.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GeoRegion {
     pub rect: (i32, i32, i32, i32),
     pub cell: Vec<u32>,
-    pub fan: Vec<[f32; 2]>,
+    pub fan: Vec<[f32; 4]>,
     pub dye_src: Vec<[f32; 4]>,
 }
 
 impl GeoRegion {
     pub fn byte_size(&self) -> usize {
-        self.cell.len() * 4 + self.fan.len() * 8 + self.dye_src.len() * 16 + 64
+        self.cell.len() * 4 + self.fan.len() * 16 + self.dye_src.len() * 16 + 64
     }
 }
 
@@ -140,10 +146,18 @@ impl UndoStack {
     }
 }
 
-/// Extra parameters a stamp needs: fan direction and smoke color.
+/// Extra parameters a stamp needs: fan physics and smoke color.
 #[derive(Clone, Copy)]
 pub struct BrushContext {
     pub fan_dir: [f32; 2],
+    /// Per-fan multiplier on the global flow speed (encoded as the
+    /// magnitude of the stored fan vector).
+    pub fan_mult: f32,
+    /// 0..1 time-varying gust strength.
+    pub fan_turb: f32,
+    /// Gust phase, decorrelates separate fans (constant per stroke so a
+    /// fan strip gusts coherently).
+    pub fan_phase: f32,
     pub dye_rgb: [f32; 3],
 }
 
@@ -151,7 +165,7 @@ pub struct Geometry {
     pub w: usize,
     pub h: usize,
     pub cell: Vec<u32>,
-    pub fan: Vec<[f32; 2]>,
+    pub fan: Vec<[f32; 4]>,
     pub dye_src: Vec<[f32; 4]>,
     /// Region that needs re-uploading to the GPU (None = clean).
     pub dirty: Option<GridRect>,
@@ -164,7 +178,7 @@ impl Geometry {
             w,
             h,
             cell: vec![CELL_FLUID; n],
-            fan: vec![[0.0; 2]; n],
+            fan: vec![[0.0; 4]; n],
             dye_src: vec![[0.0; 4]; n],
             dirty: Some(GridRect::full(w, h)),
         }
@@ -195,18 +209,23 @@ impl Geometry {
         match material {
             Material::Wall => {
                 self.cell[i] = CELL_WALL;
-                self.fan[i] = [0.0; 2];
+                self.fan[i] = [0.0; 4];
                 self.dye_src[i] = [0.0; 4];
             }
             Material::Fan => {
                 self.cell[i] = CELL_INLET;
-                self.fan[i] = ctx.fan_dir;
+                self.fan[i] = [
+                    ctx.fan_dir[0] * ctx.fan_mult,
+                    ctx.fan_dir[1] * ctx.fan_mult,
+                    ctx.fan_turb,
+                    ctx.fan_phase,
+                ];
                 self.dye_src[i] =
                     [ctx.dye_rgb[0], ctx.dye_rgb[1], ctx.dye_rgb[2], 0.8];
             }
             Material::Drain => {
                 self.cell[i] = CELL_OUTLET;
-                self.fan[i] = [0.0; 2];
+                self.fan[i] = [0.0; 4];
                 self.dye_src[i] = [0.0; 4];
             }
             Material::Smoke => {
@@ -217,7 +236,7 @@ impl Geometry {
             }
             Material::Erase => {
                 self.cell[i] = CELL_FLUID;
-                self.fan[i] = [0.0; 2];
+                self.fan[i] = [0.0; 4];
                 self.dye_src[i] = [0.0; 4];
             }
         }
@@ -380,11 +399,11 @@ impl Geometry {
                 let i = y * self.w + r;
                 if enable {
                     self.cell[i] = CELL_INLET;
-                    self.fan[i] = [1.0, 0.0];
+                    self.fan[i] = [1.0, 0.0, 0.0, 0.0];
                     self.dye_src[i] = if seed { streak } else { [0.0; 4] };
                 } else {
                     self.cell[i] = CELL_FLUID;
-                    self.fan[i] = [0.0; 2];
+                    self.fan[i] = [0.0; 4];
                     self.dye_src[i] = [0.0; 4];
                 }
                 // Outlet on the right edge.
@@ -394,7 +413,7 @@ impl Geometry {
                 } else {
                     self.cell[o] = CELL_FLUID;
                 }
-                self.fan[o] = [0.0; 2];
+                self.fan[o] = [0.0; 4];
                 self.dye_src[o] = [0.0; 4];
             }
         }
@@ -405,7 +424,7 @@ impl Geometry {
     pub fn clear(&mut self) {
         for i in 0..self.n() {
             self.cell[i] = CELL_FLUID;
-            self.fan[i] = [0.0; 2];
+            self.fan[i] = [0.0; 4];
             self.dye_src[i] = [0.0; 4];
         }
         self.mark_dirty(GridRect::full(self.w, self.h));
@@ -556,11 +575,11 @@ pub struct SceneFile {
     pub w: u32,
     pub h: u32,
     pub cell: Vec<u32>,
-    pub fan: Vec<[f32; 2]>,
+    pub fan: Vec<[f32; 4]>,
     pub dye_src: Vec<[f32; 4]>,
     pub wind_tunnel: bool,
     pub flow_speed: f32,
     pub viscosity: f32,
 }
 
-pub const SCENE_VERSION: u32 = 1;
+pub const SCENE_VERSION: u32 = 2;

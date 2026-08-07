@@ -16,18 +16,34 @@ On an RTX 3080 it happily pushes the **Ultra** grid (2560 × 1280 —
 - **Brush** (B) — freehand strokes; **Line** (L), **Rectangle** (R),
   **Ellipse** (E) — rubber-band previews, stamped on release;
   **Eraser** (X). Right-drag erases with any tool.
+- **Polyline** (P) — CAD-style connected wall/fan runs: click vertices,
+  Enter or right-click finishes (one undo entry), Esc cancels.
 - **Select** (S) — marquee-select any drawn region, then **move it live
   through the flow**, rotate, scale, flip, copy/paste (Ctrl+C/V), nudge
   with arrows, Delete, Enter to apply, Esc to cancel. The selection
   stays physically present while you drag it, so the fluid reacts in
-  real time.
+  real time. If it contains fans, sliders appear to retune their
+  speed and gustiness in place.
+- **CAD sketch aids**: live dimension readouts at the cursor (length,
+  angle, width × height), cursor cell coordinates in the status bar,
+  Shift = 45°-snapped lines / squares / circles, Alt = draw rectangles
+  and ellipses from the centre, and an optional snap-to-grid with
+  adjustable spacing.
 - **Materials**: Wall (no-slip solid), Fan (inlet — blows along your
-  stroke or line direction), Smoke (colored dye emitter, with color
-  picker), Drain (pressure outlet).
+  stroke or line direction, with per-fan **speed multiplier** and
+  **gustiness** that makes the jet meander and pulse like a real
+  blustery inflow), Smoke (colored dye emitter, with color picker),
+  Drain (pressure outlet).
 - **Undo/redo** (Ctrl+Z / Ctrl+Y) with region snapshots.
 - Brush size slider + `[` `]` keys; circle cursor preview.
 
-**Generators** (menu):
+**Fluid presets** (Physics panel): one click sets the regime — Still
+air, Gentle breeze, Wind tunnel (air), Storm (high Re), Water flume,
+Glycerin/syrup (creeping flow), and a stylized Supersonic tunnel
+(maximum speed and Reynolds number — the solver is incompressible, so
+no shocks).
+
+**Generators** (side panel):
 - **Airfoil** — full NACA 4-digit generator (camber, camber position,
   thickness, chord, angle of attack) with presets: NACA 0012, 2412
   (Cessna 172), 4412, 0015, 6412, Clark Y, 0006. Inserts as a floating

@@ -14,7 +14,7 @@ struct SimParams {
     sponge_width: f32,
     sponge_strength: f32,
     free_u: vec2f,
-    _pad0: f32,
+    time: f32,
     _pad1: f32,
 };
 

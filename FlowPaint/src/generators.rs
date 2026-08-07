@@ -90,7 +90,7 @@ pub fn generate_airfoil(p: &AirfoilParams) -> GeoRegion {
     let pivot = 0.25;
 
     let mut cell = vec![CELL_FLUID; w * h];
-    let fan = vec![[0.0f32; 2]; w * h];
+    let fan = vec![[0.0f32; 4]; w * h];
     let dye_src = vec![[0.0f32; 4]; w * h];
 
     let (sin_a, cos_a) = alpha.sin_cos();
@@ -232,7 +232,7 @@ pub fn generate_nozzle(p: &NozzleParams) -> GeoRegion {
     let cy = h as f32 * 0.5;
 
     let mut cell = vec![CELL_FLUID; w * h];
-    let mut fan = vec![[0.0f32; 2]; w * h];
+    let mut fan = vec![[0.0f32; 4]; w * h];
     let mut dye_src = vec![[0.0f32; 4]; w * h];
 
     // Inner half-width at any axial position (clamped into the nozzle).
@@ -277,7 +277,7 @@ pub fn generate_nozzle(p: &NozzleParams) -> GeoRegion {
                 // Fan strip across the chamber entrance, blowing +x, with
                 // a little smoke so the plume is visible immediately.
                 cell[i] = CELL_INLET;
-                fan[i] = [1.0, 0.0];
+                fan[i] = [1.0, 0.0, 0.0, 0.0];
                 dye_src[i] = [0.95, 0.85, 0.55, 0.85];
             }
         }
