@@ -1,3 +1,16 @@
+# CFD you can finger paint
+
+Two apps, one idea: draw geometry, place boundary conditions like game
+pieces, and watch a real lattice-Boltzmann fluid solver react in real
+time.
+
+| App | Platform | Where |
+| --- | --- | --- |
+| **FingerFlow** | iPhone / iPad (SwiftUI + Metal) | this page, below |
+| **FlowPaint** | Windows / Linux / macOS desktop (Rust + wgpu) | [`FlowPaint/`](FlowPaint/) — MS-Paint-style shell, multi-million-cell grids, tracer particles, undo/redo, save/export |
+
+---
+
 # FingerFlow — a pocket wind tunnel for iPhone
 
 Draw geometry with your finger, place boundary conditions like game
