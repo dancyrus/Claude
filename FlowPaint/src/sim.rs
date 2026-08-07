@@ -660,6 +660,12 @@ impl GpuSim {
         if (w, h) == (self.geo.w, self.geo.h) {
             return;
         }
+        // Strip tunnel edge cells first so they aren't smeared into ghost
+        // inlet/outlet columns by the resample; they are re-applied on the
+        // new grid below.
+        if self.settings.wind_tunnel {
+            self.geo.apply_wind_tunnel(false);
+        }
         let mut new_geo = Geometry::new(w, h);
         new_geo.resample_from(&self.geo);
         if self.settings.wind_tunnel {
@@ -680,12 +686,21 @@ impl GpuSim {
             &self.particles,
         );
         self.undo.clear();
+        self.clear_particles();
         self.reset_flow();
+    }
+
+    /// Zero the particle buffer so every slot respawns (positions are in
+    /// grid cells and go stale when the grid changes).
+    fn clear_particles(&self) {
+        self.queue
+            .write_buffer(&self.particles, 0, &vec![0u8; (MAX_PARTICLES * 16) as usize]);
     }
 
     pub fn undo_action(&mut self) {
         if let Some(e) = self.undo.pop_undo() {
             self.geo.restore(&e.before);
+            self.reassert_tunnel();
             self.undo.push_redo(e);
         }
     }
@@ -693,7 +708,16 @@ impl GpuSim {
     pub fn redo_action(&mut self) {
         if let Some(e) = self.undo.pop_redo() {
             self.geo.restore(&e.after);
+            self.reassert_tunnel();
             self.undo.push_undo_back(e);
+        }
+    }
+
+    /// Stroke snapshots can capture tunnel edge cells; after restoring one,
+    /// re-assert the tunnel so the boundary matches the toggle.
+    fn reassert_tunnel(&mut self) {
+        if self.settings.wind_tunnel {
+            self.geo.apply_wind_tunnel(true);
         }
     }
 
@@ -977,13 +1001,15 @@ impl GpuSim {
             return Err(format!("unsupported scene version {}", scene.version));
         }
         let (sw, sh) = (scene.w as usize, scene.h as usize);
-        if sw * sh != scene.cell.len()
+        if sw == 0
+            || sh == 0
+            || sw * sh != scene.cell.len()
             || scene.fan.len() != scene.cell.len()
             || scene.dye_src.len() != scene.cell.len()
         {
             return Err("corrupt scene file".into());
         }
-        let loaded = Geometry {
+        let mut loaded = Geometry {
             w: sw,
             h: sh,
             cell: scene.cell,
@@ -991,6 +1017,11 @@ impl GpuSim {
             dye_src: scene.dye_src,
             dirty: None,
         };
+        // Strip the saved tunnel edges before resampling so they aren't
+        // smeared into ghost columns; the tunnel is re-applied below.
+        if scene.wind_tunnel {
+            loaded.apply_wind_tunnel(false);
+        }
         // Resample into the current grid resolution.
         let mut geo = Geometry::new(self.geo.w, self.geo.h);
         geo.resample_from(&loaded);
@@ -1002,6 +1033,7 @@ impl GpuSim {
             self.geo.apply_wind_tunnel(true);
         }
         self.undo.clear();
+        self.clear_particles();
         self.reset_flow();
         Ok(())
     }

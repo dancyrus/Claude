@@ -35,6 +35,15 @@ impl GridRect {
         self.x0 >= self.x1 || self.y0 >= self.y1
     }
     pub fn union(&self, o: GridRect) -> GridRect {
+        // A clamped rect can be "empty" with non-sentinel coordinates
+        // (e.g. a stamp entirely off one edge); unioning those raw
+        // coordinates would inflate the result, so normalize first.
+        if self.is_empty() {
+            return o;
+        }
+        if o.is_empty() {
+            return *self;
+        }
         GridRect {
             x0: self.x0.min(o.x0),
             y0: self.y0.min(o.y0),
@@ -200,6 +209,16 @@ impl Geometry {
         }
     }
 
+    /// Bounding rect of a capsule stamp, before clamping.
+    pub fn capsule_bounds(a: [f32; 2], b: [f32; 2], r: f32) -> GridRect {
+        GridRect {
+            x0: (a[0].min(b[0]) - r).floor() as i32,
+            y0: (a[1].min(b[1]) - r).floor() as i32,
+            x1: (a[0].max(b[0]) + r).ceil() as i32 + 1,
+            y1: (a[1].max(b[1]) + r).ceil() as i32 + 1,
+        }
+    }
+
     /// Stamp a filled capsule from a to b with the given radius (all in
     /// grid cells). Returns the affected rect.
     pub fn stamp_capsule(
@@ -210,13 +229,7 @@ impl Geometry {
         material: Material,
         ctx: &BrushContext,
     ) -> GridRect {
-        let rect = GridRect {
-            x0: (a[0].min(b[0]) - r).floor() as i32,
-            y0: (a[1].min(b[1]) - r).floor() as i32,
-            x1: (a[0].max(b[0]) + r).ceil() as i32 + 1,
-            y1: (a[1].max(b[1]) + r).ceil() as i32 + 1,
-        }
-        .clampped(self.w, self.h);
+        let rect = Self::capsule_bounds(a, b, r).clampped(self.w, self.h);
         if rect.is_empty() {
             return rect;
         }
@@ -387,6 +400,9 @@ impl Geometry {
     /// Nearest-neighbour resample of another geometry into this one
     /// (used when the grid resolution changes).
     pub fn resample_from(&mut self, old: &Geometry) {
+        if old.w == 0 || old.h == 0 {
+            return;
+        }
         for y in 0..self.h {
             let oy = (y * old.h / self.h).min(old.h - 1);
             for x in 0..self.w {

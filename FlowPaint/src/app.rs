@@ -1,7 +1,9 @@
 //! The FlowPaint application: an MS-Paint-style shell (menu bar, tool
 //! palette, status bar) around the GPU fluid canvas.
 
-use crate::geometry::{BrushContext, GeoRegion, GridRect, Material, Preset, UndoEntry};
+use crate::geometry::{
+    BrushContext, GeoRegion, Geometry, GridRect, Material, Preset, UndoEntry,
+};
 use crate::sim::{
     GpuSim, RenderMode, ViewportMapping, PARTICLE_CHOICES, RESOLUTIONS,
 };
@@ -26,11 +28,29 @@ impl Tool {
     ];
 }
 
-/// An in-progress drag on the canvas.
+/// An in-progress drag on the canvas. The tool, material and radius are
+/// captured at drag start so switching them mid-drag (hotkeys, panel)
+/// cannot change or desynchronize an in-flight stroke.
 struct DragState {
     start_cell: [f32; 2],
     last_cell: [f32; 2],
     erase: bool,
+    tool: Tool,
+    material: Material,
+    radius: f32,
+    /// Fan brush strokes defer their first stamp until the drag direction
+    /// is known, so the whole stroke blows the way the pointer moved.
+    fan_deferred: bool,
+}
+
+impl DragState {
+    fn effective_material(&self) -> Material {
+        if self.erase || self.tool == Tool::Eraser {
+            Material::Erase
+        } else {
+            self.material
+        }
+    }
 }
 
 /// Settings snapshot read from the sim before building the UI, so panels
@@ -58,10 +78,12 @@ pub struct FlowPaintApp {
     drag: Option<DragState>,
     // Freehand-stroke undo bookkeeping. These live on the app (not the
     // drag state) because canvas events are queued as commands and applied
-    // after the UI pass; the union rect and the stroke-start snapshot are
-    // only valid once the commands actually run.
+    // after the UI pass; they are only valid once the commands run.
+    // Pre-stroke contents are captured lazily as fixed-size tiles the
+    // first time a stamp touches them, so stroke start never has to copy
+    // the whole grid.
     pending_stroke_rect: GridRect,
-    pending_stroke_before: Option<GeoRegion>,
+    pending_stroke_tiles: std::collections::HashMap<(i32, i32), GeoRegion>,
     show_about: bool,
     show_shortcuts: bool,
     res_index: usize,
@@ -95,7 +117,7 @@ impl FlowPaintApp {
             fan_dir: [1.0, 0.0],
             drag: None,
             pending_stroke_rect: GridRect::empty(),
-            pending_stroke_before: None,
+            pending_stroke_tiles: std::collections::HashMap::new(),
             show_about: false,
             show_shortcuts: false,
             res_index,
@@ -119,13 +141,6 @@ impl FlowPaintApp {
         }
     }
 
-    fn active_material(&self, erase: bool) -> Material {
-        if erase || self.tool == Tool::Eraser {
-            Material::Erase
-        } else {
-            self.material
-        }
-    }
 }
 
 impl eframe::App for FlowPaintApp {
@@ -208,14 +223,34 @@ enum Cmd {
     SetMapping(ViewportMapping),
 }
 
+/// Tile edge length for lazy pre-stroke capture.
+const UNDO_TILE: i32 = 64;
+
+/// Drop any half-tracked stroke state (used when the grid is replaced or
+/// wholesale-cleared so stale snapshots can never pair with a new grid).
+fn clear_stroke_state(app: &mut FlowPaintApp) {
+    app.pending_stroke_rect = GridRect::empty();
+    app.pending_stroke_tiles.clear();
+    app.drag = None;
+}
+
 fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
     match cmd {
         Cmd::TogglePause => sim.settings.paused = !sim.settings.paused,
         Cmd::ResetFlow => sim.reset_flow(),
-        Cmd::ClearAll => sim.clear_all(),
+        Cmd::ClearAll => {
+            clear_stroke_state(app);
+            sim.clear_all();
+        }
         Cmd::SetWindTunnel(on) => sim.set_wind_tunnel(on),
-        Cmd::Preset(p) => sim.apply_preset(p),
-        Cmd::SetResolution(i) => sim.set_resolution(i),
+        Cmd::Preset(p) => {
+            clear_stroke_state(app);
+            sim.apply_preset(p);
+        }
+        Cmd::SetResolution(i) => {
+            clear_stroke_state(app);
+            sim.set_resolution(i);
+        }
         Cmd::SetParticles(nn) => sim.settings.particle_count = nn,
         Cmd::SetRenderMode(m) => sim.settings.render_mode = m,
         Cmd::SetFlowSpeed(v) => sim.settings.flow_speed = v,
@@ -232,6 +267,7 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             };
         }
         Cmd::LoadScene(p) => {
+            clear_stroke_state(app);
             app.status = match sim.load_scene(&p) {
                 Ok(()) => format!("Loaded {}", p.display()),
                 Err(e) => format!("Load failed: {e}"),
@@ -244,6 +280,25 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             };
         }
         Cmd::StampSegment { a, b, r, material } => {
+            // Capture the pre-stroke contents of every tile this stamp can
+            // touch before stamping (first touch wins, so tiles keep their
+            // true pre-stroke data for the whole stroke).
+            let bound =
+                Geometry::capsule_bounds(a, b, r).clampped(sim.geo.w, sim.geo.h);
+            if !bound.is_empty() {
+                for ty in (bound.y0 / UNDO_TILE)..=((bound.y1 - 1) / UNDO_TILE) {
+                    for tx in (bound.x0 / UNDO_TILE)..=((bound.x1 - 1) / UNDO_TILE) {
+                        app.pending_stroke_tiles.entry((tx, ty)).or_insert_with(|| {
+                            sim.geo.extract(GridRect {
+                                x0: tx * UNDO_TILE,
+                                y0: ty * UNDO_TILE,
+                                x1: (tx + 1) * UNDO_TILE,
+                                y1: (ty + 1) * UNDO_TILE,
+                            })
+                        });
+                    }
+                }
+            }
             let ctx = app.brush_ctx();
             let rect = sim.geo.stamp_capsule(a, b, r, material, &ctx);
             app.pending_stroke_rect = app.pending_stroke_rect.union(rect);
@@ -281,49 +336,62 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         }
         Cmd::StrokeBegin => {
             app.pending_stroke_rect = GridRect::empty();
-            app.pending_stroke_before =
-                Some(sim.geo.extract(GridRect::full(sim.geo.w, sim.geo.h)));
+            app.pending_stroke_tiles.clear();
         }
         Cmd::StrokeEnd => {
             let rect = app.pending_stroke_rect.clampped(sim.geo.w, sim.geo.h);
             app.pending_stroke_rect = GridRect::empty();
-            let before_full = app.pending_stroke_before.take();
+            let tiles = std::mem::take(&mut app.pending_stroke_tiles);
             if rect.is_empty() {
                 return;
             }
-            // Crop the stroke-start snapshot to the painted union rect.
-            if let Some(full) = before_full {
-                let before = crop_region(&full, rect);
-                let after = sim.geo.extract(rect);
-                sim.undo.push(UndoEntry { before, after });
-            }
+            let before = assemble_before(&sim.geo, &tiles, rect);
+            let after = sim.geo.extract(rect);
+            sim.undo.push(UndoEntry { before, after });
         }
         Cmd::SetMapping(m) => {
-            sim.mapping = m;
+            // Refit against the sim's authoritative grid size: on a
+            // resolution-switch frame the UI computed this mapping from
+            // last frame's dimensions.
+            sim.mapping =
+                ViewportMapping::fit(m.vp_origin, m.vp_size, sim.geo.w, sim.geo.h);
             sim.write_render_uniform();
         }
     }
 }
 
-/// Crop a full-grid region snapshot down to `rect`.
-fn crop_region(full: &GeoRegion, rect: GridRect) -> GeoRegion {
-    let (fx0, fy0, fx1, _fy1) = full.rect;
-    let fw = (fx1 - fx0) as usize;
+/// Build the pre-stroke contents of `rect` from the lazily captured tiles.
+/// Cells of `rect` never touched by a stamp keep their current contents,
+/// which equal their pre-stroke contents by definition.
+fn assemble_before(
+    geo: &Geometry,
+    tiles: &std::collections::HashMap<(i32, i32), GeoRegion>,
+    rect: GridRect,
+) -> GeoRegion {
+    let mut before = geo.extract(rect);
     let rw = (rect.x1 - rect.x0) as usize;
-    let rh = (rect.y1 - rect.y0) as usize;
-    let mut cell = Vec::with_capacity(rw * rh);
-    let mut fan = Vec::with_capacity(rw * rh);
-    let mut dye_src = Vec::with_capacity(rw * rh);
-    for y in rect.y0..rect.y1 {
-        let src_row = ((y - fy0) as usize) * fw;
-        for x in rect.x0..rect.x1 {
-            let s = src_row + (x - fx0) as usize;
-            cell.push(full.cell[s]);
-            fan.push(full.fan[s]);
-            dye_src.push(full.dye_src[s]);
+    for (&(tx, ty), tile) in tiles {
+        let (t_x0, t_y0, t_x1, t_y1) = tile.rect;
+        debug_assert_eq!((t_x0, t_y0), (tx * UNDO_TILE, ty * UNDO_TILE));
+        let tw = (t_x1 - t_x0) as usize;
+        // Intersection of the tile with the stroke rect.
+        let ix0 = rect.x0.max(t_x0);
+        let iy0 = rect.y0.max(t_y0);
+        let ix1 = rect.x1.min(t_x1);
+        let iy1 = rect.y1.min(t_y1);
+        for y in iy0..iy1 {
+            let src_row = ((y - t_y0) as usize) * tw;
+            let dst_row = ((y - rect.y0) as usize) * rw;
+            for x in ix0..ix1 {
+                let s = src_row + (x - t_x0) as usize;
+                let d = dst_row + (x - rect.x0) as usize;
+                before.cell[d] = tile.cell[s];
+                before.fan[d] = tile.fan[s];
+                before.dye_src[d] = tile.dye_src[s];
+            }
         }
     }
-    GeoRegion { rect: (rect.x0, rect.y0, rect.x1, rect.y1), cell, fan, dye_src }
+    before
 }
 
 // --- UI sections -----------------------------------------------------
@@ -333,6 +401,17 @@ impl FlowPaintApp {
         if ctx.wants_keyboard_input() {
             return;
         }
+        // Escape cancels an in-progress drag: shapes are dropped before
+        // they commit; freehand strokes just end (their paint is already
+        // down, so finalize the undo entry).
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if let Some(drag) = self.drag.take() {
+                if matches!(drag.tool, Tool::Brush | Tool::Eraser) {
+                    cmds.push(Cmd::StrokeEnd);
+                }
+            }
+        }
+        let dragging = self.drag.is_some();
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Space) {
                 cmds.push(Cmd::TogglePause);
@@ -347,20 +426,24 @@ impl FlowPaintApp {
             if i.modifiers.command && i.key_pressed(egui::Key::Y) {
                 cmds.push(Cmd::Redo);
             }
-            if i.key_pressed(egui::Key::B) {
-                self.tool = Tool::Brush;
-            }
-            if i.key_pressed(egui::Key::L) {
-                self.tool = Tool::Line;
-            }
-            if i.key_pressed(egui::Key::R) {
-                self.tool = Tool::Rect;
-            }
-            if i.key_pressed(egui::Key::E) {
-                self.tool = Tool::Ellipse;
-            }
-            if i.key_pressed(egui::Key::X) {
-                self.tool = Tool::Eraser;
+            // Tool switching is disabled mid-drag; the drag carries its own
+            // tool, and switching now would only confuse the preview.
+            if !dragging {
+                if i.key_pressed(egui::Key::B) {
+                    self.tool = Tool::Brush;
+                }
+                if i.key_pressed(egui::Key::L) {
+                    self.tool = Tool::Line;
+                }
+                if i.key_pressed(egui::Key::R) {
+                    self.tool = Tool::Rect;
+                }
+                if i.key_pressed(egui::Key::E) {
+                    self.tool = Tool::Ellipse;
+                }
+                if i.key_pressed(egui::Key::X) {
+                    self.tool = Tool::Eraser;
+                }
             }
             if i.key_pressed(egui::Key::OpenBracket) {
                 self.brush_radius = (self.brush_radius - 2.0).max(1.0);
@@ -507,7 +590,13 @@ impl FlowPaintApp {
                 (Material::Drain, "Drain", "Lets flow leave"),
             ];
             for (m, label, tip) in mats {
-                ui.radio_value(&mut self.material, m, label).on_hover_text(tip);
+                let resp =
+                    ui.radio_value(&mut self.material, m, label).on_hover_text(tip);
+                // Smoke is only visible in the Smoke view; switch so the
+                // first stroke gives immediate feedback.
+                if resp.clicked() && m == Material::Smoke {
+                    cmds.push(Cmd::SetRenderMode(RenderMode::Dye));
+                }
             }
             if self.material == Material::Smoke || self.material == Material::Fan {
                 ui.horizontal(|ui| {
@@ -627,20 +716,26 @@ impl FlowPaintApp {
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
-                let response =
-                    ui.allocate_rect(rect, egui::Sense::click_and_drag());
+                // Sense::drag (not click_and_drag): drags then start on the
+                // press frame at the press position, so a plain click
+                // stamps a dot and strokes anchor exactly where the user
+                // pressed instead of ~6 pt into the gesture.
+                let response = ui.allocate_rect(rect, egui::Sense::drag());
 
                 let ppp = ctx.pixels_per_point();
                 let (gw, gh) = self.stats_grid;
                 if gw == 0 || gh == 0 {
                     return;
                 }
-                let mapping = ViewportMapping::fit(
-                    [rect.min.x * ppp, rect.min.y * ppp],
-                    [rect.width() * ppp, rect.height() * ppp],
-                    gw,
-                    gh,
-                );
+                // Round to whole physical pixels the same way egui rounds
+                // the render-pass viewport, so the particle overlay's NDC
+                // math matches the viewport the GPU actually uses.
+                let x0 = (rect.min.x * ppp).round();
+                let y0 = (rect.min.y * ppp).round();
+                let x1 = (rect.max.x * ppp).round();
+                let y1 = (rect.max.y * ppp).round();
+                let mapping =
+                    ViewportMapping::fit([x0, y0], [x1 - x0, y1 - y0], gw, gh);
                 cmds.push(Cmd::SetMapping(mapping));
 
                 self.canvas_interaction(&response, mapping, ppp, cmds);
@@ -673,17 +768,33 @@ impl FlowPaintApp {
         if response.drag_started() {
             if let Some(pos) = pointer {
                 let cell = to_cell(pos);
-                self.drag = Some(DragState { start_cell: cell, last_cell: cell, erase });
-                if matches!(self.tool, Tool::Brush | Tool::Eraser) {
+                let freehand = matches!(self.tool, Tool::Brush | Tool::Eraser);
+                // Fan brush strokes wait for a direction before stamping.
+                let fan_deferred = freehand
+                    && !erase
+                    && self.tool == Tool::Brush
+                    && self.material == Material::Fan;
+                let drag = DragState {
+                    start_cell: cell,
+                    last_cell: cell,
+                    erase,
+                    tool: self.tool,
+                    material: self.material,
+                    radius: self.brush_radius,
+                    fan_deferred,
+                };
+                if freehand {
                     cmds.push(Cmd::StrokeBegin);
-                    let material = self.active_material(erase);
-                    cmds.push(Cmd::StampSegment {
-                        a: cell,
-                        b: cell,
-                        r: self.brush_radius,
-                        material,
-                    });
+                    if !fan_deferred {
+                        cmds.push(Cmd::StampSegment {
+                            a: cell,
+                            b: cell,
+                            r: drag.radius,
+                            material: drag.effective_material(),
+                        });
+                    }
                 }
+                self.drag = Some(drag);
             }
         }
 
@@ -691,28 +802,49 @@ impl FlowPaintApp {
             if let Some(pos) = pointer {
                 let cell = to_cell(pos);
                 if self.drag.is_some() {
-                    let freehand = matches!(self.tool, Tool::Brush | Tool::Eraser);
-                    let (a, erase_flag) = {
-                        let drag = self.drag.as_mut().unwrap();
-                        let a = drag.last_cell;
-                        drag.last_cell = cell;
-                        (a, drag.erase)
+                    let (a, radius, material, tool, deferred, start) = {
+                        let drag = self.drag.as_ref().unwrap();
+                        (
+                            drag.last_cell,
+                            drag.radius,
+                            drag.effective_material(),
+                            drag.tool,
+                            drag.fan_deferred,
+                            drag.start_cell,
+                        )
                     };
-                    if freehand {
-                        // Fans blow along the stroke direction.
-                        let dx = cell[0] - a[0];
-                        let dy = cell[1] - a[1];
-                        let len = (dx * dx + dy * dy).sqrt();
-                        if len > 1.0 && self.material == Material::Fan {
-                            self.fan_dir = [dx / len, dy / len];
+                    if matches!(tool, Tool::Brush | Tool::Eraser) {
+                        if deferred {
+                            // Wait until the pointer has moved a few cells,
+                            // then stamp the whole run with that direction.
+                            let dx = cell[0] - start[0];
+                            let dy = cell[1] - start[1];
+                            let len = (dx * dx + dy * dy).sqrt();
+                            if len >= 3.0 {
+                                self.fan_dir = [dx / len, dy / len];
+                                let drag = self.drag.as_mut().unwrap();
+                                drag.fan_deferred = false;
+                                drag.last_cell = cell;
+                                cmds.push(Cmd::StampSegment {
+                                    a: start,
+                                    b: cell,
+                                    r: radius,
+                                    material,
+                                });
+                            }
+                        } else {
+                            // Fans blow along the stroke direction.
+                            let dx = cell[0] - a[0];
+                            let dy = cell[1] - a[1];
+                            let len = (dx * dx + dy * dy).sqrt();
+                            if len > 1.0 && material == Material::Fan {
+                                self.fan_dir = [dx / len, dy / len];
+                            }
+                            self.drag.as_mut().unwrap().last_cell = cell;
+                            cmds.push(Cmd::StampSegment { a, b: cell, r: radius, material });
                         }
-                        let material = self.active_material(erase_flag);
-                        cmds.push(Cmd::StampSegment {
-                            a,
-                            b: cell,
-                            r: self.brush_radius,
-                            material,
-                        });
+                    } else {
+                        self.drag.as_mut().unwrap().last_cell = cell;
                     }
                 }
             }
@@ -720,13 +852,23 @@ impl FlowPaintApp {
 
         if response.drag_stopped() {
             if let Some(drag) = self.drag.take() {
-                match self.tool {
+                match drag.tool {
                     Tool::Brush | Tool::Eraser => {
+                        if drag.fan_deferred {
+                            // A tap: blow along the tunnel axis.
+                            self.fan_dir = [1.0, 0.0];
+                            cmds.push(Cmd::StampSegment {
+                                a: drag.start_cell,
+                                b: drag.start_cell,
+                                r: drag.radius,
+                                material: drag.effective_material(),
+                            });
+                        }
                         cmds.push(Cmd::StrokeEnd);
                     }
                     Tool::Line | Tool::Rect | Tool::Ellipse => {
                         // Line direction sets the fan direction.
-                        if self.material == Material::Fan && self.tool == Tool::Line {
+                        if drag.material == Material::Fan && drag.tool == Tool::Line {
                             let dx = drag.last_cell[0] - drag.start_cell[0];
                             let dy = drag.last_cell[1] - drag.start_cell[1];
                             let len = (dx * dx + dy * dy).sqrt();
@@ -734,13 +876,12 @@ impl FlowPaintApp {
                                 self.fan_dir = [dx / len, dy / len];
                             }
                         }
-                        let material = self.active_material(drag.erase);
                         cmds.push(Cmd::ShapeCommit {
-                            tool: self.tool,
+                            tool: drag.tool,
                             a: drag.start_cell,
                             b: drag.last_cell,
-                            r: self.brush_radius,
-                            material,
+                            r: drag.radius,
+                            material: drag.effective_material(),
                         });
                     }
                 }
@@ -772,31 +913,42 @@ impl FlowPaintApp {
             }
         }
 
-        // Shape preview while dragging.
+        // Shape preview while dragging; sized and filled to match what
+        // will actually be stamped.
         if let Some(drag) = &self.drag {
             let a = cell_to_pos(drag.start_cell);
             let b = cell_to_pos(drag.last_cell);
-            match self.tool {
+            let fill = egui::Color32::from_white_alpha(30);
+            match drag.tool {
                 Tool::Line => {
+                    // Preview at the true committed thickness (a capsule
+                    // of radius brush_radius cells).
+                    let w = (2.0 * drag.radius * mapping.px_per_cell / ppp).max(1.5);
+                    painter.line_segment(
+                        [a, b],
+                        egui::Stroke::new(w, egui::Color32::from_white_alpha(70)),
+                    );
                     painter.line_segment([a, b], stroke);
                 }
                 Tool::Rect => {
-                    painter.rect_stroke(egui::Rect::from_two_pos(a, b), 0.0, stroke);
+                    let rect = egui::Rect::from_two_pos(a, b);
+                    painter.rect_filled(rect, 0.0, fill);
+                    painter.rect_stroke(rect, 0.0, stroke);
                 }
                 Tool::Ellipse => {
                     let rect = egui::Rect::from_two_pos(a, b);
                     // egui has no ellipse primitive; approximate with a
-                    // polyline.
+                    // polygon.
                     let c = rect.center();
                     let rx = rect.width() * 0.5;
                     let ry = rect.height() * 0.5;
-                    let pts: Vec<egui::Pos2> = (0..=48)
+                    let pts: Vec<egui::Pos2> = (0..48)
                         .map(|i| {
                             let t = i as f32 / 48.0 * std::f32::consts::TAU;
                             egui::pos2(c.x + rx * t.cos(), c.y + ry * t.sin())
                         })
                         .collect();
-                    painter.add(egui::Shape::line(pts, stroke));
+                    painter.add(egui::Shape::convex_polygon(pts, fill, stroke));
                 }
                 _ => {}
             }
@@ -834,6 +986,7 @@ impl FlowPaintApp {
                         ("B / L / R / E / X", "brush / line / rect / ellipse / eraser"),
                         ("[ / ]", "brush size"),
                         ("Right-drag", "erase with any tool"),
+                        ("Esc", "cancel an in-progress shape"),
                     ] {
                         ui.label(k);
                         ui.label(v);
