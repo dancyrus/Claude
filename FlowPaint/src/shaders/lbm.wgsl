@@ -103,17 +103,20 @@ fn collide(@builtin(global_invocation_id) gid: vec3u) {
         var dir = f4.xy;
         let turb = f4.z;
         if (turb > 0.0) {
+            // Gust frequencies are exact multiples of 2*pi/65536 per
+            // step (428, 132, 285 and 95 of them), so the CPU-side time
+            // wrap at 65536 steps is phase-continuous — no popping.
             let ph = f4.w * 6.2831853;
             let t = P.time;
             let ang = turb
-                * (0.55 * sin(0.041 * t + ph)
-                    + 0.30 * sin(0.0127 * t + 2.7 * ph + 1.7));
+                * (0.55 * sin(0.04103400 * t + ph)
+                    + 0.30 * sin(0.01265534 * t + 2.7 * ph + 1.7));
             let ca = cos(ang);
             let sa = sin(ang);
             dir = vec2f(dir.x * ca - dir.y * sa, dir.x * sa + dir.y * ca);
             let mag = 1.0 + turb
-                * (0.30 * sin(0.0273 * t + 1.9 * ph + 0.6)
-                    + 0.15 * sin(0.0091 * t + 0.8 * ph + 3.9));
+                * (0.30 * sin(0.02732404 * t + 1.9 * ph + 0.6)
+                    + 0.15 * sin(0.00910801 * t + 0.8 * ph + 3.9));
             dir *= max(mag, 0.0);
         }
         var u = dir * P.inlet_speed;

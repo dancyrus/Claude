@@ -446,6 +446,9 @@ impl FlowPaintApp {
         }
         let pts = std::mem::take(&mut self.polyline);
         self.roll_fan_phase();
+        // Pin the phase at queue time: another stroke starting this same
+        // frame will roll again, and stamps read the phase at apply time.
+        cmds.push(Cmd::SetFanPhase(self.fan_phase));
         cmds.push(Cmd::StrokeBegin);
         if pts.len() == 1 {
             cmds.push(Cmd::StampSegment {
@@ -581,8 +584,13 @@ enum Cmd {
     /// Per-segment fan direction override (used by the polyline tool so
     /// each segment of a fan duct blows along itself).
     SetFanDir([f32; 2]),
-    /// Retune the fan cells inside the floating selection.
-    SetSelectionFanPhysics { mult: f32, turb: f32 },
+    /// Pin the gust phase for subsequently applied stamps (queued at
+    /// stroke-queue time so same-frame strokes keep distinct phases).
+    SetFanPhase(f32),
+    /// Retune the fan cells inside the floating selection. Only the
+    /// properties that are Some are written, so touching one slider
+    /// doesn't homogenize the other across mixed fans.
+    SetSelectionFanPhysics { mult: Option<f32>, turb: Option<f32> },
     // Selection (coordinates in visible cells).
     SelectCut { a: [f32; 2], b: [f32; 2] },
     SelectUpdate,
@@ -604,6 +612,9 @@ fn clear_stroke_state(app: &mut FlowPaintApp) {
     app.pending_stroke_rect = GridRect::empty();
     app.pending_stroke_tiles.clear();
     app.drag = None;
+    // Polyline vertices are absolute visible-cell coordinates; they are
+    // meaningless on a replaced grid.
+    app.polyline.clear();
     // A floating selection is abandoned outright: the grid it was stamped
     // into is being replaced wholesale.
     app.selection = None;
@@ -721,8 +732,16 @@ fn refresh_sel_fan_cache(app: &mut FlowPaintApp) {
 }
 
 /// Start a new selection session around `source` (already based at 0,0).
-fn start_selection(sim: &mut GpuSim, app: &mut FlowPaintApp, source: GeoRegion, pos: [f32; 2]) {
+/// Used by paste and generator insertion; fan cells in the incoming
+/// content get a fresh gust phase so separate insertions decorrelate.
+fn start_selection(sim: &mut GpuSim, app: &mut FlowPaintApp, mut source: GeoRegion, pos: [f32; 2]) {
     commit_selection(sim, app);
+    app.roll_fan_phase();
+    for (i, &c) in source.cell.iter().enumerate() {
+        if c == crate::geometry::CELL_INLET {
+            source.fan[i][3] = app.fan_phase;
+        }
+    }
     app.pending_stroke_rect = GridRect::empty();
     app.pending_stroke_tiles.clear();
     app.selection = Some(Selection {
@@ -927,6 +946,9 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::SetFanDir(d) => {
             app.fan_dir = d;
         }
+        Cmd::SetFanPhase(p) => {
+            app.fan_phase = p;
+        }
         Cmd::SetSelectionFanPhysics { mult, turb } => {
             let mut changed = false;
             if let Some(sel) = app.selection.as_mut() {
@@ -934,16 +956,20 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
                     if sel.source.cell[i] != crate::geometry::CELL_INLET {
                         continue;
                     }
-                    let len = (f[0] * f[0] + f[1] * f[1]).sqrt();
-                    if len > 1e-4 {
-                        let k = mult / len;
-                        f[0] *= k;
-                        f[1] *= k;
-                    } else {
-                        f[0] = mult;
-                        f[1] = 0.0;
+                    if let Some(mult) = mult {
+                        let len = (f[0] * f[0] + f[1] * f[1]).sqrt();
+                        if len > 1e-4 {
+                            let k = mult / len;
+                            f[0] *= k;
+                            f[1] *= k;
+                        } else {
+                            f[0] = mult;
+                            f[1] = 0.0;
+                        }
                     }
-                    f[2] = turb;
+                    if let Some(turb) = turb {
+                        f[2] = turb;
+                    }
                     changed = true;
                 }
             }
@@ -1125,12 +1151,14 @@ impl FlowPaintApp {
             }
         }
 
-        // Enter finishes a pending polyline.
+        // Enter finishes a pending polyline. Also drop any in-flight
+        // vertex drag so the mouse release can't seed a stray new one.
         if self.tool == Tool::Polyline
             && !self.polyline.is_empty()
             && ctx.input(|i| i.key_pressed(egui::Key::Enter))
         {
             self.commit_polyline(cmds);
+            self.drag = None;
         }
 
         // Selection keys.
@@ -1169,10 +1197,12 @@ impl FlowPaintApp {
             });
         }
         // Paste only when no stroke is in flight: starting a selection
-        // session mid-drag would conflate the two undo sessions.
+        // session mid-drag would conflate the two undo sessions. A
+        // pending polyline commits first for the same reason.
         if self.drag.is_none()
             && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
         {
+            self.commit_polyline(cmds);
             cmds.push(Cmd::PasteClipboard);
         }
         let dragging = self.drag.is_some();
@@ -1238,6 +1268,8 @@ impl FlowPaintApp {
                             .add_filter("FlowPaint scene", &["flow"])
                             .pick_file()
                         {
+                            // The file carries its own flow/viscosity.
+                            self.fluid_preset_idx = None;
                             cmds.push(Cmd::LoadScene(p));
                         }
                         ui.close_menu();
@@ -1417,23 +1449,28 @@ impl FlowPaintApp {
                 if self.sel_has_fans {
                     ui.add_space(4.0);
                     ui.label("Fans in selection:");
-                    let mut fan_changed = false;
-                    fan_changed |= ui
+                    if ui
                         .add(
                             egui::Slider::new(&mut self.sel_fan_mult, 0.2..=2.0)
                                 .text("speed ×"),
                         )
-                        .changed();
-                    fan_changed |= ui
+                        .changed()
+                    {
+                        cmds.push(Cmd::SetSelectionFanPhysics {
+                            mult: Some(self.sel_fan_mult),
+                            turb: None,
+                        });
+                    }
+                    if ui
                         .add(
                             egui::Slider::new(&mut self.sel_fan_turb, 0.0..=1.0)
                                 .text("gustiness"),
                         )
-                        .changed();
-                    if fan_changed {
+                        .changed()
+                    {
                         cmds.push(Cmd::SetSelectionFanPhysics {
-                            mult: self.sel_fan_mult,
-                            turb: self.sel_fan_turb,
+                            mult: None,
+                            turb: Some(self.sel_fan_turb),
                         });
                     }
                 }
@@ -1556,12 +1593,18 @@ impl FlowPaintApp {
                         let sel = self.fluid_preset_idx == Some(i);
                         if ui.selectable_label(sel, p.name).on_hover_text(p.desc).clicked() {
                             self.fluid_preset_idx = Some(i);
-                            cmds.push(Cmd::SetWindTunnel(p.tunnel));
+                            // Only touch the tunnel when it actually
+                            // changes: SetWindTunnel commits any floating
+                            // selection and rewrites the tunnel columns.
+                            if p.tunnel != snap.tunnel {
+                                cmds.push(Cmd::SetWindTunnel(p.tunnel));
+                            }
                             cmds.push(Cmd::SetFlowSpeed(p.flow));
                             cmds.push(Cmd::SetViscosity(p.visc));
-                            if let Some(s) = p.steps {
-                                cmds.push(Cmd::SetSteps(s));
-                            }
+                            // Presets own the sub-step count too, so e.g.
+                            // Supersonic's 16 steps don't leak into the
+                            // next regime.
+                            cmds.push(Cmd::SetSteps(p.steps.unwrap_or(8)));
                             self.status = format!("Fluid preset: {}", p.name);
                         }
                     }
@@ -1588,6 +1631,7 @@ impl FlowPaintApp {
                 .add(egui::Slider::new(&mut steps, 1..=32).text("steps / frame"))
                 .changed()
             {
+                self.fluid_preset_idx = None;
                 cmds.push(Cmd::SetSteps(steps));
             }
             if ui
@@ -1597,6 +1641,7 @@ impl FlowPaintApp {
                 cmds.push(Cmd::SetDyeFade(fade));
             }
             if ui.checkbox(&mut tunnel, "Wind tunnel (left to right)").changed() {
+                self.fluid_preset_idx = None;
                 cmds.push(Cmd::SetWindTunnel(tunnel));
             }
 
@@ -1809,9 +1854,12 @@ impl FlowPaintApp {
                     } else {
                         cell
                     };
-                    // Every new fan stroke gusts on its own schedule.
+                    // Every new fan stroke gusts on its own schedule; the
+                    // phase is pinned via a command so it survives other
+                    // same-frame rolls (stamps read it at apply time).
                     if self.material == Material::Fan && !erase {
                         self.roll_fan_phase();
+                        cmds.push(Cmd::SetFanPhase(self.fan_phase));
                     }
                     let freehand = matches!(self.tool, Tool::Brush | Tool::Eraser);
                     // Fan brush strokes wait for a direction before stamping.
@@ -2201,7 +2249,9 @@ impl FlowPaintApp {
                 ));
                 ui.add_space(6.0);
                 if ui.button("Insert into scene").clicked() {
-                    cmds.push(Cmd::InsertStamp(gen::generate_airfoil(p)));
+                    let stamp = gen::generate_airfoil(p);
+                    self.commit_polyline(cmds); // don't orphan a pending sketch
+                    cmds.push(Cmd::InsertStamp(stamp));
                 }
             });
         self.show_airfoil_gen = show;
@@ -2264,7 +2314,9 @@ impl FlowPaintApp {
                 );
                 ui.add_space(6.0);
                 if ui.button("Insert into scene").clicked() {
-                    cmds.push(Cmd::InsertStamp(gen::generate_nozzle(p)));
+                    let stamp = gen::generate_nozzle(p);
+                    self.commit_polyline(cmds); // don't orphan a pending sketch
+                    cmds.push(Cmd::InsertStamp(stamp));
                 }
             });
         self.show_nozzle_gen = show;

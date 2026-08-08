@@ -935,9 +935,11 @@ impl GpuSim {
             time: self.lattice_time,
             _pad1: 0.0,
         };
-        // Advance after building the params; wrap far below f32 precision
-        // loss (the gust frequencies are ~0.01-0.05 rad/step).
-        self.lattice_time = (self.lattice_time + steps as f32) % 1.0e6;
+        // Advance after building the params. The wrap period is the
+        // common period of the shader's gust sinusoids (all exact
+        // multiples of 2*pi/65536 per step), so wrapping is
+        // phase-continuous, and 65536 is far below f32 precision loss.
+        self.lattice_time = (self.lattice_time + steps as f32) % 65536.0;
         self.queue.write_buffer(&self.sim_uniform, 0, bytemuck::bytes_of(&params));
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
@@ -1192,6 +1194,16 @@ impl GpuSim {
 
     pub fn load_scene(&mut self, path: &std::path::Path) -> Result<(), String> {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        // Peek the version first: an old-layout file usually fails full
+        // deserialization with an unhelpful I/O error otherwise (bincode
+        // fixint LE stores the leading u32 verbatim).
+        if bytes.len() < 4 {
+            return Err("corrupt scene file".into());
+        }
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if version != crate::geometry::SCENE_VERSION {
+            return Err(format!("unsupported scene version {version}"));
+        }
         let scene: crate::geometry::SceneFile =
             bincode::deserialize(&bytes).map_err(|e| e.to_string())?;
         if scene.version != crate::geometry::SCENE_VERSION {
