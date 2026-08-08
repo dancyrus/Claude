@@ -64,16 +64,20 @@ no shocks).
   what you're watching.
 - Wind-tunnel mode (left → right) with automatic smoke streaklines
   entering from the far upstream edge.
-- Presets: cylinder (von Kármán vortex street), NACA 0012 airfoil,
-  venturi nozzle, backward-facing step, pinball field.
+- Scene presets in the side panel: cylinder (von Kármán vortex street),
+  NACA 0012 airfoil, venturi nozzle, backward-facing step, pinball
+  field.
 - Live controls: flow speed, viscosity (Reynolds number readout),
   solver sub-steps per frame, smoke persistence, pause (Space) / reset,
   plus advanced controls for display gain, smoke brightness, edge
   damping, and particle size/brightness.
 - Visible resolutions from 960 × 480 to 2560 × 1280 (the simulated grid
   is bigger by the margin), resampling your drawing on switch.
-- Tracer particles are **off by default** — enable them under
-  View → Particles.
+- Tracer particles are **off by default** — enable them from the View
+  section of the side panel.
+- The menu bar carries only rarely used operations (file open/save,
+  PNG export, grid resolution, domain margin, help); everything you
+  touch while playing lives in the side panel.
 
 **Views:** Smoke, Speed (inferno), Vorticity, Pressure (diverging), with
 optional highlight tints on fans/drains, plus the particle layer.

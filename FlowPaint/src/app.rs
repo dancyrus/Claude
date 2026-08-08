@@ -1320,14 +1320,6 @@ impl FlowPaintApp {
                     }
                 });
                 ui.menu_button("Simulation", |ui| {
-                    ui.menu_button("Presets", |ui| {
-                        for p in Preset::ALL {
-                            if ui.button(p.label()).clicked() {
-                                cmds.push(Cmd::Preset(p));
-                                ui.close_menu();
-                            }
-                        }
-                    });
                     ui.menu_button("Grid resolution", |ui| {
                         for (i, (label, _, _)) in RESOLUTIONS.iter().enumerate() {
                             if ui
@@ -1354,17 +1346,6 @@ impl FlowPaintApp {
                         }
                     });
                 });
-                ui.menu_button("View", |ui| {
-                    ui.menu_button("Particles", |ui| {
-                        for (i, (label, count)) in PARTICLE_CHOICES.iter().enumerate() {
-                            if ui.radio(i == self.particle_index, *label).clicked() {
-                                self.particle_index = i;
-                                cmds.push(Cmd::SetParticles(*count));
-                                ui.close_menu();
-                            }
-                        }
-                    });
-                });
                 ui.menu_button("Help", |ui| {
                     if ui.button("Keyboard shortcuts").clicked() {
                         self.show_shortcuts = true;
@@ -1381,6 +1362,14 @@ impl FlowPaintApp {
 
     fn side_panel(&mut self, ctx: &egui::Context, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
         egui::SidePanel::left("tools").min_width(210.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.side_panel_contents(ui, snap, cmds);
+            });
+        });
+    }
+
+    fn side_panel_contents(&mut self, ui: &mut egui::Ui, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
+        {
             ui.add_space(4.0);
             ui.heading("Tools");
             ui.horizontal_wrapped(|ui| {
@@ -1557,6 +1546,28 @@ impl FlowPaintApp {
 
             ui.add_space(6.0);
             ui.separator();
+            ui.heading("Scene presets");
+            ui.horizontal_wrapped(|ui| {
+                for p in Preset::ALL {
+                    let short = match p {
+                        Preset::Cylinder => "Cylinder",
+                        Preset::Airfoil => "Airfoil",
+                        Preset::Venturi => "Venturi",
+                        Preset::Step => "Step",
+                        Preset::Pinball => "Pinball",
+                    };
+                    if ui
+                        .button(short)
+                        .on_hover_text(format!("{} — replaces the scene", p.label()))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::Preset(p));
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.separator();
             ui.heading("View");
             // Local mirrors so widgets show the live values.
             let mut flow = snap.flow;
@@ -1578,6 +1589,19 @@ impl FlowPaintApp {
             if ui.checkbox(&mut tints, "Highlight fans && drains").changed() {
                 cmds.push(Cmd::SetBoundaryTints(tints));
             }
+            egui::ComboBox::from_label("particles")
+                .selected_text(PARTICLE_CHOICES[self.particle_index].0)
+                .show_ui(ui, |ui| {
+                    for (i, (label, count)) in PARTICLE_CHOICES.iter().enumerate() {
+                        if ui
+                            .selectable_label(i == self.particle_index, *label)
+                            .clicked()
+                        {
+                            self.particle_index = i;
+                            cmds.push(Cmd::SetParticles(*count));
+                        }
+                    }
+                });
 
             ui.add_space(6.0);
             ui.separator();
@@ -1718,7 +1742,7 @@ impl FlowPaintApp {
                     cmds.push(Cmd::Redo);
                 }
             });
-        });
+        }
     }
 
     fn status_bar(&mut self, ctx: &egui::Context) {
