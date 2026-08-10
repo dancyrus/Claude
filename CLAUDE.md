@@ -17,12 +17,18 @@ panel arrangement — not for widget construction or numeric values.
 
 ## Unit status (plan v4.1)
 
-- **U1 (cleanup + navigation): done**, branch `claude/flowpaint-v4.1-u1-nav-o8c1im`.
-  Next: U2 (one author, no delegation) and T2-A may run concurrently;
-  T2-B waits for U1 to merge (`ui/status.rs`).
+Per-unit decisions later units must not re-derive live in
+`docs/unit-decisions.md` — read it before starting any unit.
+
+- **U1 (cleanup + navigation): done**, branch
+  `claude/flowpaint-v4.1-u1-nav-o8c1im`.
 - **U2 (multi-select + tier): done**, branch
   `claude/flowpaint-u2-multi-select-kvfbsi` (off the U1 branch).
   Next: U3 and U4 are unblocked (both need U2's selection set).
+- **T2-A (color range + colormap): done**, branch
+  `claude/t2a-color-range-opuijy` (off `34d57aa`, no U1); write-up in
+  `docs/t2a-color-range.md`. Asymmetric manual min/max deliberately
+  unimplemented (needs a per-mode offset in `render.wgsl`).
 - Scene format: **v6** current, loads v3+ (v3 lacks solver fields;
   v4/v5 share a layout; v6 appends per-object `locked`/`hidden`, so
   pre-v6 objects decode via the `SketchObjectV5` mirror — see
@@ -31,60 +37,16 @@ panel arrangement — not for widget construction or numeric values.
   was already current before U2 — U2 went to **v6**. U3 and T2-C: the
   next bump is **v7**; do not repeat the plan's off-by-one.
 - T2-A's locked color ranges and colormap picks live behind a Mutex in
-  `sim.rs` on the T2-A branch (app.rs is frozen while both tracks run)
-  and are NOT in scene v6. Persisting them is a track-merge task; U5
-  depends on it.
-- U1 decisions a later unit must not re-derive:
-  - Inspector Rotate/Scale DragValues are **staged deltas per selection**
-    (`inspector_stage`), not absolute properties — a selection has no
-    single angle, so this is the form U3 extends to a common pivot.
-  - Zoom/pan is a view transform on `px_per_cell`/`lb_origin` only:
-    canvas owns `view_zoom`/`view_center`/`view_fit`; `Cmd::SetMapping`
-    is a passthrough (no re-fit); ribbon/Ctrl+0/1/2 talk to the canvas
-    via `ViewRequest`. Grid, margin, `domain_width_m`, readouts:
-    untouched by design — treat any coupling as a bug.
-  - Space pauses on **release** (held Space + drag pans); pick
-    thresholds are screen-space (no cell floors).
-  - `MARGIN_CHOICES`/`PARTICLE_CHOICES` have no off entry; off is a
-    checkbox (`margin_on`/`particles_on`) and the index remembers the
-    last value. Single-step = `Cmd::StepOnce` → `GpuSim::step_once`.
-- U2 decisions a later unit must not re-derive:
-  - Selection is `selected: Vec<u64>` — an ordered set: insertion
-    order, no duplicates, last = primary. ALL writes go through the
-    helpers in `app.rs` (`select_only`/`select_add`/`select_toggle`/
-    `deselect`/`deselect_all`); `prune_selection` runs once per frame.
-    Locked objects can enter the selection only via the tree and are
-    filtered by `editable_selection()` at every mutating operation.
-  - **Rubber-band = INTERSECT**, not fully-contain
-    (`SketchObject::intersects_rect`): FlowPaint scenes are dominated
-    by thin open geometry (lines, polylines, outline shapes), where
-    fully-contain would force lassoing an object's whole extent to
-    grab it. Touching the band selects.
-  - Modifiers: canvas Shift-click toggles membership; tree Ctrl-click
-    toggles, Shift-click ranges from `tree_anchor`. Tree lists objects
-    TOP-FIRST (reverse model order); `model.objects` order IS z-order
-    (later = rasterized later = wins overlaps), reordered undoably via
-    `SketchModel::reorder`.
-  - One undo entry per user action across a selection:
-    `ModelOp::Group` (+ `add_many`/`remove_many`/`record_modify_many`
-    (`_coalesced`)); group undo applies members in reverse.
-  - Ctrl+C/V NEVER arrive as key events — egui swallows them into
-    `Event::Copy`/`Event::Paste`, and Paste only fires when the system
-    clipboard holds text, so `copy_selected` writes the
-    `CLIPBOARD_MARKER` breadcrumb text and paste matches it. The
-    object clipboard itself is app-internal (`clipboard`/`paste_gen`).
-  - Nudge is 1 cell, Shift = 8 (plan v4.1 flipped U1's Shift-for-fine).
-  - Hidden objects are skipped by `rasterize_region` and `hit_test`;
-    locked ones by `hit_test` only. Engaging either drops the object
-    from the selection; both persist in scene v6.
-  - Multi-selection inspector shows mixed-value indicators; an edit
-    applies to the whole editable selection (never silently seeded
-    from the first object). Rotate/scale of a set is deferred to U3.
+  `sim.rs` (app.rs was frozen while both tracks ran) and are NOT in
+  scene v6. Folding them into `Settings` + `Cmd` and persisting them
+  is a track-merge task; U5 depends on it.
 
 ## Hard rules
 
 - **Never edit anything under `FlowPaint/src/shaders/`** during the UI
-  effort. The inferno/coolwarm stop tables in `app.rs` mirror
+  effort. One approved exception has landed: T2-A's colormap-swap
+  branches in `render.wgsl` (`flags` bit 1; no uniform added or
+  reordered). The inferno/coolwarm stop tables in `app.rs` mirror
   `render.wgsl` and must stay linked to it (don't re-theme them alone).
 - **egui stays at 0.29.1 — the upgrade is deferred** (plan v3). Moving
   to 0.35 drags wgpu 22→29 through all of `sim.rs`. API breaks waiting

@@ -2,7 +2,7 @@
 //! color-scale bar for the current view.
 
 use crate::app::{coolwarm_color, inferno_color, FlowPaintApp, UiSnapshot};
-use crate::sim::{RenderMode, SolverMode};
+use crate::sim::{color_ranges, ColorMap, FieldRange, RangeMode, RenderMode, SolverMode};
 use eframe::egui;
 
 use super::units::{
@@ -11,15 +11,91 @@ use super::units::{
 };
 
 impl FlowPaintApp {
+    /// Physical value of one render-buffer unit of a field — the factor
+    /// the legend uses to invert the shader's normalization (T2-A). All
+    /// unit conversions for the color range live here, app-side; the sim
+    /// stores render-unit values only.
+    fn range_phys_per_render(&self, mode: RenderMode, snap: &UiSnapshot) -> f32 {
+        let ps = self.phys_cache;
+        let euler = snap.solver == SolverMode::Euler;
+        match mode {
+            // LBM: lattice cells/step. Euler: the buffer stores u * dt
+            // with u in units of a∞.
+            RenderMode::Speed => {
+                if euler {
+                    self.fluid_a / snap.euler_dt.max(1e-6)
+                } else {
+                    ps.u_phys(1.0)
+                }
+            }
+            RenderMode::Vorticity => 1.0 / ps.dt,
+            // LBM: density deviation, p = cs² · Δρ. Euler: the density
+            // buffer stores 1 + 0.1 · (p − p∞), p in units of ρ∞ a∞².
+            RenderMode::Pressure => {
+                if euler {
+                    10.0 * self.fluid_rho * self.fluid_a * self.fluid_a
+                } else {
+                    ps.pressure_pa(1.0, self.fluid_rho)
+                }
+            }
+            RenderMode::Dye => 1.0,
+        }
+    }
+
+    /// Saturation point of a mode's AUTO range in render units — where
+    /// the shader's normalization clips with the current settings (each
+    /// formula inverts the corresponding mapping in render.wgsl).
+    fn auto_sat_render(mode: RenderMode, snap: &UiSnapshot) -> f32 {
+        let gain = snap.display_gain.max(1e-3);
+        let inlet = if snap.solver == SolverMode::Euler {
+            snap.mach * snap.euler_dt
+        } else {
+            snap.flow
+        };
+        match mode {
+            RenderMode::Speed => (inlet * 1.6).max(1e-3) / gain,
+            RenderMode::Vorticity => inlet.max(0.02) / (4.0 * gain),
+            RenderMode::Pressure => 1.0 / (25.0 * gain),
+            RenderMode::Dye => 1.0,
+        }
+    }
+
+    /// Reconcile the shared color-range state with this frame's physical
+    /// scaling: a pinned (Locked/Manual) range holds its physical value
+    /// and gets its render-unit twin rewritten, while Auto tracks the
+    /// current settings in both — so switching to Locked or Manual starts
+    /// from exactly what is on screen, with no separate capture step.
+    /// Runs every frame (called before the legend's early-out).
+    fn sync_color_ranges(&self, snap: &UiSnapshot) {
+        let mut cr = color_ranges().lock().unwrap();
+        for mode in [RenderMode::Speed, RenderMode::Vorticity, RenderMode::Pressure] {
+            let k = self.range_phys_per_render(mode, snap).max(1e-12);
+            let fr = &mut cr[mode as usize];
+            match fr.mode {
+                RangeMode::Locked | RangeMode::Manual => {
+                    fr.sat_render = (fr.sat_phys / k).max(1e-9)
+                }
+                RangeMode::Auto => {
+                    fr.sat_render = Self::auto_sat_render(mode, snap);
+                    fr.sat_phys = fr.sat_render * k;
+                }
+            }
+        }
+    }
+
     /// The right-hand legend: the important flow numbers in physical
     /// units, plus a color-scale bar for the current view.
     pub(in crate::app) fn legend_panel(&mut self, ctx: &egui::Context, snap: UiSnapshot) {
+        self.sync_color_ranges(&snap);
         if !self.show_legend {
             return;
         }
         let ps = self.phys_cache;
         let (_vw, vh) = self.stats_grid;
         egui::SidePanel::right("legend").default_width(200.0).show(ctx, |ui| {
+            // Scroll rather than clip: at the 900×600 minimum the color
+            // bar and range controls land below the flow-numbers grid.
+            egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
             ui.label(super::theme::heading("Flow numbers"));
             egui::Grid::new("legend_grid")
                 .num_columns(2)
@@ -82,9 +158,11 @@ impl FlowPaintApp {
                 });
             ui.separator();
 
-            // Color-scale legend for the current view. The saturation
-            // points invert the shader's normalizations.
-            let gain = snap.display_gain.max(1e-3);
+            // Color-scale legend for the current view. `sync_color_ranges`
+            // above wrote the saturation point in physical units for every
+            // range mode — Auto still inverts the shader's normalization,
+            // Locked and Manual read the pinned value (T2-A).
+            let fr: FieldRange = color_ranges().lock().unwrap()[snap.mode as usize];
             match snap.mode {
                 RenderMode::Dye => {
                     ui.label("Smoke view: dye brightness");
@@ -98,68 +176,180 @@ impl FlowPaintApp {
                 }
                 RenderMode::Speed => {
                     ui.label("Speed |u|");
-                    // Inverts the shader normalization |vel| / (inlet * 1.6)
-                    // — both solvers write `vel` in units where the inlet
-                    // reference is their respective inflow speed.
-                    let u_sat = if snap.solver == SolverMode::Euler {
-                        snap.mach * self.fluid_a * 1.6 / gain
-                    } else {
-                        ps.u_phys(snap.flow * 1.6 / gain)
-                    };
-                    Self::colormap_bar(ui, |t| inferno_color(t));
+                    Self::colormap_bar(ui, fr.map);
                     ui.horizontal(|ui| {
                         super::theme::mono_small(ui, "0".into());
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| super::theme::mono_small(ui, format!("≥ {}", fmt_speed(u_sat))),
+                            |ui| {
+                                super::theme::mono_small(ui, format!("≥ {}", fmt_speed(fr.sat_phys)))
+                            },
                         );
                     });
+                    self.range_controls(ui, snap.mode, fr);
                 }
                 RenderMode::Vorticity => {
                     ui.label("Vorticity ω (curl)");
-                    let inlet_render = if snap.solver == SolverMode::Euler {
-                        snap.mach * snap.euler_dt
-                    } else {
-                        snap.flow
-                    };
-                    let w_sat = inlet_render.max(0.02) / (4.0 * gain) / ps.dt;
-                    Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
+                    Self::colormap_bar(ui, fr.map);
                     ui.horizontal(|ui| {
-                        super::theme::mono_small(ui, format!("-{}", fmt_omega(w_sat)));
+                        super::theme::mono_small(ui, format!("-{}", fmt_omega(fr.sat_phys)));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| super::theme::mono_small(ui, format!("+{}", fmt_omega(w_sat))),
+                            |ui| {
+                                super::theme::mono_small(ui, format!("+{}", fmt_omega(fr.sat_phys)))
+                            },
                         );
                     });
                     ui.small("red: clockwise · blue: counter-clockwise");
+                    self.range_controls(ui, snap.mode, fr);
                 }
                 RenderMode::Pressure => {
                     ui.label("Pressure Δp (gauge)");
-                    // Euler mode writes 1 + 0.1 * (p - p∞) into the density
-                    // buffer (p nondimensionalized by ρ∞ a∞²).
-                    let p_sat = if snap.solver == SolverMode::Euler {
-                        (1.0 / (25.0 * gain)) / 0.1
-                            * self.fluid_rho
-                            * self.fluid_a
-                            * self.fluid_a
-                    } else {
-                        ps.pressure_pa(1.0 / (25.0 * gain), self.fluid_rho)
-                    };
-                    Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
+                    Self::colormap_bar(ui, fr.map);
                     ui.horizontal(|ui| {
-                        super::theme::mono_small(ui, format!("-{}", fmt_pressure(p_sat)));
+                        super::theme::mono_small(ui, format!("-{}", fmt_pressure(fr.sat_phys)));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| super::theme::mono_small(ui, format!("+{}", fmt_pressure(p_sat))),
+                            |ui| {
+                                super::theme::mono_small(
+                                    ui,
+                                    format!("+{}", fmt_pressure(fr.sat_phys)),
+                                )
+                            },
                         );
                     });
                     ui.small("relative to ambient (0 = undisturbed)");
+                    self.range_controls(ui, snap.mode, fr);
                 }
             }
+            });
         });
     }
 
-    fn colormap_bar(ui: &mut egui::Ui, color: impl Fn(f32) -> egui::Color32) {
+    /// The scale controls under the color bar (plan v4.1, T2-A): the
+    /// range selector (Auto follows the flow settings, Locked pins the
+    /// scale as it is, Manual takes a typed saturation value in physical
+    /// units) and the colormap picker — per render mode. They live here,
+    /// next to the scale they govern, because the Results ribbon has no
+    /// width left at the 900 px minimum.
+    fn range_controls(&self, ui: &mut egui::Ui, mode: RenderMode, fr: FieldRange) {
+        // Collect edits, write back afterwards — holding the lock across
+        // the combo closure invites a deadlock. Picking Locked needs no
+        // capture step: `sync_color_ranges` already left the on-screen
+        // value in `sat_phys` this frame, and the mode switch pins it.
+        let mut set_mode: Option<RangeMode> = None;
+        let mut set_phys: Option<f32> = None;
+        let mut set_map: Option<ColorMap> = None;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("range").small().color(super::theme::INK_3));
+            let current = match fr.mode {
+                RangeMode::Auto => "Auto",
+                RangeMode::Locked => "Locked",
+                RangeMode::Manual => "Manual",
+            };
+            egui::ComboBox::from_id_salt("legend_color_range")
+                .width(88.0)
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    if super::theme::toggle(ui, fr.mode == RangeMode::Auto, "Auto")
+                        .on_hover_text(
+                            "The scale follows the inlet condition and the \
+                             display gain",
+                        )
+                        .clicked()
+                    {
+                        set_mode = Some(RangeMode::Auto);
+                    }
+                    if super::theme::toggle(ui, fr.mode == RangeMode::Locked, "Locked")
+                        .on_hover_text(
+                            "Pin the scale as it is now, so two screenshots \
+                             stay comparable",
+                        )
+                        .clicked()
+                    {
+                        set_mode = Some(RangeMode::Locked);
+                    }
+                    if super::theme::toggle(ui, fr.mode == RangeMode::Manual, "Manual")
+                        .on_hover_text("Type the top of the scale")
+                        .clicked()
+                    {
+                        set_mode = Some(RangeMode::Manual);
+                    }
+                });
+        });
+        if fr.mode == RangeMode::Manual {
+            let mut v = fr.sat_phys;
+            let suffix = match mode {
+                RenderMode::Speed => " m/s",
+                RenderMode::Vorticity => " 1/s",
+                RenderMode::Pressure => " Pa",
+                RenderMode::Dye => "",
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("max").small().color(super::theme::INK_3));
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut v)
+                            .range(1e-4..=1e9)
+                            .speed((fr.sat_phys.abs() * 0.01).max(0.001))
+                            .suffix(suffix),
+                    )
+                    .on_hover_text(match mode {
+                        RenderMode::Speed => "Speed where the scale saturates; 0 stays the bottom",
+                        _ => "Magnitude where the scale saturates, symmetric about 0",
+                    })
+                    .changed()
+                {
+                    set_phys = Some(v);
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("map").small().color(super::theme::INK_3));
+            let map_name = |m: ColorMap| match m {
+                ColorMap::Inferno => "Inferno",
+                ColorMap::Coolwarm => "Coolwarm",
+            };
+            egui::ComboBox::from_id_salt("legend_colormap")
+                .width(88.0)
+                .selected_text(map_name(fr.map))
+                .show_ui(ui, |ui| {
+                    for m in [ColorMap::Inferno, ColorMap::Coolwarm] {
+                        if super::theme::toggle(ui, fr.map == m, map_name(m))
+                            .on_hover_text(match m {
+                                ColorMap::Inferno => {
+                                    "Sequential: dark to bright yellow"
+                                }
+                                ColorMap::Coolwarm => {
+                                    "Diverging: blue and red around the middle"
+                                }
+                            })
+                            .clicked()
+                        {
+                            set_map = Some(m);
+                        }
+                    }
+                });
+        });
+        if set_mode.is_some() || set_phys.is_some() || set_map.is_some() {
+            let mut cr = color_ranges().lock().unwrap();
+            if let Some(m) = set_mode {
+                cr[mode as usize].mode = m;
+            }
+            if let Some(v) = set_phys {
+                cr[mode as usize].sat_phys = v.max(1e-6);
+            }
+            if let Some(m) = set_map {
+                cr[mode as usize].map = m;
+            }
+        }
+    }
+
+    /// The color-scale bar, drawn with the view's chosen map. `t` runs
+    /// 0..1 left to right; the diverging map spans its full ramp across
+    /// that, matching the shader's swap convention (render.wgsl flags
+    /// bit 1).
+    fn colormap_bar(ui: &mut egui::Ui, map: ColorMap) {
         let (rect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width().min(184.0), 14.0),
             egui::Sense::hover(),
@@ -169,13 +359,17 @@ impl FlowPaintApp {
         for i in 0..n {
             let t0 = i as f32 / n as f32;
             let t1 = (i + 1) as f32 / n as f32;
+            let t = (t0 + t1) * 0.5;
             painter.rect_filled(
                 egui::Rect::from_min_max(
                     egui::pos2(rect.min.x + rect.width() * t0, rect.min.y),
                     egui::pos2(rect.min.x + rect.width() * t1, rect.max.y),
                 ),
                 0.0,
-                color((t0 + t1) * 0.5),
+                match map {
+                    ColorMap::Inferno => inferno_color(t),
+                    ColorMap::Coolwarm => coolwarm_color(t * 2.0 - 1.0),
+                },
             );
         }
     }
