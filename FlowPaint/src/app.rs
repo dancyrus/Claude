@@ -400,7 +400,24 @@ pub struct FlowPaintApp {
     stats_steps_per_s: f32,
     stats_sim_steps: f64,
     sim_time_s: f64,
+    /// Frame-time measurement harness (`--bench`), None in normal runs.
+    bench: Option<BenchState>,
 }
+
+/// Frame-time harness state (see the plan's working rules): loads the
+/// Pinball preset in compressible mode, measures a fixed frame count and
+/// exits, so pre- and post-overhaul frame times are comparable.
+struct BenchState {
+    frame: u32,
+    samples: Vec<f32>,
+    last: Option<std::time::Instant>,
+}
+
+/// Setup happens on frame 1; frames up to the warmup bound are excluded
+/// (pipeline compilation, flow reset); the next BENCH_FRAMES frame times
+/// are the measurement.
+const BENCH_WARMUP: u32 = 10;
+const BENCH_FRAMES: usize = 300;
 
 impl FlowPaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -466,6 +483,11 @@ impl FlowPaintApp {
             stats_mlups: 0.0,
             stats_re: 0,
             stats_euler: false,
+            bench: if std::env::args().any(|a| a == "--bench") {
+                Some(BenchState { frame: 0, samples: Vec::new(), last: None })
+            } else {
+                None
+            },
             stats_steps_per_s: 0.0,
             stats_sim_steps: 0.0,
             sim_time_s: 0.0,
@@ -560,6 +582,10 @@ impl eframe::App for FlowPaintApp {
         ctx.request_repaint();
 
         let mut cmds: Vec<Cmd> = Vec::new();
+
+        if self.bench.is_some() {
+            self.bench_tick(ctx, &mut cmds);
+        }
 
         let snapshot = {
             let Some(rs) = frame.wgpu_render_state() else { return };
@@ -926,6 +952,48 @@ impl FlowPaintApp {
                 self.model.add(copy);
                 self.status = "Duplicated.".into();
             }
+        }
+    }
+
+    /// One harness step per frame: time the frame, set up the scene on
+    /// the first call, and print the stats + quit when done.
+    fn bench_tick(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
+        let now = std::time::Instant::now();
+        let (frame, done) = {
+            let b = self.bench.as_mut().expect("bench_tick without bench");
+            if let Some(last) = b.last {
+                if b.frame > BENCH_WARMUP && b.samples.len() < BENCH_FRAMES {
+                    b.samples.push(now.duration_since(last).as_secs_f32() * 1e3);
+                }
+            }
+            b.last = Some(now);
+            b.frame += 1;
+            (b.frame, b.samples.len() >= BENCH_FRAMES)
+        };
+        if frame == 1 {
+            // Deterministic scene: Pinball preset, compressible mode, at
+            // whatever grid the app started with (the default).
+            let (vw, vh) = self.stats_grid;
+            let objs = build_preset(ScenePreset::Pinball, &mut self.model, vw, vh);
+            self.model.replace_all(objs);
+            cmds.push(Cmd::SetSolver(SolverMode::Euler));
+            cmds.push(Cmd::ResetFlow);
+        }
+        if done {
+            let mut s = std::mem::take(&mut self.bench.as_mut().unwrap().samples);
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mean = s.iter().sum::<f32>() / s.len() as f32;
+            let p99 = s[((s.len() as f32 * 0.99).ceil() as usize).clamp(1, s.len()) - 1];
+            println!(
+                "bench: {} frames  mean {:.2} ms  p99 {:.2} ms  min {:.2} ms  max {:.2} ms",
+                s.len(),
+                mean,
+                p99,
+                s[0],
+                s[s.len() - 1]
+            );
+            self.bench = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
