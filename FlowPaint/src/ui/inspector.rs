@@ -126,11 +126,12 @@ impl FlowPaintApp {
         // Fan physics. A generated part that carries fan cells (a rocket
         // nozzle's chamber inlet) is an ENGINE in the user's mental model
         // and gets its own group; a hand-placed Fan object keeps the
-        // generic fan block below, unchanged. Blow direction and smoke
-        // color are withheld for stamps: the rasterizer rotates baked fan
-        // vectors with the part's geometry only and copies baked dye
-        // verbatim, so those two controls would do nothing (phase 5
-        // finding — see the report).
+        // generic fan block below, unchanged. Stamps get no blow-direction
+        // control, by design rather than omission: stamp fan vectors are
+        // locked to the stamp's geometric angle (see the rasterizer's
+        // stamp arm in model.rs — rotating the chamber flow independently
+        // of the bell would aim thrust into the converging wall). Aiming
+        // is done with the object Rotate controls.
         let stamp_fan_mag = match &obj.shape {
             Shape::Stamp { raster, .. } => raster
                 .fan
@@ -172,19 +173,14 @@ impl FlowPaintApp {
             }
         }
         if obj.material == ObjMaterial::Fan || obj.material == ObjMaterial::Smoke {
-            let mut c = egui::Color32::from_rgb(
-                (obj.smoke_rgb[0] * 255.0) as u8,
-                (obj.smoke_rgb[1] * 255.0) as u8,
-                (obj.smoke_rgb[2] * 255.0) as u8,
-            );
+            // RGB picker, not srgba: the alpha/blend controls would write
+            // premultiplied channels back into smoke_rgb (alpha is fixed
+            // by the rasterizer per material).
             ui.horizontal(|ui| {
                 ui.label("Smoke color:");
-                if ui.color_edit_button_srgba(&mut c).changed() {
-                    obj.smoke_rgb = [
-                        c.r() as f32 / 255.0,
-                        c.g() as f32 / 255.0,
-                        c.b() as f32 / 255.0,
-                    ];
+                let mut rgb = obj.smoke_rgb;
+                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                    obj.smoke_rgb = rgb;
                     changed = true;
                 }
             });
@@ -253,7 +249,10 @@ impl FlowPaintApp {
         stamp_fan_mag: f32,
     ) -> bool {
         let mut changed = false;
-        ui.label(super::theme::heading("Engine"));
+        ui.label(super::theme::heading("Engine")).on_hover_text(
+            "To aim the nozzle, use the Rotate controls below. The jet \
+             direction is locked to the part's geometry.",
+        );
         ui.horizontal(|ui| {
             changed |= ui
                 .add(
@@ -272,6 +271,22 @@ impl FlowPaintApp {
             .add(egui::Slider::new(&mut obj.fan_gust, 0.0..=1.0).text("gustiness"))
             .on_hover_text("Add slow variation to the jet. Zero gives a steady jet.")
             .changed();
+        // The rasterizer recolors the stamp's fan-cell dye with the
+        // object's smoke color, so the picker works for engines too.
+        // RGB picker, not srgba: the alpha/blend controls would write
+        // premultiplied channels back into smoke_rgb (dye alpha is baked).
+        ui.horizontal(|ui| {
+            ui.label("Plume color:");
+            let mut rgb = obj.smoke_rgb;
+            if ui
+                .color_edit_button_rgb(&mut rgb)
+                .on_hover_text("Set the color of the engine plume.")
+                .changed()
+            {
+                obj.smoke_rgb = rgb;
+                changed = true;
+            }
+        });
 
         // Which layer binds, and by how much the request exceeds it.
         let ps = self.phys_cache;

@@ -93,7 +93,10 @@ struct SceneV3 {
     ref_width: u32,
 }
 
-/// Scene file (version 4): v3 plus the solver mode and its settings.
+/// Scene file (versions 4 and 5 — identical layout). The v5 tag marks
+/// files whose stamp objects carry a meaningful `smoke_rgb` (the plume
+/// recolor); in older files that field is an unused default and gets
+/// re-seeded from the baked stamp dye on load.
 #[derive(Serialize, Deserialize)]
 struct SceneV4 {
     version: u32,
@@ -114,6 +117,7 @@ struct SceneV4 {
 
 const SCENE_V3: u32 = 3;
 const SCENE_V4: u32 = 4;
+const SCENE_V5: u32 = 5;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -532,6 +536,12 @@ impl FlowPaintApp {
         obj.material = ObjMaterial::Wall;
         obj.fan_mult = 1.0;
         obj.fan_gust = 0.0;
+        // The rasterizer recolors fan-cell dye with the object's smoke
+        // color; start it at the baked plume color so the insert looks
+        // exactly like the dialog preview and the picker tells the truth.
+        if let Some(rgb) = obj.stamp_plume_rgb() {
+            obj.smoke_rgb = rgb;
+        }
         self.model.add(obj.clone());
         self.selected = Some(obj.id);
         self.tool = Tool::Select;
@@ -1101,7 +1111,7 @@ impl FlowPaintApp {
         // polyline's cursor-tracking rubber vertex.
         self.finish_gesture();
         let scene = SceneV4 {
-            version: SCENE_V4,
+            version: SCENE_V5,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -1142,14 +1152,15 @@ impl FlowPaintApp {
         } else {
             0
         };
-        if version != SCENE_V3 && version != SCENE_V4 {
+        if !(SCENE_V3..=SCENE_V5).contains(&version) {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
             return;
         }
-        // A v3 file is a v4 file without the solver fields.
-        let decoded = if version == SCENE_V4 {
+        // A v3 file is a v4 file without the solver fields; v5 shares
+        // the v4 layout.
+        let decoded = if version >= SCENE_V4 {
             bincode::deserialize::<SceneV4>(&bytes)
         } else {
             bincode::deserialize::<SceneV3>(&bytes).map(|s| SceneV4 {
@@ -1178,6 +1189,16 @@ impl FlowPaintApp {
                 let before_n = objects.len();
                 objects.retain(object_is_sane);
                 let dropped = before_n - objects.len();
+                // Pre-v5 files predate the recolorable stamp plume: their
+                // stamps' smoke_rgb is an unused default, so seed it from
+                // the baked fan dye to keep old scenes' plume colors.
+                if version < SCENE_V5 {
+                    for o in &mut objects {
+                        if let Some(rgb) = o.stamp_plume_rgb() {
+                            o.smoke_rgb = rgb;
+                        }
+                    }
+                }
                 // Rescale into the current grid width.
                 let cur_w = self.stats_grid.0 as f32;
                 let f = cur_w / (scene.ref_width.max(1) as f32);

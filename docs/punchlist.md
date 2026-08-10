@@ -15,6 +15,14 @@ here instead of being fixed inline.
 - **Physics ribbon tab exactly fills 900 px** — the Domain group's
   derived "cell = …" line touches the right edge at the minimum window
   width. Cosmetic; revisit if a sixth Physics group ever appears.
+- **Defaults-panel smoke picker uses `color_edit_button_srgba`**
+  (`ui/inspector.rs` `defaults_panel`). The popup's alpha/blend controls
+  treat `def_smoke` as premultiplied: holding the alpha slider darkens
+  the stored RGB frame-over-frame (compounding toward black), and only
+  r/g/b are ever read when objects are created. Same defect class was
+  fixed for the two per-object pickers (now `color_edit_button_rgb`) in
+  the smoke-color commit; this one edits an `egui::Color32` field so it
+  needs a small u8↔f32 round-trip when converted.
 - **Idle value boxes don't show the mockup's `.dv` treatment**
   (`FIELD_BG` fill + `LINE_2` border). egui 0.29 renders at-rest
   DragValues/slider readouts as buttons (`PANEL_2`, borderless);

@@ -183,6 +183,21 @@ impl SketchObject {
         self.fan_angle += da;
     }
 
+    /// Baked plume color of a stamp: the dye RGB of its first
+    /// dye-emitting fan cell (a generated engine's chamber inlet).
+    /// `None` for non-stamps and for stamps without such cells.
+    pub fn stamp_plume_rgb(&self) -> Option<[f32; 3]> {
+        let Shape::Stamp { raster, .. } = &self.shape else {
+            return None;
+        };
+        raster
+            .fan
+            .iter()
+            .zip(&raster.dye_src)
+            .find(|(f, d)| (f[0] != 0.0 || f[1] != 0.0) && d[3] > 0.0)
+            .map(|(_, d)| [d[0], d[1], d[2]])
+    }
+
     /// Scale about the centre.
     pub fn scale_by(&mut self, f: f32) {
         let f = f.clamp(0.05, 50.0);
@@ -958,7 +973,12 @@ fn rasterize_object(geo: &mut Geometry, obj: &SketchObject, clip: GridRect, m: i
                     // Rotate stored fan vectors with the stamp; the
                     // object-level fan knobs act as a multiplier and extra
                     // gustiness so generated parts stay tunable after
-                    // placement.
+                    // placement. `obj.fan_angle` is deliberately NOT
+                    // applied: stamp fan vectors stay locked to the
+                    // stamp's geometric `angle`. Rotating the chamber
+                    // flow independently of the bell would aim thrust
+                    // into the converging wall — a nozzle is aimed by
+                    // rotating the whole object.
                     let f = raster.fan[si];
                     let m = obj.fan_mult;
                     geo.fan[gi] = [
@@ -967,7 +987,15 @@ fn rasterize_object(geo: &mut Geometry, obj: &SketchObject, clip: GridRect, m: i
                         (f[2] + obj.fan_gust).clamp(0.0, 1.0),
                         f[3],
                     ];
-                    geo.dye_src[gi] = raster.dye_src[si];
+                    // Fan-cell dye takes the object's smoke color (baked
+                    // alpha kept), so a generated engine's plume recolors
+                    // like a hand-placed fan's.
+                    let d = raster.dye_src[si];
+                    geo.dye_src[gi] = if (f[0] != 0.0 || f[1] != 0.0) && d[3] > 0.0 {
+                        [obj.smoke_rgb[0], obj.smoke_rgb[1], obj.smoke_rgb[2], d[3]]
+                    } else {
+                        d
+                    };
                 }
             }
         }
