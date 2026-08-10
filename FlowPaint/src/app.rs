@@ -43,6 +43,10 @@ struct FluidPreset {
     flow: f32,
     visc: f32,
     steps: Option<u32>,
+    /// Physical kinematic viscosity [m^2/s].
+    nu: f32,
+    /// Physical density [kg/m^3].
+    rho: f32,
 }
 
 const FLUID_PRESETS: [FluidPreset; 7] = [
@@ -53,6 +57,8 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         flow: 0.06,
         visc: 0.02,
         steps: None,
+        nu: 1.5e-5,
+        rho: 1.2,
     },
     FluidPreset {
         name: "Gentle breeze (air)",
@@ -61,6 +67,8 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         flow: 0.05,
         visc: 0.03,
         steps: None,
+        nu: 1.5e-5,
+        rho: 1.2,
     },
     FluidPreset {
         name: "Wind tunnel (air)",
@@ -69,6 +77,8 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         flow: 0.09,
         visc: 0.015,
         steps: None,
+        nu: 1.5e-5,
+        rho: 1.2,
     },
     FluidPreset {
         name: "Storm (air, high Re)",
@@ -77,6 +87,8 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         flow: 0.13,
         visc: 0.006,
         steps: None,
+        nu: 1.5e-5,
+        rho: 1.2,
     },
     FluidPreset {
         name: "Water flume",
@@ -86,6 +98,8 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         flow: 0.07,
         visc: 0.0055,
         steps: None,
+        nu: 1.0e-6,
+        rho: 998.0,
     },
     FluidPreset {
         name: "Glycerin / syrup",
@@ -95,6 +109,8 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         flow: 0.04,
         visc: 0.08,
         steps: None,
+        nu: 1.19e-3,
+        rho: 1260.0,
     },
     FluidPreset {
         name: "Supersonic tunnel (stylized)",
@@ -105,6 +121,8 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         flow: 0.14,
         visc: 0.005,
         steps: Some(16),
+        nu: 1.5e-5,
+        rho: 1.2,
     },
 ];
 
@@ -207,6 +225,8 @@ struct DragState {
     /// Select tool: true when dragging the floating selection itself
     /// (translate), false when rubber-banding a new marquee.
     sel_move: bool,
+    /// Sketch tools: the pending-sketch vertex being dragged, if any.
+    sketch_handle: Option<usize>,
 }
 
 impl DragState {
@@ -217,6 +237,157 @@ impl DragState {
             self.material
         }
     }
+}
+
+/// Sketch entity kinds (CAD-style: drawn as editable outlines first,
+/// rasterized only on commit).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SketchKind {
+    Line,
+    Rect,
+    Ellipse,
+    Polyline,
+}
+
+/// An in-progress sketch: vertices stay editable (drag the handles)
+/// until the sketch is committed with Enter / right-click, or cancelled
+/// with Esc. Line/Rect/Ellipse store two defining vertices (for
+/// rect/ellipse: opposite corners); Polyline stores every vertex.
+struct PendingSketch {
+    kind: SketchKind,
+    verts: Vec<[f32; 2]>,
+}
+
+impl PendingSketch {
+    /// Editable handles in visible-cell coords (rect/ellipse expose all
+    /// four corners).
+    fn handles(&self) -> Vec<[f32; 2]> {
+        match self.kind {
+            SketchKind::Rect | SketchKind::Ellipse => {
+                let a = self.verts[0];
+                let b = self.verts[1];
+                vec![a, [b[0], a[1]], b, [a[0], b[1]]]
+            }
+            _ => self.verts.clone(),
+        }
+    }
+
+    /// Prepare to drag handle `h`: returns the vertex index to move.
+    /// For rect/ellipse the defining pair is rearranged so the dragged
+    /// corner becomes verts[1] and its diagonal opposite verts[0].
+    fn begin_handle_drag(&mut self, h: usize) -> usize {
+        match self.kind {
+            SketchKind::Rect | SketchKind::Ellipse => {
+                let hs = self.handles();
+                let dragged = hs[h.min(3)];
+                let opp = hs[(h + 2) % 4];
+                self.verts[0] = opp;
+                self.verts[1] = dragged;
+                1
+            }
+            _ => h.min(self.verts.len().saturating_sub(1)),
+        }
+    }
+}
+
+/// Physical scaling derived from the domain size and the fluid: the
+/// lattice viscosity fixes the physical time step via
+/// `nu_lattice = nu_phys * dt / dx^2`.
+#[derive(Clone, Copy)]
+struct PhysScale {
+    dx: f32, // metres per cell
+    dt: f32, // seconds per lattice step
+}
+
+impl Default for PhysScale {
+    fn default() -> Self {
+        Self { dx: 1.0, dt: 1.0 }
+    }
+}
+
+impl PhysScale {
+    fn u_phys(&self, u_lattice: f32) -> f32 {
+        u_lattice * self.dx / self.dt
+    }
+    fn len_m(&self, cells: f32) -> f32 {
+        cells * self.dx
+    }
+    /// Gauge pressure [Pa] for a lattice density deviation
+    /// (p = cs^2 * drho, cs^2 = 1/3 lattice units).
+    fn pressure_pa(&self, drho: f32, rho_phys: f32) -> f32 {
+        drho / 3.0 * (self.dx / self.dt).powi(2) * rho_phys
+    }
+}
+
+fn fmt_len(m: f32) -> String {
+    let a = m.abs();
+    if a < 0.01 {
+        format!("{:.1} mm", m * 1e3)
+    } else if a < 1.0 {
+        format!("{:.1} cm", m * 1e2)
+    } else if a < 1000.0 {
+        format!("{:.2} m", m)
+    } else {
+        format!("{:.2} km", m * 1e-3)
+    }
+}
+
+fn fmt_time(s: f32) -> String {
+    let a = s.abs();
+    if a < 1e-3 {
+        format!("{:.1} µs", s * 1e6)
+    } else if a < 1.0 {
+        format!("{:.2} ms", s * 1e3)
+    } else if a < 120.0 {
+        format!("{:.2} s", s)
+    } else {
+        format!("{:.1} min", s / 60.0)
+    }
+}
+
+fn fmt_speed(v: f32) -> String {
+    if v.abs() < 0.1 {
+        format!("{:.1} cm/s", v * 100.0)
+    } else {
+        format!("{:.2} m/s", v)
+    }
+}
+
+fn fmt_pressure(p: f32) -> String {
+    let a = p.abs();
+    if a < 0.1 {
+        format!("{:.1} mPa", p * 1e3)
+    } else if a < 1000.0 {
+        format!("{:.2} Pa", p)
+    } else {
+        format!("{:.2} kPa", p * 1e-3)
+    }
+}
+
+// CPU mirrors of the shader colormaps, for the legend bars.
+fn inferno_color(t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0) * 4.0;
+    let stops = [
+        [0.001, 0.000, 0.014],
+        [0.341, 0.062, 0.429],
+        [0.730, 0.216, 0.330],
+        [0.973, 0.555, 0.035],
+        [0.988, 0.998, 0.645],
+    ];
+    let i = (t as usize).min(3);
+    let f = t - i as f32;
+    let c = |k: usize| stops[i][k] + (stops[i + 1][k] - stops[i][k]) * f;
+    egui::Color32::from_rgb((c(0) * 255.0) as u8, (c(1) * 255.0) as u8, (c(2) * 255.0) as u8)
+}
+
+fn coolwarm_color(t: f32) -> egui::Color32 {
+    let t = t.clamp(-1.0, 1.0);
+    let cold = [0.230, 0.299, 0.754];
+    let white = [0.940, 0.930, 0.920];
+    let warm = [0.706, 0.016, 0.150];
+    let (a, b, f) = if t < 0.0 { (white, cold, -t) } else { (white, warm, t) };
+    let c = |k: usize| a[k] + (b[k] - a[k]) * f;
+    egui::Color32::from_rgb((c(0) * 255.0) as u8, (c(1) * 255.0) as u8, (c(2) * 255.0) as u8)
 }
 
 /// Settings snapshot read from the sim before building the UI, so panels
@@ -257,8 +428,14 @@ pub struct FlowPaintApp {
     // CAD sketch aids.
     snap_enabled: bool,
     snap_spacing: f32,
-    /// In-progress polyline vertices (visible-cell coords).
-    polyline: Vec<[f32; 2]>,
+    /// Angle-snap increment for Shift-constrained lines, degrees.
+    snap_angle_deg: f32,
+    /// Wall thickness for committed sketch entities, cells.
+    wall_thickness: f32,
+    /// Commit rect/ellipse as filled slabs instead of outlines.
+    shape_filled: bool,
+    /// The editable, not-yet-committed sketch entity.
+    pending_sketch: Option<PendingSketch>,
     drag: Option<DragState>,
     // Freehand-stroke undo bookkeeping. These live on the app (not the
     // drag state) because canvas events are queued as commands and applied
@@ -279,6 +456,20 @@ pub struct FlowPaintApp {
     show_nozzle_gen: bool,
     // Fluid preset combo state (None = custom).
     fluid_preset_idx: Option<usize>,
+    /// Real exhaust velocity of the last-picked nozzle engine preset.
+    nozzle_real_ve: Option<f32>,
+    // Physical scaling: the canvas maps to a real domain of this width,
+    // and the current fluid's physical properties anchor all unit
+    // conversions (lattice viscosity fixes the physical time step).
+    domain_width_m: f32,
+    fluid_name: &'static str,
+    fluid_nu: f32,
+    fluid_rho: f32,
+    show_legend: bool,
+    stats_steps_per_s: f32,
+    stats_sim_steps: f64,
+    /// Cached physical scale for this frame (from the latest snapshot).
+    phys_cache: PhysScale,
     // Whether the current selection contains fan cells (cached).
     sel_has_fans: bool,
     // Cursor cell coordinates for the status bar.
@@ -327,7 +518,10 @@ impl FlowPaintApp {
             sel_fan_turb: 0.0,
             snap_enabled: false,
             snap_spacing: 10.0,
-            polyline: Vec::new(),
+            snap_angle_deg: 45.0,
+            wall_thickness: 6.0,
+            shape_filled: false,
+            pending_sketch: None,
             drag: None,
             pending_stroke_rect: GridRect::empty(),
             pending_stroke_tiles: std::collections::HashMap::new(),
@@ -337,6 +531,15 @@ impl FlowPaintApp {
             show_airfoil_gen: false,
             show_nozzle_gen: false,
             fluid_preset_idx: Some(2),
+            nozzle_real_ve: None,
+            domain_width_m: 1.0,
+            fluid_name: "air",
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            show_legend: true,
+            stats_steps_per_s: 0.0,
+            stats_sim_steps: 0.0,
+            phys_cache: PhysScale::default(),
             sel_has_fans: false,
             hover_cell: None,
             airfoil_params: crate::generators::AirfoilParams::default(),
@@ -370,6 +573,14 @@ impl FlowPaintApp {
         }
     }
 
+    /// Physical scale for the current settings.
+    fn phys_scale(&self, visc_lattice: f32) -> PhysScale {
+        let vis_w = self.stats_grid.0.max(1);
+        let dx = self.domain_width_m / vis_w as f32;
+        let dt = visc_lattice.max(1e-5) * dx * dx / self.fluid_nu.max(1e-12);
+        PhysScale { dx, dt }
+    }
+
     /// New stroke, new gust phase: each painted fan wanders on its own
     /// schedule, while all cells of one stroke stay coherent.
     fn roll_fan_phase(&mut self) {
@@ -388,15 +599,16 @@ impl FlowPaintApp {
         [(p[0] / s).round() * s, (p[1] / s).round() * s]
     }
 
-    /// Snap the segment a->b to 45-degree increments (CAD ortho/polar).
-    fn angle_snap(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    /// Snap the segment a->b to the configured angle increment
+    /// (CAD ortho/polar snapping).
+    fn angle_snap(&self, a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
         let dx = b[0] - a[0];
         let dy = b[1] - a[1];
         let len = (dx * dx + dy * dy).sqrt();
         if len < 1e-4 {
             return b;
         }
-        let step = std::f32::consts::FRAC_PI_4;
+        let step = self.snap_angle_deg.clamp(1.0, 90.0).to_radians();
         let ang = (dy.atan2(dx) / step).round() * step;
         [a[0] + len * ang.cos(), a[1] + len * ang.sin()]
     }
@@ -416,7 +628,7 @@ impl FlowPaintApp {
         match tool {
             Tool::Line | Tool::Polyline => {
                 if shift {
-                    b = Self::angle_snap(a, b);
+                    b = self.angle_snap(a, b);
                 }
                 (a, b)
             }
@@ -439,43 +651,146 @@ impl FlowPaintApp {
         }
     }
 
-    /// Queue the pending polyline as one stroke (single undo entry).
-    fn commit_polyline(&mut self, cmds: &mut Vec<Cmd>) {
-        if self.polyline.is_empty() {
-            return;
+    /// Constrained position for a dragged sketch handle: grid snap, plus
+    /// Shift = angle snap (lines/polylines) or square/circle
+    /// (rect/ellipse, relative to the fixed opposite corner).
+    fn constrained_handle_pos(
+        &self,
+        kind: SketchKind,
+        idx: usize,
+        cell: [f32; 2],
+        shift: bool,
+    ) -> [f32; 2] {
+        let mut p = self.snap_point(cell);
+        if !shift {
+            return p;
         }
-        let pts = std::mem::take(&mut self.polyline);
+        if let Some(sk) = &self.pending_sketch {
+            match kind {
+                SketchKind::Line => {
+                    if sk.verts.len() >= 2 {
+                        let other = sk.verts[1 - idx.min(1)];
+                        p = self.angle_snap(other, p);
+                    }
+                }
+                SketchKind::Polyline => {
+                    let anchor = if idx > 0 {
+                        sk.verts.get(idx - 1).copied()
+                    } else {
+                        sk.verts.get(1).copied()
+                    };
+                    if let Some(a) = anchor {
+                        p = self.angle_snap(a, p);
+                    }
+                }
+                SketchKind::Rect | SketchKind::Ellipse => {
+                    let a = sk.verts[0];
+                    let dx = p[0] - a[0];
+                    let dy = p[1] - a[1];
+                    let m = dx.abs().max(dy.abs());
+                    p = [a[0] + m * dx.signum(), a[1] + m * dy.signum()];
+                }
+            }
+        }
+        p
+    }
+
+    /// The sketch kind a tool draws, if any.
+    fn sketch_kind(tool: Tool) -> Option<SketchKind> {
+        match tool {
+            Tool::Line => Some(SketchKind::Line),
+            Tool::Rect => Some(SketchKind::Rect),
+            Tool::Ellipse => Some(SketchKind::Ellipse),
+            Tool::Polyline => Some(SketchKind::Polyline),
+            _ => None,
+        }
+    }
+
+    /// Rasterize and commit the pending sketch as one undo entry.
+    /// Lines/polylines/outlines are capsule chains at the configured
+    /// wall thickness; rect/ellipse optionally commit filled.
+    fn commit_sketch(&mut self, cmds: &mut Vec<Cmd>) {
+        let Some(sk) = self.pending_sketch.take() else { return };
+        let r = (self.wall_thickness * 0.5).max(0.75);
         self.roll_fan_phase();
         // Pin the phase at queue time: another stroke starting this same
         // frame will roll again, and stamps read the phase at apply time.
         cmds.push(Cmd::SetFanPhase(self.fan_phase));
-        cmds.push(Cmd::StrokeBegin);
-        if pts.len() == 1 {
-            cmds.push(Cmd::StampSegment {
-                a: pts[0],
-                b: pts[0],
-                r: self.brush_radius,
-                material: self.material,
-            });
-        } else {
-            for seg in pts.windows(2) {
-                let (a, b) = (seg[0], seg[1]);
-                // Fan ducts blow along each segment.
-                let dx = b[0] - a[0];
-                let dy = b[1] - a[1];
-                let len = (dx * dx + dy * dy).sqrt();
-                if self.material == Material::Fan && len > 1e-3 {
-                    cmds.push(Cmd::SetFanDir([dx / len, dy / len]));
-                }
+
+        // Chain of capsule segments as one stroke session.
+        let chain = |cmds: &mut Vec<Cmd>, pts: &[[f32; 2]], closed: bool| {
+            cmds.push(Cmd::StrokeBegin);
+            if pts.len() == 1 {
                 cmds.push(Cmd::StampSegment {
-                    a,
-                    b,
-                    r: self.brush_radius,
+                    a: pts[0],
+                    b: pts[0],
+                    r,
                     material: self.material,
                 });
+            } else {
+                let n = pts.len();
+                let segs = if closed { n } else { n - 1 };
+                for s in 0..segs {
+                    let a = pts[s];
+                    let b = pts[(s + 1) % n];
+                    let dx = b[0] - a[0];
+                    let dy = b[1] - a[1];
+                    let len = (dx * dx + dy * dy).sqrt();
+                    // Fan ducts blow along each segment.
+                    if self.material == Material::Fan && len > 1e-3 {
+                        cmds.push(Cmd::SetFanDir([dx / len, dy / len]));
+                    }
+                    cmds.push(Cmd::StampSegment { a, b, r, material: self.material });
+                }
+            }
+            cmds.push(Cmd::StrokeEnd);
+        };
+
+        match sk.kind {
+            SketchKind::Line | SketchKind::Polyline => chain(cmds, &sk.verts, false),
+            SketchKind::Rect => {
+                let a = sk.verts[0];
+                let b = sk.verts[1];
+                if self.shape_filled {
+                    cmds.push(Cmd::ShapeCommit {
+                        tool: Tool::Rect,
+                        a,
+                        b,
+                        r,
+                        material: self.material,
+                    });
+                } else {
+                    let corners =
+                        [a, [b[0], a[1]], b, [a[0], b[1]]];
+                    chain(cmds, &corners, true);
+                }
+            }
+            SketchKind::Ellipse => {
+                let a = sk.verts[0];
+                let b = sk.verts[1];
+                if self.shape_filled {
+                    cmds.push(Cmd::ShapeCommit {
+                        tool: Tool::Ellipse,
+                        a,
+                        b,
+                        r,
+                        material: self.material,
+                    });
+                } else {
+                    let c = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+                    let rx = ((a[0] - b[0]).abs() * 0.5).max(0.5);
+                    let ry = ((a[1] - b[1]).abs() * 0.5).max(0.5);
+                    let n = 64usize;
+                    let pts: Vec<[f32; 2]> = (0..n)
+                        .map(|i| {
+                            let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                            [c[0] + rx * t.cos(), c[1] + ry * t.sin()]
+                        })
+                        .collect();
+                    chain(cmds, &pts, true);
+                }
             }
         }
-        cmds.push(Cmd::StrokeEnd);
     }
 
 }
@@ -511,6 +826,8 @@ impl eframe::App for FlowPaintApp {
             }
         };
 
+        self.phys_cache = self.phys_scale(snapshot.visc);
+
         self.keyboard(ctx, &mut cmds);
         // A selection only lives under the Select tool; switching away
         // commits it. This runs AFTER keyboard() so a same-frame tool
@@ -518,15 +835,19 @@ impl eframe::App for FlowPaintApp {
         if self.selection.is_some() && self.tool != Tool::Select {
             cmds.push(Cmd::SelectCommit);
         }
-        // Likewise a pending polyline commits when the tool changes.
-        if self.tool != Tool::Polyline && !self.polyline.is_empty() {
-            self.commit_polyline(&mut cmds);
+        // Likewise a pending sketch commits when the tool changes to one
+        // that doesn't edit it.
+        if let Some(sk) = &self.pending_sketch {
+            if Self::sketch_kind(self.tool) != Some(sk.kind) {
+                self.commit_sketch(&mut cmds);
+            }
         }
         self.menu_bar(ctx, &mut cmds);
         self.side_panel(ctx, snapshot, &mut cmds);
+        self.legend_panel(ctx, snapshot);
         self.status_bar(ctx);
         self.canvas(ctx, &mut cmds);
-        self.windows(ctx, &mut cmds);
+        self.windows(ctx, snapshot, &mut cmds);
 
         // Apply everything to the sim.
         let Some(rs) = frame.wgpu_render_state() else { return };
@@ -546,6 +867,8 @@ impl eframe::App for FlowPaintApp {
         let n = (self.stats_full.0 * self.stats_full.1) as f32;
         self.stats_mlups = n * sim.steps_last_frame as f32 / dt / 1.0e6;
         self.stats_re = sim.reynolds_estimate();
+        self.stats_steps_per_s = sim.steps_last_frame as f32 / dt;
+        self.stats_sim_steps = sim.total_steps;
     }
 }
 
@@ -593,6 +916,8 @@ enum Cmd {
     SetSelectionFanPhysics { mult: Option<f32>, turb: Option<f32> },
     // Selection (coordinates in visible cells).
     SelectCut { a: [f32; 2], b: [f32; 2] },
+    /// Click-select the connected fan under this point (visible cells).
+    SelectFanAt([f32; 2]),
     SelectUpdate,
     SelectCommit,
     SelectCancel,
@@ -612,9 +937,9 @@ fn clear_stroke_state(app: &mut FlowPaintApp) {
     app.pending_stroke_rect = GridRect::empty();
     app.pending_stroke_tiles.clear();
     app.drag = None;
-    // Polyline vertices are absolute visible-cell coordinates; they are
+    // Sketch vertices are absolute visible-cell coordinates; they are
     // meaningless on a replaced grid.
-    app.polyline.clear();
+    app.pending_sketch = None;
     // A floating selection is abandoned outright: the grid it was stamped
     // into is being replaced wholesale.
     app.selection = None;
@@ -712,6 +1037,48 @@ fn commit_selection(sim: &mut GpuSim, app: &mut FlowPaintApp) {
         app.selection_bg = None;
         push_stroke_undo(sim, app);
     }
+}
+
+/// Lift `rect` (full-grid coords) off the grid into a new floating
+/// selection, beginning an undo session. Shared by marquee cuts and
+/// click-to-select-fan.
+fn cut_rect_into_selection(sim: &mut GpuSim, app: &mut FlowPaintApp, rect: GridRect) {
+    if rect.is_empty() {
+        return;
+    }
+    let m = sim.margin() as f32;
+    app.pending_stroke_rect = GridRect::empty();
+    app.pending_stroke_tiles.clear();
+    capture_tiles(app, sim, rect);
+    let mut source = sim.geo.extract(rect);
+    let w = rect.x1 - rect.x0;
+    let h = rect.y1 - rect.y0;
+    source.rect = (0, 0, w, h);
+    for y in rect.y0..rect.y1 {
+        for x in rect.x0..rect.x1 {
+            let i = (y as usize) * sim.geo.w + x as usize;
+            sim.geo.cell[i] = crate::geometry::CELL_FLUID;
+            sim.geo.fan[i] = [0.0; 4];
+            sim.geo.dye_src[i] = [0.0; 4];
+        }
+    }
+    sim.geo.touch(rect);
+    app.pending_stroke_rect = rect;
+    let pos = [
+        (rect.x0 + rect.x1) as f32 * 0.5 - m,
+        (rect.y0 + rect.y1) as f32 * 0.5 - m,
+    ];
+    app.selection = Some(Selection {
+        source,
+        pos,
+        angle_deg: 0.0,
+        scale: 1.0,
+        flip_h: false,
+        flip_v: false,
+    });
+    app.selection_bg = None;
+    refresh_sel_fan_cache(app);
+    selection_update(sim, app);
 }
 
 /// Cache whether the selection holds fan cells, and seed the fan-editing
@@ -990,42 +1357,53 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             }
             .intersect(sim.vis_rect())
             .clampped(sim.geo.w, sim.geo.h);
-            if rect.is_empty() {
+            cut_rect_into_selection(sim, app, rect);
+        }
+        Cmd::SelectFanAt(p) => {
+            commit_selection(sim, app);
+            let m = sim.margin() as f32;
+            let cx = (p[0] + m).floor() as i32;
+            let cy = (p[1] + m).floor() as i32;
+            let (gw, gh) = (sim.geo.w as i32, sim.geo.h as i32);
+            if cx < 0 || cy < 0 || cx >= gw || cy >= gh {
                 return;
             }
-            // Begin the session, lift the content, clear the area.
-            app.pending_stroke_rect = GridRect::empty();
-            app.pending_stroke_tiles.clear();
-            capture_tiles(app, sim, rect);
-            let mut source = sim.geo.extract(rect);
-            let w = rect.x1 - rect.x0;
-            let h = rect.y1 - rect.y0;
-            source.rect = (0, 0, w, h);
-            for y in rect.y0..rect.y1 {
-                for x in rect.x0..rect.x1 {
-                    let i = (y as usize) * sim.geo.w + x as usize;
-                    sim.geo.cell[i] = crate::geometry::CELL_FLUID;
-                    sim.geo.fan[i] = [0.0; 4];
-                    sim.geo.dye_src[i] = [0.0; 4];
+            if sim.geo.cell[(cy as usize) * sim.geo.w + cx as usize]
+                != crate::geometry::CELL_INLET
+            {
+                return;
+            }
+            // Flood-fill the connected fan (4-neighbour) and select its
+            // bounding box, so its physics can be retuned in place.
+            let mut rect = GridRect { x0: cx, y0: cy, x1: cx + 1, y1: cy + 1 };
+            let mut stack = vec![(cx, cy)];
+            let mut seen = std::collections::HashSet::new();
+            seen.insert((cx, cy));
+            const FLOOD_CAP: usize = 300_000;
+            while let Some((x, y)) = stack.pop() {
+                rect = rect.union(GridRect { x0: x, y0: y, x1: x + 1, y1: y + 1 });
+                for (nx, ny) in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
+                    if nx < 0 || ny < 0 || nx >= gw || ny >= gh {
+                        continue;
+                    }
+                    if seen.len() >= FLOOD_CAP || seen.contains(&(nx, ny)) {
+                        continue;
+                    }
+                    if sim.geo.cell[(ny as usize) * sim.geo.w + nx as usize]
+                        == crate::geometry::CELL_INLET
+                    {
+                        seen.insert((nx, ny));
+                        stack.push((nx, ny));
+                    }
                 }
             }
-            sim.geo.touch(rect);
-            app.pending_stroke_rect = rect;
-            let pos = [
-                (rect.x0 + rect.x1) as f32 * 0.5 - m,
-                (rect.y0 + rect.y1) as f32 * 0.5 - m,
-            ];
-            app.selection = Some(Selection {
-                source,
-                pos,
-                angle_deg: 0.0,
-                scale: 1.0,
-                flip_h: false,
-                flip_v: false,
-            });
-            app.selection_bg = None;
-            refresh_sel_fan_cache(app);
-            selection_update(sim, app);
+            let rect = rect.intersect(sim.vis_rect()).clampped(sim.geo.w, sim.geo.h);
+            cut_rect_into_selection(sim, app, rect);
+            if app.sel_has_fans {
+                app.status =
+                    "Fan selected — tune speed/gustiness in the panel, Enter when done."
+                        .into();
+            }
         }
         Cmd::SelectUpdate => selection_update(sim, app),
         Cmd::SelectCommit => commit_selection(sim, app),
@@ -1133,13 +1511,12 @@ impl FlowPaintApp {
         if ctx.wants_keyboard_input() {
             return;
         }
-        // Escape: drop a pending polyline first, then cancel the floating
-        // selection, else cancel an in-progress drag (shapes are dropped
-        // before they commit; freehand strokes just end — their paint is
-        // already down).
+        // Escape: drop a pending sketch first, then cancel the floating
+        // selection, else cancel an in-progress drag (freehand strokes
+        // just end — their paint is already down).
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if !self.polyline.is_empty() {
-                self.polyline.clear();
+            if self.pending_sketch.is_some() {
+                self.pending_sketch = None;
                 self.drag = None;
             } else if self.selection.is_some() {
                 self.drag = None;
@@ -1151,13 +1528,13 @@ impl FlowPaintApp {
             }
         }
 
-        // Enter finishes a pending polyline. Also drop any in-flight
+        // Enter commits the pending sketch. Also drop any in-flight
         // vertex drag so the mouse release can't seed a stray new one.
-        if self.tool == Tool::Polyline
-            && !self.polyline.is_empty()
+        if self.pending_sketch.is_some()
+            && self.selection.is_none()
             && ctx.input(|i| i.key_pressed(egui::Key::Enter))
         {
-            self.commit_polyline(cmds);
+            self.commit_sketch(cmds);
             self.drag = None;
         }
 
@@ -1198,11 +1575,11 @@ impl FlowPaintApp {
         }
         // Paste only when no stroke is in flight: starting a selection
         // session mid-drag would conflate the two undo sessions. A
-        // pending polyline commits first for the same reason.
+        // pending sketch commits first for the same reason.
         if self.drag.is_none()
             && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
         {
-            self.commit_polyline(cmds);
+            self.commit_sketch(cmds);
             cmds.push(Cmd::PasteClipboard);
         }
         let dragging = self.drag.is_some();
@@ -1508,25 +1885,56 @@ impl FlowPaintApp {
             ui.add_space(6.0);
             ui.separator();
             ui.heading("Brush");
+            let ps = self.phys_cache;
+            let radius_label = format!("radius ({})", fmt_len(ps.len_m(self.brush_radius)));
             ui.add(
-                egui::Slider::new(&mut self.brush_radius, 1.0..=64.0)
-                    .text("radius (cells)"),
+                egui::Slider::new(&mut self.brush_radius, 1.0..=64.0).text(radius_label),
             );
 
             ui.add_space(6.0);
             ui.separator();
             ui.heading("Sketch");
+            let thick_label = format!(
+                "wall thickness ({})",
+                fmt_len(ps.len_m(self.wall_thickness))
+            );
+            ui.add(
+                egui::Slider::new(&mut self.wall_thickness, 1.0..=24.0)
+                    .text(thick_label),
+            )
+            .on_hover_text("Lines, polylines and shape outlines commit at this thickness");
+            ui.checkbox(&mut self.shape_filled, "Filled rect / ellipse")
+                .on_hover_text("Off = SolidWorks-style outlines at the wall thickness");
+            ui.horizontal(|ui| {
+                ui.label("angle snap");
+                ui.add(
+                    egui::DragValue::new(&mut self.snap_angle_deg)
+                        .range(1.0..=90.0)
+                        .speed(0.5)
+                        .suffix("°"),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                for a in [5.0f32, 15.0, 22.5, 30.0, 45.0, 90.0] {
+                    if ui.small_button(format!("{a}°")).clicked() {
+                        self.snap_angle_deg = a;
+                    }
+                }
+            });
             ui.checkbox(&mut self.snap_enabled, "Snap to grid");
             if self.snap_enabled {
+                let spacing_label =
+                    format!("spacing ({})", fmt_len(ps.len_m(self.snap_spacing)));
                 ui.add(
                     egui::Slider::new(&mut self.snap_spacing, 2.0..=50.0)
-                        .text("spacing (cells)"),
+                        .text(spacing_label),
                 );
             }
             ui.label(
                 egui::RichText::new(
-                    "Shift: 45° lines, squares, circles · Alt: from centre \
-                     · P: polyline (Enter finishes)",
+                    "Sketches stay editable (drag the handles) until \
+                     Enter/right-click commits · Shift: angle-snap, squares, \
+                     circles · Alt: from centre · Esc cancels",
                 )
                 .small()
                 .weak(),
@@ -1589,6 +1997,7 @@ impl FlowPaintApp {
             if ui.checkbox(&mut tints, "Highlight fans && drains").changed() {
                 cmds.push(Cmd::SetBoundaryTints(tints));
             }
+            ui.checkbox(&mut self.show_legend, "Show legend");
             egui::ComboBox::from_label("particles")
                 .selected_text(PARTICLE_CHOICES[self.particle_index].0)
                 .show_ui(ui, |ui| {
@@ -1617,6 +2026,9 @@ impl FlowPaintApp {
                         let sel = self.fluid_preset_idx == Some(i);
                         if ui.selectable_label(sel, p.name).on_hover_text(p.desc).clicked() {
                             self.fluid_preset_idx = Some(i);
+                            self.fluid_name = p.name;
+                            self.fluid_nu = p.nu;
+                            self.fluid_rho = p.rho;
                             // Only touch the tunnel when it actually
                             // changes: SetWindTunnel commits any floating
                             // selection and rewrites the tunnel columns.
@@ -1633,8 +2045,10 @@ impl FlowPaintApp {
                         }
                     }
                 });
+            let ps = self.phys_cache;
+            let flow_label = format!("flow speed ({})", fmt_speed(ps.u_phys(flow)));
             if ui
-                .add(egui::Slider::new(&mut flow, 0.02..=0.14).text("flow speed"))
+                .add(egui::Slider::new(&mut flow, 0.02..=0.14).text(flow_label))
                 .changed()
             {
                 self.fluid_preset_idx = None;
@@ -1644,7 +2058,7 @@ impl FlowPaintApp {
                 .add(
                     egui::Slider::new(&mut visc, 0.005..=0.08)
                         .logarithmic(true)
-                        .text("viscosity"),
+                        .text(format!("viscosity (Δt {})", fmt_time(ps.dt))),
                 )
                 .changed()
             {
@@ -1671,6 +2085,15 @@ impl FlowPaintApp {
 
             ui.add_space(6.0);
             egui::CollapsingHeader::new("Advanced").show(ui, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut self.domain_width_m, 0.05..=100.0)
+                        .logarithmic(true)
+                        .text("domain width (m)"),
+                )
+                .on_hover_text(
+                    "Physical size the canvas represents; anchors every unit \
+                     readout (cell size, time step, speeds, pressures)",
+                );
                 let mut gain = snap.display_gain;
                 if ui
                     .add(
@@ -1733,6 +2156,13 @@ impl FlowPaintApp {
                 if ui.button("Reset flow").clicked() {
                     cmds.push(Cmd::ResetFlow);
                 }
+                if ui
+                    .button(egui::RichText::new("Clear all").color(egui::Color32::from_rgb(255, 140, 120)))
+                    .on_hover_text("Erase everything — geometry, fans, smoke and flow (not undoable)")
+                    .clicked()
+                {
+                    cmds.push(Cmd::ClearAll);
+                }
             });
             ui.horizontal(|ui| {
                 if ui.add_enabled(can_undo, egui::Button::new("↶ Undo")).clicked() {
@@ -1742,6 +2172,141 @@ impl FlowPaintApp {
                     cmds.push(Cmd::Redo);
                 }
             });
+        }
+    }
+
+    /// The right-hand legend: the important flow numbers in physical
+    /// units, plus a color-scale bar for the current view.
+    fn legend_panel(&mut self, ctx: &egui::Context, snap: UiSnapshot) {
+        if !self.show_legend {
+            return;
+        }
+        let ps = self.phys_cache;
+        let (_vw, vh) = self.stats_grid;
+        egui::SidePanel::right("legend").default_width(200.0).show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.heading("Flow numbers");
+            egui::Grid::new("legend_grid")
+                .num_columns(2)
+                .striped(true)
+                .min_col_width(80.0)
+                .show(ui, |ui| {
+                    let mut row = |k: &str, v: String| {
+                        ui.label(k);
+                        ui.monospace(v);
+                        ui.end_row();
+                    };
+                    row("Fluid", self.fluid_name.to_string());
+                    row("ν", format!("{:.2e} m²/s", self.fluid_nu));
+                    row("ρ", format!("{:.0} kg/m³", self.fluid_rho));
+                    row(
+                        "Domain",
+                        format!(
+                            "{} × {}",
+                            fmt_len(self.domain_width_m),
+                            fmt_len(ps.len_m(vh as f32))
+                        ),
+                    );
+                    row("Cell Δx", fmt_len(ps.dx));
+                    row("Step Δt", fmt_time(ps.dt));
+                    row("Inlet U∞", fmt_speed(ps.u_phys(snap.flow)));
+                    row(
+                        "Ref. length",
+                        fmt_len(ps.len_m(0.16 * vh as f32)),
+                    );
+                    row("Reynolds", format!("{}", self.stats_re));
+                    row(
+                        "Dyn. press.",
+                        fmt_pressure(
+                            0.5 * self.fluid_rho * ps.u_phys(snap.flow).powi(2),
+                        ),
+                    );
+                    row(
+                        "Sim rate",
+                        format!("{:.2}× real", self.stats_steps_per_s * ps.dt),
+                    );
+                    row(
+                        "Sim time",
+                        fmt_time(self.stats_sim_steps as f32 * ps.dt),
+                    );
+                });
+            ui.add_space(6.0);
+            ui.separator();
+
+            // Color-scale legend for the current view. The saturation
+            // points invert the shader's normalizations.
+            let gain = snap.display_gain.max(1e-3);
+            match snap.mode {
+                RenderMode::Dye => {
+                    ui.label("Smoke view: dye brightness");
+                    ui.label(
+                        egui::RichText::new(
+                            "(passive tracer — arbitrary units)",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                RenderMode::Speed => {
+                    ui.label("Speed |u|");
+                    let u_sat = ps.u_phys(snap.flow * 1.6 / gain);
+                    Self::colormap_bar(ui, |t| inferno_color(t));
+                    ui.horizontal(|ui| {
+                        ui.small("0");
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| ui.small(format!("≥ {}", fmt_speed(u_sat))),
+                        );
+                    });
+                }
+                RenderMode::Vorticity => {
+                    ui.label("Vorticity ω (curl)");
+                    let w_sat = snap.flow.max(0.02) / (4.0 * gain) / ps.dt;
+                    Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
+                    ui.horizontal(|ui| {
+                        ui.small(format!("-{:.1} 1/s", w_sat));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| ui.small(format!("+{:.1} 1/s", w_sat)),
+                        );
+                    });
+                    ui.small("blue: clockwise · red: counter-clockwise");
+                }
+                RenderMode::Pressure => {
+                    ui.label("Pressure Δp (gauge)");
+                    let p_sat = ps.pressure_pa(1.0 / (25.0 * gain), self.fluid_rho);
+                    Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
+                    ui.horizontal(|ui| {
+                        ui.small(format!("-{}", fmt_pressure(p_sat)));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| ui.small(format!("+{}", fmt_pressure(p_sat))),
+                        );
+                    });
+                    ui.small("relative to ambient (0 = undisturbed)");
+                }
+            }
+        });
+    }
+
+    fn colormap_bar(ui: &mut egui::Ui, color: impl Fn(f32) -> egui::Color32) {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().min(184.0), 14.0),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        let n = 48;
+        for i in 0..n {
+            let t0 = i as f32 / n as f32;
+            let t1 = (i + 1) as f32 / n as f32;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x + rect.width() * t0, rect.min.y),
+                    egui::pos2(rect.min.x + rect.width() * t1, rect.max.y),
+                ),
+                0.0,
+                color((t0 + t1) * 0.5),
+            );
         }
     }
 
@@ -1829,20 +2394,43 @@ impl FlowPaintApp {
         if response.drag_started() {
             if let Some(pos) = pointer {
                 let cell = to_cell(pos);
-                if self.tool == Tool::Polyline {
+                if let Some(kind) = Self::sketch_kind(self.tool) {
                     if erase {
-                        // Right-click finishes the polyline, CAD-style.
-                        self.commit_polyline(cmds);
+                        // Right-click commits the pending sketch, CAD-style.
+                        self.commit_sketch(cmds);
                     } else {
+                        // Pressing a handle of the pending sketch edits
+                        // that vertex; pressing elsewhere starts a new
+                        // entity (committing the old one) or, for the
+                        // polyline, appends a vertex on release.
+                        let handle_r_cells = 8.0 * ppp / mapping.px_per_cell.max(1e-3);
+                        let handle_hit = self.pending_sketch.as_ref().and_then(|sk| {
+                            sk.handles().iter().position(|h| {
+                                let dx = h[0] - cell[0];
+                                let dy = h[1] - cell[1];
+                                (dx * dx + dy * dy).sqrt() < handle_r_cells
+                            })
+                        });
+                        let mut sketch_handle = None;
+                        if let Some(h) = handle_hit {
+                            let sk = self.pending_sketch.as_mut().unwrap();
+                            sketch_handle = Some(sk.begin_handle_drag(h));
+                        } else if kind != SketchKind::Polyline {
+                            self.commit_sketch(cmds);
+                            let a = self.snap_point(cell);
+                            self.pending_sketch =
+                                Some(PendingSketch { kind, verts: vec![a, a] });
+                        }
                         self.drag = Some(DragState {
-                            start_cell: cell,
+                            start_cell: self.snap_point(cell),
                             last_cell: cell,
                             erase: false,
-                            tool: Tool::Polyline,
+                            tool: self.tool,
                             material: self.material,
                             radius: self.brush_radius,
                             fan_deferred: false,
                             sel_move: false,
+                            sketch_handle,
                         });
                     }
                 } else if self.tool == Tool::Select {
@@ -1864,6 +2452,7 @@ impl FlowPaintApp {
                         radius: self.brush_radius,
                         fan_deferred: false,
                         sel_move: hit,
+                        sketch_handle: None,
                     });
                 } else {
                     // Belt and braces: a painting drag must never start
@@ -1871,13 +2460,6 @@ impl FlowPaintApp {
                     if self.selection.is_some() {
                         cmds.push(Cmd::SelectCommit);
                     }
-                    // Shape tools snap their anchor to the sketch grid.
-                    let cell = if matches!(self.tool, Tool::Line | Tool::Rect | Tool::Ellipse)
-                    {
-                        self.snap_point(cell)
-                    } else {
-                        cell
-                    };
                     // Every new fan stroke gusts on its own schedule; the
                     // phase is pinned via a command so it survives other
                     // same-frame rolls (stamps read it at apply time).
@@ -1900,6 +2482,7 @@ impl FlowPaintApp {
                         radius: self.brush_radius,
                         fan_deferred,
                         sel_move: false,
+                        sketch_handle: None,
                     };
                     if freehand {
                         cmds.push(Cmd::StrokeBegin);
@@ -1933,7 +2516,29 @@ impl FlowPaintApp {
                             drag.sel_move,
                         )
                     };
-                    if tool == Tool::Select {
+                    if let Some(kind) = Self::sketch_kind(tool) {
+                        let (shift, alt) = response
+                            .ctx
+                            .input(|i| (i.modifiers.shift, i.modifiers.alt));
+                        let handle = self.drag.as_ref().unwrap().sketch_handle;
+                        if let Some(idx) = handle {
+                            // Dragging an existing vertex/handle.
+                            let p = self.constrained_handle_pos(kind, idx, cell, shift);
+                            if let Some(sk) = self.pending_sketch.as_mut() {
+                                if idx < sk.verts.len() {
+                                    sk.verts[idx] = p;
+                                }
+                            }
+                        } else if kind != SketchKind::Polyline {
+                            // Rubber-banding a new entity from its anchor.
+                            let (ea, eb) =
+                                self.effective_shape(tool, start, cell, shift, alt);
+                            if let Some(sk) = self.pending_sketch.as_mut() {
+                                sk.verts = vec![ea, eb];
+                            }
+                        }
+                        self.drag.as_mut().unwrap().last_cell = cell;
+                    } else if tool == Tool::Select {
                         self.drag.as_mut().unwrap().last_cell = cell;
                         if sel_move {
                             if let Some(sel) = self.selection.as_mut() {
@@ -1991,6 +2596,10 @@ impl FlowPaintApp {
                                     a: drag.start_cell,
                                     b: drag.last_cell,
                                 });
+                            } else {
+                                // A plain click: select the connected fan
+                                // under the cursor, if any.
+                                cmds.push(Cmd::SelectFanAt(drag.start_cell));
                             }
                         }
                     }
@@ -2008,46 +2617,49 @@ impl FlowPaintApp {
                         cmds.push(Cmd::StrokeEnd);
                     }
                     Tool::Polyline => {
-                        // A click (or drag-release) places a vertex,
-                        // constrained relative to the previous one.
-                        let shift = response.ctx.input(|i| i.modifiers.shift);
-                        let mut p = self.snap_point(drag.last_cell);
-                        if let Some(&prev) = self.polyline.last() {
-                            if shift {
-                                p = Self::angle_snap(prev, p);
+                        if drag.sketch_handle.is_none() {
+                            // A click (or drag-release) places a vertex,
+                            // constrained relative to the previous one.
+                            let shift = response.ctx.input(|i| i.modifiers.shift);
+                            if self.pending_sketch.is_none() {
+                                self.pending_sketch = Some(PendingSketch {
+                                    kind: SketchKind::Polyline,
+                                    verts: Vec::new(),
+                                });
                             }
-                        }
-                        if self.polyline.len() < 512 {
-                            self.polyline.push(p);
+                            let prev = self
+                                .pending_sketch
+                                .as_ref()
+                                .unwrap()
+                                .verts
+                                .last()
+                                .copied();
+                            let mut p = self.snap_point(drag.last_cell);
+                            if let (Some(prev), true) = (prev, shift) {
+                                p = self.angle_snap(prev, p);
+                            }
+                            let sk = self.pending_sketch.as_mut().unwrap();
+                            if sk.verts.len() < 512 {
+                                sk.verts.push(p);
+                            }
                         }
                     }
                     Tool::Line | Tool::Rect | Tool::Ellipse => {
-                        let (shift, alt) = response
-                            .ctx
-                            .input(|i| (i.modifiers.shift, i.modifiers.alt));
-                        let (ea, eb) = self.effective_shape(
-                            drag.tool,
-                            drag.start_cell,
-                            drag.last_cell,
-                            shift,
-                            alt,
-                        );
-                        // Line direction sets the fan direction.
-                        if drag.material == Material::Fan && drag.tool == Tool::Line {
-                            let dx = eb[0] - ea[0];
-                            let dy = eb[1] - ea[1];
-                            let len = (dx * dx + dy * dy).sqrt();
-                            if len > 1.0 {
-                                self.fan_dir = [dx / len, dy / len];
+                        // The entity stays pending (editable handles);
+                        // drop it if the initial drag was degenerate.
+                        if drag.sketch_handle.is_none() {
+                            if let Some(sk) = &self.pending_sketch {
+                                if sk.verts.len() >= 2 {
+                                    let d = [
+                                        sk.verts[1][0] - sk.verts[0][0],
+                                        sk.verts[1][1] - sk.verts[0][1],
+                                    ];
+                                    if (d[0] * d[0] + d[1] * d[1]).sqrt() < 1.0 {
+                                        self.pending_sketch = None;
+                                    }
+                                }
                             }
                         }
-                        cmds.push(Cmd::ShapeCommit {
-                            tool: drag.tool,
-                            a: ea,
-                            b: eb,
-                            r: drag.radius,
-                            material: drag.effective_material(),
-                        });
                     }
                 }
             }
@@ -2072,7 +2684,7 @@ impl FlowPaintApp {
 
         // Brush cursor.
         if let Some(hover) = response.hover_pos() {
-            if matches!(self.tool, Tool::Brush | Tool::Eraser | Tool::Line) {
+            if matches!(self.tool, Tool::Brush | Tool::Eraser) {
                 let r = self.brush_radius * mapping.px_per_cell / ppp;
                 painter.circle_stroke(hover, r, stroke);
             }
@@ -2122,51 +2734,66 @@ impl FlowPaintApp {
             );
         };
 
-        // Shape preview while dragging; sized, constrained and filled to
-        // match what will actually be stamped.
-        if let Some(drag) = &self.drag {
-            let (shift, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt));
-            let (ea, eb) =
-                self.effective_shape(drag.tool, drag.start_cell, drag.last_cell, shift, alt);
-            let a = cell_to_pos(ea);
-            let b = cell_to_pos(eb);
+        // Pending sketch: CAD-style editable entity with vertex handles,
+        // rendered at the true committed wall thickness.
+        if let Some(sk) = &self.pending_sketch {
+            let ps = self.phys_cache;
+            let w_px = (self.wall_thickness * mapping.px_per_cell / ppp).max(1.5);
+            let body_stroke = egui::Stroke::new(w_px, egui::Color32::from_white_alpha(70));
             let fill = egui::Color32::from_white_alpha(30);
-            match drag.tool {
-                Tool::Line => {
-                    // Preview at the true committed thickness (a capsule
-                    // of radius brush_radius cells).
-                    let w = (2.0 * drag.radius * mapping.px_per_cell / ppp).max(1.5);
-                    painter.line_segment(
-                        [a, b],
-                        egui::Stroke::new(w, egui::Color32::from_white_alpha(70)),
-                    );
-                    painter.line_segment([a, b], stroke);
-                    let dx = eb[0] - ea[0];
-                    let dy = eb[1] - ea[1];
+            match sk.kind {
+                SketchKind::Line => {
+                    if sk.verts.len() >= 2 {
+                        let a = cell_to_pos(sk.verts[0]);
+                        let b = cell_to_pos(sk.verts[1]);
+                        painter.line_segment([a, b], body_stroke);
+                        painter.line_segment([a, b], stroke);
+                        let dx = sk.verts[1][0] - sk.verts[0][0];
+                        let dy = sk.verts[1][1] - sk.verts[0][1];
+                        let len_c = (dx * dx + dy * dy).sqrt();
+                        dims_text(
+                            painter,
+                            b,
+                            format!(
+                                "L {} ({:.0} c)  ∠ {:.0}°",
+                                fmt_len(ps.len_m(len_c)),
+                                len_c,
+                                (-dy).atan2(dx).to_degrees()
+                            ),
+                        );
+                    }
+                }
+                SketchKind::Rect => {
+                    let a = cell_to_pos(sk.verts[0]);
+                    let b = cell_to_pos(sk.verts[1]);
+                    let rect = egui::Rect::from_two_pos(a, b);
+                    if self.shape_filled {
+                        painter.rect_filled(rect, 0.0, fill);
+                        painter.rect_stroke(rect, 0.0, stroke);
+                    } else {
+                        painter.rect_stroke(
+                            rect,
+                            0.0,
+                            egui::Stroke::new(w_px, egui::Color32::from_white_alpha(70)),
+                        );
+                        painter.rect_stroke(rect, 0.0, stroke);
+                    }
+                    let wc = (sk.verts[1][0] - sk.verts[0][0]).abs();
+                    let hc = (sk.verts[1][1] - sk.verts[0][1]).abs();
                     dims_text(
                         painter,
                         b,
                         format!(
-                            "L {:.0}  ∠ {:.0}°",
-                            (dx * dx + dy * dy).sqrt(),
-                            (-dy).atan2(dx).to_degrees()
+                            "{} × {}",
+                            fmt_len(ps.len_m(wc)),
+                            fmt_len(ps.len_m(hc))
                         ),
                     );
                 }
-                Tool::Rect => {
+                SketchKind::Ellipse => {
+                    let a = cell_to_pos(sk.verts[0]);
+                    let b = cell_to_pos(sk.verts[1]);
                     let rect = egui::Rect::from_two_pos(a, b);
-                    painter.rect_filled(rect, 0.0, fill);
-                    painter.rect_stroke(rect, 0.0, stroke);
-                    dims_text(
-                        painter,
-                        b,
-                        format!("{:.0} × {:.0}", (eb[0] - ea[0]).abs(), (eb[1] - ea[1]).abs()),
-                    );
-                }
-                Tool::Ellipse => {
-                    let rect = egui::Rect::from_two_pos(a, b);
-                    // egui has no ellipse primitive; approximate with a
-                    // polygon.
                     let c = rect.center();
                     let rx = rect.width() * 0.5;
                     let ry = rect.height() * 0.5;
@@ -2176,60 +2803,83 @@ impl FlowPaintApp {
                             egui::pos2(c.x + rx * t.cos(), c.y + ry * t.sin())
                         })
                         .collect();
-                    painter.add(egui::Shape::convex_polygon(pts, fill, stroke));
+                    if self.shape_filled {
+                        painter.add(egui::Shape::convex_polygon(pts, fill, stroke));
+                    } else {
+                        let mut ring = pts.clone();
+                        ring.push(pts[0]);
+                        painter.add(egui::Shape::line(ring.clone(), body_stroke));
+                        painter.add(egui::Shape::line(ring, stroke));
+                    }
+                    let rxc = (sk.verts[1][0] - sk.verts[0][0]).abs() * 0.5;
+                    let ryc = (sk.verts[1][1] - sk.verts[0][1]).abs() * 0.5;
                     dims_text(
                         painter,
                         b,
                         format!(
-                            "r {:.0} × {:.0}",
-                            (eb[0] - ea[0]).abs() * 0.5,
-                            (eb[1] - ea[1]).abs() * 0.5
+                            "r {} × {}",
+                            fmt_len(ps.len_m(rxc)),
+                            fmt_len(ps.len_m(ryc))
                         ),
                     );
                 }
-                _ => {}
-            }
-        }
-
-        // Polyline preview: committed-thickness segments through the
-        // placed vertices plus a rubber segment to the cursor.
-        if self.tool == Tool::Polyline && !self.polyline.is_empty() {
-            let w = (2.0 * self.brush_radius * mapping.px_per_cell / ppp).max(1.5);
-            let seg_stroke = egui::Stroke::new(w, egui::Color32::from_white_alpha(70));
-            for seg in self.polyline.windows(2) {
-                painter.line_segment([cell_to_pos(seg[0]), cell_to_pos(seg[1])], seg_stroke);
-                painter.line_segment([cell_to_pos(seg[0]), cell_to_pos(seg[1])], stroke);
-            }
-            for &v in &self.polyline {
-                painter.circle_filled(cell_to_pos(v), 3.0, egui::Color32::from_rgb(160, 230, 255));
-            }
-            if let Some(hover) = self.hover_cell {
-                let shift = ui.input(|i| i.modifiers.shift);
-                let prev = *self.polyline.last().unwrap();
-                let mut p = self.snap_point(hover);
-                if shift {
-                    p = Self::angle_snap(prev, p);
+                SketchKind::Polyline => {
+                    for seg in sk.verts.windows(2) {
+                        let a = cell_to_pos(seg[0]);
+                        let b = cell_to_pos(seg[1]);
+                        painter.line_segment([a, b], body_stroke);
+                        painter.line_segment([a, b], stroke);
+                    }
+                    // Rubber segment to the cursor.
+                    if self.tool == Tool::Polyline && self.drag.is_none() {
+                        if let (Some(hover), Some(&prev)) =
+                            (self.hover_cell, sk.verts.last())
+                        {
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            let mut p = self.snap_point(hover);
+                            if shift {
+                                p = self.angle_snap(prev, p);
+                            }
+                            painter.line_segment(
+                                [cell_to_pos(prev), cell_to_pos(p)],
+                                egui::Stroke::new(
+                                    1.0,
+                                    egui::Color32::from_white_alpha(120),
+                                ),
+                            );
+                            let dx = p[0] - prev[0];
+                            let dy = p[1] - prev[1];
+                            let len_c = (dx * dx + dy * dy).sqrt();
+                            dims_text(
+                                painter,
+                                cell_to_pos(p),
+                                format!(
+                                    "L {}  ∠ {:.0}°  (Enter: finish)",
+                                    fmt_len(ps.len_m(len_c)),
+                                    (-dy).atan2(dx).to_degrees()
+                                ),
+                            );
+                        }
+                    }
                 }
-                painter.line_segment(
-                    [cell_to_pos(prev), cell_to_pos(p)],
-                    egui::Stroke::new(1.0, egui::Color32::from_white_alpha(120)),
-                );
-                let dx = p[0] - prev[0];
-                let dy = p[1] - prev[1];
-                dims_text(
-                    painter,
-                    cell_to_pos(p),
-                    format!(
-                        "L {:.0}  ∠ {:.0}°   (Enter/right-click: finish)",
-                        (dx * dx + dy * dy).sqrt(),
-                        (-dy).atan2(dx).to_degrees()
-                    ),
+            }
+            // Vertex handles: draggable squares, CAD-style.
+            for h in sk.handles() {
+                let p = cell_to_pos(h);
+                let r = 4.0;
+                let hrect =
+                    egui::Rect::from_center_size(p, egui::vec2(2.0 * r, 2.0 * r));
+                painter.rect_filled(hrect, 1.0, egui::Color32::from_rgb(40, 90, 120));
+                painter.rect_stroke(
+                    hrect,
+                    1.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(160, 230, 255)),
                 );
             }
         }
     }
 
-    fn generator_windows(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
+    fn generator_windows(&mut self, ctx: &egui::Context, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
         use crate::generators as gen;
 
         let mut show = self.show_airfoil_gen;
@@ -2274,7 +2924,7 @@ impl FlowPaintApp {
                 ui.add_space(6.0);
                 if ui.button("Insert into scene").clicked() {
                     let stamp = gen::generate_airfoil(p);
-                    self.commit_polyline(cmds); // don't orphan a pending sketch
+                    self.commit_sketch(cmds); // don't orphan a pending sketch
                     cmds.push(Cmd::InsertStamp(stamp));
                 }
             });
@@ -2289,7 +2939,7 @@ impl FlowPaintApp {
                 egui::ComboBox::from_label("Famous engines")
                     .selected_text("Choose a preset…")
                     .show_ui(ui, |ui| {
-                        for (name, eps, contour) in gen::NOZZLE_PRESETS {
+                        for (name, eps, contour, ve) in gen::NOZZLE_PRESETS {
                             if ui.selectable_label(false, name).clicked() {
                                 // Planar 2D analogue of an axisymmetric area
                                 // ratio: width ratio = sqrt(eps).
@@ -2297,6 +2947,13 @@ impl FlowPaintApp {
                                 p.contour = contour;
                                 p.div_ratio =
                                     (1.5 * (p.exit_ratio - 1.0)).clamp(2.0, 16.0);
+                                // Scale the chamber fan so the throat jet
+                                // approximates the engine's exhaust as
+                                // closely as the solver's speed cap allows.
+                                p.fan_mult = (0.27
+                                    / (snap.flow * p.chamber_ratio).max(1e-4))
+                                .clamp(0.2, 2.0);
+                                self.nozzle_real_ve = Some(ve);
                             }
                         }
                     });
@@ -2327,6 +2984,27 @@ impl FlowPaintApp {
                     ui.radio_value(&mut p.contour, gen::NozzleContour::Conical, "Conical (15°-style)");
                 });
                 ui.checkbox(&mut p.chamber_fan, "Fan in the chamber (self-powered)");
+                ui.add(
+                    egui::Slider::new(&mut p.fan_mult, 0.2..=2.0).text("chamber fan ×"),
+                );
+                // Expected jet speeds in real units, next to the engine's
+                // actual exhaust velocity.
+                let throat_sim =
+                    self.phys_cache.u_phys(snap.flow * p.fan_mult * p.chamber_ratio);
+                ui.label(format!("sim throat jet ≈ {}", fmt_speed(throat_sim)));
+                if let Some(ve) = self.nozzle_real_ve {
+                    let factor = ve / throat_sim.max(1e-6);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "real engine exhaust ≈ {:.0} m/s (~{:.0}× faster — the \
+                             incompressible solver caps jet speed, so this is a \
+                             scaled approximation)",
+                            ve, factor
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(
@@ -2338,16 +3016,19 @@ impl FlowPaintApp {
                 );
                 ui.add_space(6.0);
                 if ui.button("Insert into scene").clicked() {
+                    // Rescale the fan for the flow speed at insert time.
+                    p.fan_mult = (0.27 / (snap.flow * p.chamber_ratio).max(1e-4))
+                        .clamp(0.2, 2.0);
                     let stamp = gen::generate_nozzle(p);
-                    self.commit_polyline(cmds); // don't orphan a pending sketch
+                    self.commit_sketch(cmds); // don't orphan a pending sketch
                     cmds.push(Cmd::InsertStamp(stamp));
                 }
             });
         self.show_nozzle_gen = show;
     }
 
-    fn windows(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
-        self.generator_windows(ctx, cmds);
+    fn windows(&mut self, ctx: &egui::Context, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
+        self.generator_windows(ctx, snap, cmds);
         egui::Window::new("About FlowPaint")
             .open(&mut self.show_about)
             .collapsible(false)
@@ -2378,10 +3059,10 @@ impl FlowPaintApp {
                         ("B / L / R / E / P / X / S", "brush / line / rect / ellipse / polyline / eraser / select"),
                         ("[ / ]", "brush size"),
                         ("Right-drag", "erase with any tool"),
-                        ("Shift", "45° lines · squares · circles"),
+                        ("Shift", "angle-snapped lines · squares · circles"),
                         ("Alt", "rect/ellipse from centre"),
-                        ("Enter / right-click", "finish polyline"),
-                        ("Esc", "cancel polyline / shape / selection"),
+                        ("Enter / right-click", "commit the pending sketch"),
+                        ("Esc", "cancel sketch / selection"),
                         ("Enter", "apply the floating selection"),
                         ("Del", "delete the selection"),
                         ("Arrows (+Shift)", "nudge the selection"),

@@ -150,6 +150,10 @@ pub struct NozzleParams {
     pub contour: NozzleContour,
     /// Stamp inlet (fan) cells across the chamber entrance.
     pub chamber_fan: bool,
+    /// Speed multiplier for the chamber fan (relative to the global flow
+    /// speed). Auto-computed from the engine preset's exhaust velocity so
+    /// the throat jet runs as fast as the solver allows.
+    pub fan_mult: f32,
 }
 
 impl Default for NozzleParams {
@@ -163,19 +167,21 @@ impl Default for NozzleParams {
             wall_cells: 6.0,
             contour: NozzleContour::Bell,
             chamber_fan: true,
+            fan_mult: 1.25,
         }
     }
 }
 
-/// (name, area ratio eps, contour). The generator uses sqrt(eps) as the
-/// 2D exit/throat width ratio.
-pub const NOZZLE_PRESETS: [(&str, f32, NozzleContour); 6] = [
-    ("V-2 / A-4 — where it began (ε≈3.4)", 3.4, NozzleContour::Conical),
-    ("F-1 — Saturn V first stage (ε≈16)", 16.0, NozzleContour::Bell),
-    ("Merlin 1D — Falcon 9 (ε≈16)", 16.0, NozzleContour::Bell),
-    ("RS-25 / SSME — Space Shuttle (ε≈69)", 69.0, NozzleContour::Bell),
-    ("Raptor, sea level — Starship (ε≈34)", 34.0, NozzleContour::Bell),
-    ("RL10-B2 — vacuum bell (ε≈280)", 280.0, NozzleContour::Bell),
+/// (name, area ratio eps, contour, real exhaust velocity m/s). The
+/// generator uses sqrt(eps) as the 2D exit/throat width ratio, and the
+/// exhaust velocity to scale the chamber fan.
+pub const NOZZLE_PRESETS: [(&str, f32, NozzleContour, f32); 6] = [
+    ("V-2 / A-4 — where it began (ε≈3.4)", 3.4, NozzleContour::Conical, 2050.0),
+    ("F-1 — Saturn V first stage (ε≈16)", 16.0, NozzleContour::Bell, 2580.0),
+    ("Merlin 1D — Falcon 9 (ε≈16)", 16.0, NozzleContour::Bell, 2760.0),
+    ("RS-25 / SSME — Space Shuttle (ε≈69)", 69.0, NozzleContour::Bell, 3560.0),
+    ("Raptor, sea level — Starship (ε≈34)", 34.0, NozzleContour::Bell, 3200.0),
+    ("RL10-B2 — vacuum bell (ε≈280)", 280.0, NozzleContour::Bell, 4420.0),
 ];
 
 /// Inner half-width of the nozzle at axial position x (cells, x=0 at the
@@ -274,10 +280,11 @@ pub fn generate_nozzle(p: &NozzleParams) -> GeoRegion {
             if ay > hmin && ay <= hmax + p.wall_cells {
                 cell[i] = CELL_WALL;
             } else if ay <= h1 && p.chamber_fan && ax < 3.0 {
-                // Fan strip across the chamber entrance, blowing +x, with
-                // a little smoke so the plume is visible immediately.
+                // Fan strip across the chamber entrance, blowing +x at
+                // the preset-scaled speed, with a little smoke so the
+                // plume is visible immediately.
                 cell[i] = CELL_INLET;
-                fan[i] = [1.0, 0.0, 0.0, 0.0];
+                fan[i] = [p.fan_mult.clamp(0.2, 2.0), 0.0, 0.0, 0.0];
                 dye_src[i] = [0.95, 0.85, 0.55, 0.85];
             }
         }

@@ -1,4 +1,5 @@
-name: FlowPaint builds
+name: FlowPaint V2
+run-name: "FlowPaint V2 - ${{ github.event.head_commit.message || 'manual build' }}"
 
 on:
   push:
@@ -19,16 +20,16 @@ jobs:
         include:
           - name: Windows x64
             os: windows-latest
-            artifact: FlowPaint-windows-x64
-            binary: target/release/flowpaint.exe
+            artifact: FlowPaint-V2-windows-x64
+            binary: target/release/FlowPaint-V2.exe
           - name: Linux x64
             os: ubuntu-latest
-            artifact: FlowPaint-linux-x64
-            binary: target/release/flowpaint
+            artifact: FlowPaint-V2-linux-x64
+            binary: target/release/FlowPaint-V2
           - name: macOS arm64
             os: macos-latest
-            artifact: FlowPaint-macos-arm64
-            binary: target/release/flowpaint
+            artifact: FlowPaint-V2-macos-arm64
+            binary: target/release/FlowPaint-V2
     defaults:
       run:
         working-directory: FlowPaint

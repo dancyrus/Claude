@@ -1,4 +1,4 @@
-# FlowPaint — CFD you can finger paint, for your desktop
+# FlowPaint V2 — CFD you can finger paint, for your desktop
 
 MS Paint, if the canvas were a wind tunnel. FlowPaint is a native
 desktop program (Windows / Linux / macOS) that runs a real
@@ -18,17 +18,23 @@ On an RTX 3080 it happily pushes the **Ultra** grid (2560 × 1280 —
   **Eraser** (X). Right-drag erases with any tool.
 - **Polyline** (P) — CAD-style connected wall/fan runs: click vertices,
   Enter or right-click finishes (one undo entry), Esc cancels.
+- **SolidWorks-style sketching**: lines, rectangles, ellipses and
+  polylines are drawn as *editable sketch entities* — drag their vertex
+  handles to adjust before committing with Enter/right-click. Entities
+  commit as outlines offset to a settable **wall thickness** (or filled,
+  via a toggle), and angle snapping is settable to any increment with
+  presets for 5°, 15°, 22.5°, 30°, 45° and 90°.
 - **Select** (S) — marquee-select any drawn region, then **move it live
   through the flow**, rotate, scale, flip, copy/paste (Ctrl+C/V), nudge
   with arrows, Delete, Enter to apply, Esc to cancel. The selection
   stays physically present while you drag it, so the fluid reacts in
   real time. If it contains fans, sliders appear to retune their
   speed and gustiness in place.
-- **CAD sketch aids**: live dimension readouts at the cursor (length,
-  angle, width × height), cursor cell coordinates in the status bar,
-  Shift = 45°-snapped lines / squares / circles, Alt = draw rectangles
-  and ellipses from the centre, and an optional snap-to-grid with
-  adjustable spacing.
+- **CAD sketch aids**: live dimension readouts at the cursor in real
+  units (length, angle, width × height), cursor cell coordinates in the
+  status bar, Shift = angle-snapped lines / squares / circles, Alt =
+  draw rectangles and ellipses from the centre, and an optional
+  snap-to-grid with adjustable spacing.
 - **Materials**: Wall (no-slip solid), Fan (inlet — blows along your
   stroke or line direction, with per-fan **speed multiplier** and
   **gustiness** that makes the jet meander and pulse like a real
@@ -41,7 +47,19 @@ On an RTX 3080 it happily pushes the **Ultra** grid (2560 × 1280 —
 air, Gentle breeze, Wind tunnel (air), Storm (high Re), Water flume,
 Glycerin/syrup (creeping flow), and a stylized Supersonic tunnel
 (maximum speed and Reynolds number — the solver is incompressible, so
-no shocks).
+no shocks). Each preset carries the fluid's real kinematic viscosity
+and density.
+
+**Real units everywhere**: the canvas maps to a physical domain
+(settable width, default 1 m), which anchors every readout — cell size,
+time step, speeds in m/s, pressures in Pa. A **legend panel** on the
+right shows the important flow numbers (fluid properties, Δx, Δt, inlet
+speed, Reynolds number, dynamic pressure, sim rate and elapsed sim
+time) plus a labeled color scale for the current view. The Pressure
+view shows **gauge pressure** (relative to ambient). Sliders and
+dimension readouts are annotated with physical units. The wind tunnel
+initializes to a uniform freestream, so there is no impulsive-start
+transient (flow arriving from both ends).
 
 **Generators** (side panel):
 - **Airfoil** — full NACA 4-digit generator (camber, camber position,

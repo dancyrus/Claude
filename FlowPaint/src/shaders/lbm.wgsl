@@ -192,7 +192,12 @@ fn collide(@builtin(global_invocation_id) gid: vec3u) {
     density[idx] = rho;
 }
 
-// Reinitialise the written distribution buffer to rest equilibrium.
+// Reinitialise the written distribution buffer to the freestream
+// equilibrium (P.free_u is the tunnel inflow, or zero when the tunnel is
+// off). Starting the whole domain at the freestream — instead of at rest
+// — removes the impulsive-start transient in which the inlet and the
+// edge sponges accelerate fluid from both ends while the interior lags,
+// which reads as flow arriving from two directions.
 // Dispatched once per f buffer (with the two ping-pong bind groups).
 @compute @workgroup_size(8, 8)
 fn reset_rest(@builtin(global_invocation_id) gid: vec3u) {
@@ -201,7 +206,10 @@ fn reset_rest(@builtin(global_invocation_id) gid: vec3u) {
     if (gid.x >= W || gid.y >= H) { return; }
     let n = W * H;
     let idx = gid.y * W + gid.x;
-    for (var i = 0u; i < 9u; i++) { f_out[i * n + idx] = WT[i]; }
-    velocity[idx] = vec2f(0.0);
+    let usq = dot(P.free_u, P.free_u);
+    for (var i = 0u; i < 9u; i++) {
+        f_out[i * n + idx] = equilibrium(i, 1.0, P.free_u, usq);
+    }
+    velocity[idx] = P.free_u;
     density[idx] = 1.0;
 }

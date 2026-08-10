@@ -16,7 +16,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("FlowPaint — CFD you can finger paint"),
+            .with_title("FlowPaint V2 — CFD you can finger paint"),
         wgpu_options: egui_wgpu::WgpuConfiguration {
             power_preference: wgpu::PowerPreference::HighPerformance,
             // Ask for everything the adapter can give: the default 128 MB

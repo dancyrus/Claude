@@ -251,6 +251,9 @@ pub struct GpuSim {
     frame_counter: u32,
     /// Lattice time (steps) elapsed, fed to the fan-gust animation.
     lattice_time: f32,
+    /// Total lattice steps since the last flow reset (never wraps; used
+    /// for the physical sim-time readout).
+    pub total_steps: f64,
     pending_reset: bool,
     pending_clear_dye: bool,
     /// Steps actually encoded last frame (for stats/particle dt).
@@ -584,6 +587,7 @@ impl GpuSim {
             mapping: ViewportMapping::default(),
             frame_counter: 0,
             lattice_time: 0.0,
+            total_steps: 0.0,
             pending_reset: true,
             pending_clear_dye: true,
             steps_last_frame: 0,
@@ -737,10 +741,12 @@ impl GpuSim {
         }
     }
 
-    /// Queue a full flow reset (populations to rest, dye cleared).
+    /// Queue a full flow reset (populations to the freestream, dye
+    /// cleared, sim clock zeroed).
     pub fn reset_flow(&mut self) {
         self.pending_reset = true;
         self.pending_clear_dye = true;
+        self.total_steps = 0.0;
     }
 
     pub fn clear_all(&mut self) {
@@ -940,6 +946,7 @@ impl GpuSim {
         // multiples of 2*pi/65536 per step), so wrapping is
         // phase-continuous, and 65536 is far below f32 precision loss.
         self.lattice_time = (self.lattice_time + steps as f32) % 65536.0;
+        self.total_steps += steps as f64;
         self.queue.write_buffer(&self.sim_uniform, 0, bytemuck::bytes_of(&params));
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
