@@ -6,8 +6,8 @@
 
 use crate::model::{ObjMaterial, Shape, SketchModel, SketchObject};
 use crate::sim::{
-    GpuSim, RenderMode, ViewportMapping, DEFAULT_MARGIN_INDEX, MARGIN_CHOICES,
-    PARTICLE_CHOICES, RESOLUTIONS,
+    GpuSim, RenderMode, SolverMode, ViewportMapping, DEFAULT_MARGIN_INDEX,
+    MARGIN_CHOICES, PARTICLE_CHOICES, RESOLUTIONS,
 };
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -67,7 +67,27 @@ struct SceneV3 {
     ref_width: u32,
 }
 
+/// Scene file (version 4): v3 plus the solver mode and its settings.
+#[derive(Serialize, Deserialize)]
+struct SceneV4 {
+    version: u32,
+    objects: Vec<SketchObject>,
+    wind_tunnel: bool,
+    flow_speed: f32,
+    viscosity: f32,
+    steps_per_frame: u32,
+    domain_width_m: f32,
+    fluid_nu: f32,
+    fluid_rho: f32,
+    ref_width: u32,
+    /// 0 = LBM (incompressible), 1 = Euler (compressible).
+    solver: u32,
+    mach: f32,
+    fluid_a: f32,
+}
+
 const SCENE_V3: u32 = 3;
+const SCENE_V4: u32 = 4;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -83,6 +103,8 @@ struct FluidPreset {
     nu: f32,
     /// Physical density [kg/m^3].
     rho: f32,
+    /// Physical sound speed [m/s] (anchors the compressible mode's units).
+    a: f32,
 }
 
 const FLUID_PRESETS: [FluidPreset; 7] = [
@@ -95,6 +117,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         steps: None,
         nu: 1.5e-5,
         rho: 1.2,
+        a: 343.0,
     },
     FluidPreset {
         name: "Gentle breeze (air)",
@@ -105,6 +128,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         steps: None,
         nu: 1.5e-5,
         rho: 1.2,
+        a: 343.0,
     },
     FluidPreset {
         name: "Wind tunnel (air)",
@@ -115,6 +139,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         steps: None,
         nu: 1.5e-5,
         rho: 1.2,
+        a: 343.0,
     },
     FluidPreset {
         name: "Storm (air, high Re)",
@@ -125,6 +150,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         steps: None,
         nu: 1.5e-5,
         rho: 1.2,
+        a: 343.0,
     },
     FluidPreset {
         name: "Water flume",
@@ -136,6 +162,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         steps: None,
         nu: 1.0e-6,
         rho: 998.0,
+        a: 1481.0,
     },
     FluidPreset {
         name: "Glycerin / syrup",
@@ -147,6 +174,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         steps: None,
         nu: 1.19e-3,
         rho: 1260.0,
+        a: 1904.0,
     },
     FluidPreset {
         name: "Supersonic tunnel (stylized)",
@@ -159,6 +187,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         steps: Some(16),
         nu: 1.5e-5,
         rho: 1.2,
+        a: 343.0,
     },
 ];
 
@@ -276,6 +305,10 @@ struct UiSnapshot {
     tunnel: bool,
     tints: bool,
     mode: RenderMode,
+    solver: SolverMode,
+    mach: f32,
+    /// CFL time step of the Euler solver (nondimensional).
+    euler_dt: f32,
     display_gain: f32,
     smoke_gain: f32,
     particle_size: f32,
@@ -288,6 +321,8 @@ struct UiSnapshot {
 enum Cmd {
     TogglePause,
     ResetFlow,
+    SetSolver(SolverMode),
+    SetMach(f32),
     SetWindTunnel(bool),
     SetResolution(usize),
     SetMargin(usize),
@@ -329,6 +364,8 @@ pub struct FlowPaintApp {
     fluid_name: &'static str,
     fluid_nu: f32,
     fluid_rho: f32,
+    /// Physical sound speed [m/s] of the current fluid.
+    fluid_a: f32,
     fluid_preset_idx: Option<usize>,
     phys_cache: PhysScale,
     // Generator dialogs.
@@ -353,6 +390,7 @@ pub struct FlowPaintApp {
     stats_margin: usize,
     stats_mlups: f32,
     stats_re: u32,
+    stats_euler: bool,
     stats_steps_per_s: f32,
     stats_sim_steps: f64,
     sim_time_s: f64,
@@ -397,6 +435,7 @@ impl FlowPaintApp {
             fluid_name: "air",
             fluid_nu: 1.5e-5,
             fluid_rho: 1.2,
+            fluid_a: 343.0,
             fluid_preset_idx: Some(2),
             phys_cache: PhysScale::default(),
             show_airfoil_gen: false,
@@ -420,16 +459,25 @@ impl FlowPaintApp {
             stats_margin: 0,
             stats_mlups: 0.0,
             stats_re: 0,
+            stats_euler: false,
             stats_steps_per_s: 0.0,
             stats_sim_steps: 0.0,
             sim_time_s: 0.0,
         }
     }
 
-    fn phys_scale(&self, visc_lattice: f32) -> PhysScale {
+    fn phys_scale(&self, snap: &UiSnapshot) -> PhysScale {
         let vis_w = self.stats_grid.0.max(1);
         let dx = self.domain_width_m / vis_w as f32;
-        let dt = visc_lattice.max(1e-5) * dx * dx / self.fluid_nu.max(1e-12);
+        let dt = match snap.solver {
+            // LBM: the lattice viscosity fixes the time step.
+            SolverMode::Lbm => {
+                snap.visc.max(1e-5) * dx * dx / self.fluid_nu.max(1e-12)
+            }
+            // Euler: the (nondimensional) sound speed fixes it instead —
+            // one nondim time unit is dx / a_phys seconds.
+            SolverMode::Euler => snap.euler_dt * dx / self.fluid_a.max(1.0),
+        };
         PhysScale { dx, dt }
     }
 
@@ -520,6 +568,9 @@ impl eframe::App for FlowPaintApp {
                 tunnel: sim.settings.wind_tunnel,
                 tints: sim.settings.boundary_tints,
                 mode: sim.settings.render_mode,
+                solver: sim.settings.solver,
+                mach: sim.settings.mach,
+                euler_dt: sim.euler_dt(),
                 display_gain: sim.settings.display_gain,
                 smoke_gain: sim.settings.smoke_gain,
                 particle_size: sim.settings.particle_size,
@@ -527,7 +578,8 @@ impl eframe::App for FlowPaintApp {
                 sponge_strength: sim.settings.sponge_strength,
             }
         };
-        self.phys_cache = self.phys_scale(snapshot.visc);
+        self.phys_cache = self.phys_scale(&snapshot);
+        self.stats_euler = snapshot.solver == SolverMode::Euler;
 
         self.keyboard(ctx, &mut cmds);
         self.menu_bar(ctx, snapshot, &mut cmds);
@@ -574,6 +626,15 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
     match cmd {
         Cmd::TogglePause => sim.settings.paused = !sim.settings.paused,
         Cmd::ResetFlow => sim.reset_flow(),
+        Cmd::SetSolver(m) => {
+            if sim.settings.solver != m {
+                sim.settings.solver = m;
+                // The two solvers keep separate state; start the new one
+                // from the freestream.
+                sim.reset_flow();
+            }
+        }
+        Cmd::SetMach(v) => sim.settings.mach = v,
         Cmd::SetWindTunnel(on) => {
             sim.set_wind_tunnel(on);
             app.model.mark_all_dirty();
@@ -804,6 +865,11 @@ impl FlowPaintApp {
         if matches!(self.gesture, Gesture::None) {
             let mut switch = None;
             ctx.input(|i| {
+                // Bare keys only: Ctrl/Cmd/Alt shortcuts (Ctrl+S, Ctrl+D…)
+                // must not also switch tools.
+                if i.modifiers.command || i.modifiers.alt {
+                    return;
+                }
                 for (tool, _, key) in Tool::ALL {
                     let k = match key {
                         "S" => egui::Key::S,
@@ -913,9 +979,53 @@ impl FlowPaintApp {
                     self.selected = Some(id);
                 }
             }
-            Gesture::DrawShape { id, .. } | Gesture::DrawPencil { id } => {
-                self.model.finalize_last_add(id);
-                self.selected = Some(id);
+            Gesture::DrawShape { id, .. } => {
+                // A click without a drag: don't leave a speck behind.
+                let degenerate = self
+                    .model
+                    .find(id)
+                    .map(|i| match &self.model.objects[i].shape {
+                        Shape::Line { a, b } => Self::dist(*a, *b) < 1.5,
+                        Shape::Rect { half, .. } | Shape::Ellipse { r: half, .. } => {
+                            half[0] < 1.0 && half[1] < 1.0
+                        }
+                        _ => false,
+                    })
+                    .unwrap_or(true);
+                if degenerate {
+                    self.model.cancel_last_add(id);
+                    if self.selected == Some(id) {
+                        self.selected = None;
+                    }
+                } else {
+                    self.model.finalize_last_add(id);
+                    self.selected = Some(id);
+                }
+            }
+            Gesture::DrawPencil { id } => {
+                // Simplify the freehand stroke into a clean polyline.
+                self.mutate_live(id, |o| {
+                    if let Shape::Poly { pts, .. } = &mut o.shape {
+                        *pts = Self::simplify_stroke(pts, 1.2);
+                    }
+                });
+                let degenerate = self
+                    .model
+                    .find(id)
+                    .map(|i| match &self.model.objects[i].shape {
+                        Shape::Poly { pts, .. } => pts.len() < 2,
+                        _ => false,
+                    })
+                    .unwrap_or(true);
+                if degenerate {
+                    self.model.cancel_last_add(id);
+                    if self.selected == Some(id) {
+                        self.selected = None;
+                    }
+                } else {
+                    self.model.finalize_last_add(id);
+                    self.selected = Some(id);
+                }
             }
             Gesture::MoveObj { id, before, .. }
             | Gesture::HandleDrag { id, before, .. } => {
@@ -1030,8 +1140,11 @@ impl FlowPaintApp {
     }
 
     fn save_scene(&mut self, path: &std::path::Path, snap: UiSnapshot) {
-        let scene = SceneV3 {
-            version: SCENE_V3,
+        // Commit any in-flight gesture so the file doesn't capture a
+        // polyline's cursor-tracking rubber vertex.
+        self.finish_gesture();
+        let scene = SceneV4 {
+            version: SCENE_V4,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -1041,6 +1154,12 @@ impl FlowPaintApp {
             fluid_nu: self.fluid_nu,
             fluid_rho: self.fluid_rho,
             ref_width: self.stats_grid.0 as u32,
+            solver: match snap.solver {
+                SolverMode::Lbm => 0,
+                SolverMode::Euler => 1,
+            },
+            mach: snap.mach,
+            fluid_a: self.fluid_a,
         };
         match bincode::serialize(&scene) {
             Ok(bytes) => {
@@ -1061,19 +1180,47 @@ impl FlowPaintApp {
                 return;
             }
         };
-        if bytes.len() < 4
-            || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != SCENE_V3
-        {
+        let version = if bytes.len() >= 4 {
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            0
+        };
+        if version != SCENE_V3 && version != SCENE_V4 {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
             return;
         }
-        match bincode::deserialize::<SceneV3>(&bytes) {
+        // A v3 file is a v4 file without the solver fields.
+        let decoded = if version == SCENE_V4 {
+            bincode::deserialize::<SceneV4>(&bytes)
+        } else {
+            bincode::deserialize::<SceneV3>(&bytes).map(|s| SceneV4 {
+                version: s.version,
+                objects: s.objects,
+                wind_tunnel: s.wind_tunnel,
+                flow_speed: s.flow_speed,
+                viscosity: s.viscosity,
+                steps_per_frame: s.steps_per_frame,
+                domain_width_m: s.domain_width_m,
+                fluid_nu: s.fluid_nu,
+                fluid_rho: s.fluid_rho,
+                ref_width: s.ref_width,
+                solver: 0,
+                mach: 1.6,
+                fluid_a: 343.0,
+            })
+        };
+        match decoded {
             Ok(scene) => {
                 self.finish_gesture();
                 self.selected = None;
                 let mut objects = scene.objects;
+                // Drop payloads a corrupt or crafted file could smuggle in
+                // that the rasterizer / bounds math can't survive.
+                let before_n = objects.len();
+                objects.retain(object_is_sane);
+                let dropped = before_n - objects.len();
                 // Rescale into the current grid width.
                 let cur_w = self.stats_grid.0 as f32;
                 let f = cur_w / (scene.ref_width.max(1) as f32);
@@ -1083,19 +1230,43 @@ impl FlowPaintApp {
                     }
                 }
                 self.model.replace_all(objects);
-                self.domain_width_m = scene.domain_width_m.max(0.01);
-                self.fluid_nu = scene.fluid_nu.max(1e-9);
-                self.fluid_rho = scene.fluid_rho.max(1e-3);
+                self.domain_width_m = sane_f32(scene.domain_width_m, 0.01, 10_000.0, 1.0);
+                self.fluid_nu = sane_f32(scene.fluid_nu, 1e-9, 1.0, 1.5e-5);
+                self.fluid_rho = sane_f32(scene.fluid_rho, 1e-3, 1e5, 1.2);
+                self.fluid_a = sane_f32(scene.fluid_a, 1.0, 10_000.0, 343.0);
                 self.fluid_preset_idx = None;
                 self.fluid_name = "custom (loaded)";
                 if scene.flow_speed > 0.0 {
-                    cmds.push(Cmd::SetFlowSpeed(scene.flow_speed));
-                    cmds.push(Cmd::SetViscosity(scene.viscosity));
-                    cmds.push(Cmd::SetSteps(scene.steps_per_frame.max(1)));
+                    cmds.push(Cmd::SetFlowSpeed(sane_f32(
+                        scene.flow_speed,
+                        0.01,
+                        0.2,
+                        0.09,
+                    )));
+                    cmds.push(Cmd::SetViscosity(sane_f32(
+                        scene.viscosity,
+                        0.004,
+                        0.2,
+                        0.015,
+                    )));
+                    cmds.push(Cmd::SetSteps(scene.steps_per_frame.clamp(1, 64)));
                 }
+                cmds.push(Cmd::SetSolver(if scene.solver == 1 {
+                    SolverMode::Euler
+                } else {
+                    SolverMode::Lbm
+                }));
+                cmds.push(Cmd::SetMach(sane_f32(scene.mach, 0.3, 3.0, 1.6)));
                 cmds.push(Cmd::SetWindTunnel(scene.wind_tunnel));
                 cmds.push(Cmd::ResetFlow);
-                self.status = format!("Loaded {}", path.display());
+                self.status = if dropped > 0 {
+                    format!(
+                        "Loaded {} ({dropped} invalid object(s) dropped)",
+                        path.display()
+                    )
+                } else {
+                    format!("Loaded {}", path.display())
+                };
             }
             Err(e) => self.status = format!("Load failed: {e}"),
         }
@@ -1290,6 +1461,31 @@ impl FlowPaintApp {
         ui.add_space(6.0);
         ui.separator();
         ui.heading("Physics");
+        ui.horizontal_wrapped(|ui| {
+            for (m, label, tip) in [
+                (
+                    SolverMode::Lbm,
+                    "Incompressible",
+                    "Lattice-Boltzmann: viscous, low Mach — smoke, wakes, \
+                     vortex streets",
+                ),
+                (
+                    SolverMode::Euler,
+                    "Compressible",
+                    "Finite-volume Euler: real gas dynamics — shocks, \
+                     expansion fans, choked nozzles (inviscid)",
+                ),
+            ] {
+                if ui
+                    .selectable_label(snap.solver == m, label)
+                    .on_hover_text(tip)
+                    .clicked()
+                    && snap.solver != m
+                {
+                    cmds.push(Cmd::SetSolver(m));
+                }
+            }
+        });
         let combo_label = match self.fluid_preset_idx {
             Some(i) => FLUID_PRESETS[i].name,
             None => "Custom",
@@ -1308,6 +1504,7 @@ impl FlowPaintApp {
                         self.fluid_name = p.name;
                         self.fluid_nu = p.nu;
                         self.fluid_rho = p.rho;
+                        self.fluid_a = p.a;
                         if p.tunnel != snap.tunnel {
                             cmds.push(Cmd::SetWindTunnel(p.tunnel));
                         }
@@ -1326,24 +1523,47 @@ impl FlowPaintApp {
         let mut steps = snap.steps;
         let mut fade = snap.fade;
         let mut tunnel = snap.tunnel;
-        let flow_label = format!("flow speed ({})", fmt_speed(ps.u_phys(flow)));
-        if ui
-            .add(egui::Slider::new(&mut flow, 0.02..=0.14).text(flow_label))
-            .changed()
-        {
-            self.fluid_preset_idx = None;
-            cmds.push(Cmd::SetFlowSpeed(flow));
-        }
-        if ui
-            .add(
-                egui::Slider::new(&mut visc, 0.005..=0.08)
-                    .logarithmic(true)
-                    .text(format!("viscosity (Δt {})", fmt_time(ps.dt))),
-            )
-            .changed()
-        {
-            self.fluid_preset_idx = None;
-            cmds.push(Cmd::SetViscosity(visc));
+        if snap.solver == SolverMode::Euler {
+            let mut mach = snap.mach;
+            let mach_label = format!(
+                "inlet Mach ({})",
+                fmt_speed(mach * self.fluid_a)
+            );
+            if ui
+                .add(egui::Slider::new(&mut mach, 0.3..=3.0).text(mach_label))
+                .changed()
+            {
+                cmds.push(Cmd::SetMach(mach));
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "inviscid gas dynamics (γ = 1.4, a∞ = {}) — shocks and \
+                     expansion fans are real; boundary layers are not",
+                    fmt_speed(self.fluid_a)
+                ))
+                .small()
+                .weak(),
+            );
+        } else {
+            let flow_label = format!("flow speed ({})", fmt_speed(ps.u_phys(flow)));
+            if ui
+                .add(egui::Slider::new(&mut flow, 0.02..=0.14).text(flow_label))
+                .changed()
+            {
+                self.fluid_preset_idx = None;
+                cmds.push(Cmd::SetFlowSpeed(flow));
+            }
+            if ui
+                .add(
+                    egui::Slider::new(&mut visc, 0.005..=0.08)
+                        .logarithmic(true)
+                        .text(format!("viscosity (Δt {})", fmt_time(ps.dt))),
+                )
+                .changed()
+            {
+                self.fluid_preset_idx = None;
+                cmds.push(Cmd::SetViscosity(visc));
+            }
         }
         if ui
             .add(egui::Slider::new(&mut steps, 1..=32).text("steps / frame"))
@@ -1666,8 +1886,24 @@ impl FlowPaintApp {
                         ui.monospace(v);
                         ui.end_row();
                     };
+                    let euler = snap.solver == SolverMode::Euler;
+                    let u_inf = if euler {
+                        snap.mach * self.fluid_a
+                    } else {
+                        ps.u_phys(snap.flow)
+                    };
+                    row(
+                        "Solver",
+                        if euler { "Euler (compressible)" } else { "LBM (incompressible)" }
+                            .to_string(),
+                    );
                     row("Fluid", self.fluid_name.to_string());
-                    row("ν", format!("{:.2e} m²/s", self.fluid_nu));
+                    if euler {
+                        row("a∞", fmt_speed(self.fluid_a));
+                        row("Mach M∞", format!("{:.2}", snap.mach));
+                    } else {
+                        row("ν", format!("{:.2e} m²/s", self.fluid_nu));
+                    }
                     row("ρ", format!("{:.0} kg/m³", self.fluid_rho));
                     row(
                         "Domain",
@@ -1679,17 +1915,19 @@ impl FlowPaintApp {
                     );
                     row("Cell Δx", fmt_len(ps.dx));
                     row("Step Δt", fmt_time(ps.dt));
-                    row("Inlet U∞", fmt_speed(ps.u_phys(snap.flow)));
+                    row("Inlet U∞", fmt_speed(u_inf));
                     row(
                         "Ref. length",
                         fmt_len(ps.len_m(0.16 * vh as f32)),
                     );
-                    row("Reynolds", format!("{}", self.stats_re));
+                    if euler {
+                        row("Reynolds", "∞ (inviscid)".to_string());
+                    } else {
+                        row("Reynolds", format!("{}", self.stats_re));
+                    }
                     row(
                         "Dyn. press.",
-                        fmt_pressure(
-                            0.5 * self.fluid_rho * ps.u_phys(snap.flow).powi(2),
-                        ),
+                        fmt_pressure(0.5 * self.fluid_rho * u_inf * u_inf),
                     );
                     row(
                         "Sim rate",
@@ -1716,7 +1954,14 @@ impl FlowPaintApp {
                 }
                 RenderMode::Speed => {
                     ui.label("Speed |u|");
-                    let u_sat = ps.u_phys(snap.flow * 1.6 / gain);
+                    // Inverts the shader normalization |vel| / (inlet * 1.6)
+                    // — both solvers write `vel` in units where the inlet
+                    // reference is their respective inflow speed.
+                    let u_sat = if snap.solver == SolverMode::Euler {
+                        snap.mach * self.fluid_a * 1.6 / gain
+                    } else {
+                        ps.u_phys(snap.flow * 1.6 / gain)
+                    };
                     Self::colormap_bar(ui, |t| inferno_color(t));
                     ui.horizontal(|ui| {
                         ui.small("0");
@@ -1728,7 +1973,12 @@ impl FlowPaintApp {
                 }
                 RenderMode::Vorticity => {
                     ui.label("Vorticity ω (curl)");
-                    let w_sat = snap.flow.max(0.02) / (4.0 * gain) / ps.dt;
+                    let inlet_render = if snap.solver == SolverMode::Euler {
+                        snap.mach * snap.euler_dt
+                    } else {
+                        snap.flow
+                    };
+                    let w_sat = inlet_render.max(0.02) / (4.0 * gain) / ps.dt;
                     Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
                     ui.horizontal(|ui| {
                         ui.small(format!("-{:.1} 1/s", w_sat));
@@ -1741,7 +1991,16 @@ impl FlowPaintApp {
                 }
                 RenderMode::Pressure => {
                     ui.label("Pressure Δp (gauge)");
-                    let p_sat = ps.pressure_pa(1.0 / (25.0 * gain), self.fluid_rho);
+                    // Euler mode writes 1 + 0.1 * (p - p∞) into the density
+                    // buffer (p nondimensionalized by ρ∞ a∞²).
+                    let p_sat = if snap.solver == SolverMode::Euler {
+                        (1.0 / (25.0 * gain)) / 0.1
+                            * self.fluid_rho
+                            * self.fluid_a
+                            * self.fluid_a
+                    } else {
+                        ps.pressure_pa(1.0 / (25.0 * gain), self.fluid_rho)
+                    };
                     Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
                     ui.horizontal(|ui| {
                         ui.small(format!("-{}", fmt_pressure(p_sat)));
@@ -1787,8 +2046,13 @@ impl FlowPaintApp {
                 }
                 ui.label(&self.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let re = if self.stats_euler {
+                        "Re ∞ (inviscid)".to_string()
+                    } else {
+                        format!("Re ≈ {}", self.stats_re)
+                    };
                     ui.label(format!(
-                        "{} objects   |   canvas {} x {} (sim {} x {}, +{} margin)   |   {:.0} MLUPS   |   Re ≈ {}",
+                        "{} objects   |   canvas {} x {} (sim {} x {}, +{} margin)   |   {:.0} MLUPS   |   {}",
                         self.model.objects.len(),
                         self.stats_grid.0,
                         self.stats_grid.1,
@@ -1796,7 +2060,7 @@ impl FlowPaintApp {
                         self.stats_full.1,
                         self.stats_margin,
                         self.stats_mlups,
-                        self.stats_re
+                        re
                     ));
                 });
             });
@@ -2068,73 +2332,22 @@ impl FlowPaintApp {
 
         // --- Releases -------------------------------------------------
 
-        if response.drag_stopped_by(egui::PointerButton::Primary) {
-            enum Fin {
-                Edit,
-                Shape(u64),
-                Pencil(u64),
-                Nothing,
-            }
-            let fin = match &self.gesture {
-                Gesture::MoveObj { .. } | Gesture::HandleDrag { .. } => Fin::Edit,
-                Gesture::DrawShape { id, .. } => Fin::Shape(*id),
-                Gesture::DrawPencil { id } => Fin::Pencil(*id),
-                // A polyline persists across clicks.
-                _ => Fin::Nothing,
-            };
-            match fin {
-                Fin::Edit => self.finish_gesture(),
-                Fin::Shape(id) => {
-                    let degenerate = self
-                        .model
-                        .find(id)
-                        .map(|i| match &self.model.objects[i].shape {
-                            Shape::Line { a, b } => Self::dist(*a, *b) < 1.5,
-                            Shape::Rect { half, .. }
-                            | Shape::Ellipse { r: half, .. } => {
-                                half[0] < 1.0 && half[1] < 1.0
-                            }
-                            _ => false,
-                        })
-                        .unwrap_or(true);
-                    if degenerate {
-                        // A click without a drag: don't leave a speck.
-                        self.gesture = Gesture::None;
-                        self.model.cancel_last_add(id);
-                        if self.selected == Some(id) {
-                            self.selected = None;
-                        }
-                    } else {
-                        self.finish_gesture();
-                    }
-                }
-                Fin::Pencil(id) => {
-                    self.gesture = Gesture::None;
-                    self.mutate_live(id, |o| {
-                        if let Shape::Poly { pts, .. } = &mut o.shape {
-                            *pts = Self::simplify_stroke(pts, 1.2);
-                        }
-                    });
-                    let degenerate = self
-                        .model
-                        .find(id)
-                        .map(|i| match &self.model.objects[i].shape {
-                            Shape::Poly { pts, .. } => pts.len() < 2,
-                            _ => false,
-                        })
-                        .unwrap_or(true);
-                    if degenerate {
-                        self.model.cancel_last_add(id);
-                        if self.selected == Some(id) {
-                            self.selected = None;
-                        }
-                    } else {
-                        self.model.finalize_last_add(id);
-                        self.selected = Some(id);
-                    }
-                }
-                Fin::Nothing => {}
-            }
+        // Drag-driven gestures end when the primary button is up — not
+        // only on drag_stopped_by(Primary), which egui can skip when its
+        // drag latch dies mid-gesture (e.g. releasing the right button
+        // during a left-drag). finish_gesture handles degenerate cancels
+        // and pencil simplification. A polyline persists across clicks.
+        let primary_down = response.ctx.input(|i| i.pointer.primary_down());
+        if !primary_down
+            && matches!(
+                &self.gesture,
+                Gesture::MoveObj { .. }
+                    | Gesture::HandleDrag { .. }
+                    | Gesture::DrawShape { .. }
+                    | Gesture::DrawPencil { .. }
+            )
+        {
+            self.finish_gesture();
         }
     }
 
@@ -2500,12 +2713,10 @@ impl FlowPaintApp {
                                 p.contour = contour;
                                 p.div_ratio =
                                     (1.5 * (p.exit_ratio - 1.0)).clamp(2.0, 16.0);
-                                // Scale the chamber fan so the throat jet
-                                // approximates the engine's exhaust as
-                                // closely as the solver's speed cap allows.
-                                p.fan_mult = (0.27
-                                    / (snap.flow * p.chamber_ratio).max(1e-4))
-                                .clamp(0.2, 2.0);
+                                // Scale the chamber fan for the active
+                                // solver (see nozzle_auto_fan_mult).
+                                p.fan_mult =
+                                    nozzle_auto_fan_mult(&snap, p.chamber_ratio);
                                 self.nozzle_fan_auto = true;
                                 self.nozzle_real_ve = Some(ve);
                             }
@@ -2538,6 +2749,12 @@ impl FlowPaintApp {
                     ui.radio_value(&mut p.contour, gen::NozzleContour::Conical, "Conical (15°-style)");
                 });
                 ui.checkbox(&mut p.chamber_fan, "Fan in the chamber (self-powered)");
+                // Track the preset formula live (it depends on the current
+                // flow speed / Mach) until the user overrides the slider —
+                // what the dialog shows is exactly what Insert stamps.
+                if self.nozzle_fan_auto {
+                    p.fan_mult = nozzle_auto_fan_mult(&snap, p.chamber_ratio);
+                }
                 if ui
                     .add(
                         egui::Slider::new(&mut p.fan_mult, 0.2..=2.0)
@@ -2548,11 +2765,22 @@ impl FlowPaintApp {
                     self.nozzle_fan_auto = false;
                 }
                 // Expected jet speeds in real units, next to the engine's
-                // actual exhaust velocity. The solver clamps lattice speed
-                // at 0.3, so the readout is capped the same way.
-                let throat_lattice = snap.flow * p.fan_mult * p.chamber_ratio;
-                let capped = throat_lattice > 0.3;
-                let throat_sim = self.phys_cache.u_phys(throat_lattice.min(0.3));
+                // actual exhaust velocity.
+                let euler_mode = snap.solver == SolverMode::Euler;
+                let (throat_sim, capped) = if euler_mode {
+                    // Continuity estimate of the throat speed from the
+                    // chamber feed; the bell accelerates further on its own.
+                    let m_throat = snap.mach * p.fan_mult * p.chamber_ratio;
+                    (m_throat * self.fluid_a, false)
+                } else {
+                    // The LBM solver clamps lattice speed at 0.3, so the
+                    // readout is capped the same way.
+                    let throat_lattice = snap.flow * p.fan_mult * p.chamber_ratio;
+                    (
+                        self.phys_cache.u_phys(throat_lattice.min(0.3)),
+                        throat_lattice > 0.3,
+                    )
+                };
                 ui.label(format!(
                     "sim throat jet ≈ {}{}",
                     fmt_speed(throat_sim),
@@ -2560,34 +2788,35 @@ impl FlowPaintApp {
                 ));
                 if let Some(ve) = self.nozzle_real_ve {
                     let factor = ve / throat_sim.max(1e-6);
-                    ui.label(
-                        egui::RichText::new(format!(
+                    let note = if euler_mode {
+                        format!(
+                            "real engine exhaust ≈ {:.0} m/s — in compressible \
+                             mode the bell itself accelerates the jet through \
+                             the sonic throat; expect a supersonic plume",
+                            ve
+                        )
+                    } else {
+                        format!(
                             "real engine exhaust ≈ {:.0} m/s (~{:.0}× faster — the \
                              incompressible solver caps jet speed, so this is a \
                              scaled approximation)",
                             ve, factor
-                        ))
-                        .small()
-                        .weak(),
-                    );
+                        )
+                    };
+                    ui.label(egui::RichText::new(note).small().weak());
                 }
                 ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Note: this solver is incompressible (low Mach), so you get \
-                         the shape and a jet, not real choked-nozzle gas dynamics.",
-                    )
-                    .small()
-                    .weak(),
-                );
+                let solver_note = if euler_mode {
+                    "Compressible Euler mode: choked flow, expansion fans and \
+                     shocks are real gas dynamics (inviscid)."
+                } else {
+                    "Note: this solver is incompressible (low Mach), so you get \
+                     the shape and a jet, not real choked-nozzle gas dynamics. \
+                     Switch Physics → Compressible for the real thing."
+                };
+                ui.label(egui::RichText::new(solver_note).small().weak());
                 ui.add_space(6.0);
                 if ui.button("Insert into scene").clicked() {
-                    // Track the preset formula unless the user overrode
-                    // the slider — what the dialog shows is what inserts.
-                    if self.nozzle_fan_auto {
-                        p.fan_mult = (0.27 / (snap.flow * p.chamber_ratio).max(1e-4))
-                            .clamp(0.2, 2.0);
-                    }
                     let stamp = gen::generate_nozzle(p);
                     self.insert_stamp_object(stamp);
                 }
@@ -2608,6 +2837,12 @@ impl FlowPaintApp {
                     "FlowPaint V2 solves the 2D Navier-Stokes equations in real \
                      time with a D2Q9 lattice-Boltzmann method in GPU compute \
                      shaders (wgpu: Vulkan / DX12 / Metal).",
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    "The Compressible solver mode switches to a finite-volume \
+                     Euler method (MUSCL reconstruction + HLLC fluxes): real \
+                     shocks, expansion fans and choked nozzles, inviscid.",
                 );
                 ui.add_space(6.0);
                 ui.label(
@@ -2644,6 +2879,69 @@ impl FlowPaintApp {
                     }
                 });
             });
+    }
+}
+
+/// Clamp a file-borne float, replacing NaN/inf (which pass through
+/// `clamp` unchanged) with a default.
+fn sane_f32(v: f32, lo: f32, hi: f32, default: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(lo, hi)
+    } else {
+        default
+    }
+}
+
+/// Structural validation for objects decoded from a scene file: finite
+/// coordinates everywhere, and stamp rasters whose layer lengths match
+/// their rect (the rasterizer indexes them unchecked).
+fn object_is_sane(o: &SketchObject) -> bool {
+    let finite2 = |p: &[f32; 2]| p[0].is_finite() && p[1].is_finite();
+    if !o.thickness.is_finite() || !(0.0..=1000.0).contains(&o.thickness) {
+        return false;
+    }
+    if !(o.fan_mult.is_finite() && o.fan_gust.is_finite() && o.fan_angle.is_finite()) {
+        return false;
+    }
+    match &o.shape {
+        Shape::Line { a, b } => finite2(a) && finite2(b),
+        Shape::Poly { pts, .. } => {
+            !pts.is_empty() && pts.len() <= 100_000 && pts.iter().all(finite2)
+        }
+        Shape::Rect { c, half, angle } | Shape::Ellipse { c, r: half, angle } => {
+            finite2(c) && finite2(half) && angle.is_finite()
+        }
+        Shape::Stamp { raster, c, scale, angle } => {
+            let (x0, y0, x1, y1) = raster.rect;
+            let w = x1.saturating_sub(x0);
+            let h = y1.saturating_sub(y0);
+            if !(1..=8192).contains(&w) || !(1..=8192).contains(&h) {
+                return false;
+            }
+            let n = w as usize * h as usize;
+            n <= 32_000_000
+                && raster.cell.len() == n
+                && raster.fan.len() == n
+                && raster.dye_src.len() == n
+                && finite2(c)
+                && scale.is_finite()
+                && (1e-3..=1e3).contains(scale)
+                && angle.is_finite()
+        }
+    }
+}
+
+/// Auto chamber-fan multiplier for the nozzle generator, per solver.
+fn nozzle_auto_fan_mult(snap: &UiSnapshot, chamber_ratio: f32) -> f32 {
+    match snap.solver {
+        // Scale so the throat jet approximates the engine's exhaust as
+        // closely as the LBM speed cap (0.3 lattice) allows.
+        SolverMode::Lbm => {
+            (0.27 / (snap.flow * chamber_ratio).max(1e-4)).clamp(0.2, 2.0)
+        }
+        // Compressible: feed the chamber at ~Mach 0.3 like a real engine —
+        // the converging-diverging geometry does the accelerating.
+        SolverMode::Euler => (0.3 / snap.mach.max(0.1)).clamp(0.2, 2.0),
     }
 }
 

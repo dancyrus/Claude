@@ -32,7 +32,7 @@ impl ObjMaterial {
 }
 
 /// Shape geometry, in visible-canvas cells.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum Shape {
     /// Straight segment.
     Line { a: [f32; 2], b: [f32; 2] },
@@ -47,7 +47,7 @@ pub enum Shape {
 }
 
 /// One sketch object: shape + physical properties.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SketchObject {
     pub id: u64,
     pub shape: Shape,
@@ -77,6 +77,11 @@ impl SketchObject {
                 [a[0].max(b[0]), a[1].max(b[1])],
             ),
             Shape::Poly { pts, .. } => {
+                // A zero-point poly (corrupt file) must yield an empty
+                // rect, not a fold over f32::MAX that overflows the casts.
+                if pts.is_empty() {
+                    return GridRect { x0: 0, y0: 0, x1: 0, y1: 0 };
+                }
                 let mut min = [f32::MAX, f32::MAX];
                 let mut max = [f32::MIN, f32::MIN];
                 for p in pts {
@@ -85,11 +90,7 @@ impl SketchObject {
                     max[0] = max[0].max(p[0]);
                     max[1] = max[1].max(p[1]);
                 }
-                if pts.is_empty() {
-                    (min, min)
-                } else {
-                    (min, max)
-                }
+                (min, max)
             }
             Shape::Rect { c, half, angle } | Shape::Ellipse { c, r: half, angle } => {
                 let (s, co) = angle.sin_cos();
@@ -394,7 +395,15 @@ fn to_local(p: [f32; 2], c: [f32; 2], angle: f32) -> [f32; 2] {
 pub enum ModelOp {
     Add(SketchObject),
     Remove(usize, SketchObject),
-    Modify(usize, SketchObject, SketchObject), // index, before, after
+    Modify {
+        i: usize,
+        before: SketchObject,
+        after: SketchObject,
+        /// Panel-widget edits merge into an open coalescable op; gesture
+        /// records never coalesce, so a drag and the slider tweaks around
+        /// it stay separate undo steps.
+        coalesce: bool,
+    },
     Replace(Vec<SketchObject>, Vec<SketchObject>), // whole-list ops (clear, presets)
 }
 
@@ -469,31 +478,42 @@ impl SketchModel {
     }
 
     /// Record a finished modification (before captured at gesture start).
+    /// A no-op edit (click-select without moving) records nothing, so it
+    /// neither pollutes the undo stack nor wipes the redo stack.
     pub fn record_modify(&mut self, id: u64, before: SketchObject) {
         if let Some(i) = self.find(id) {
+            if self.objects[i] == before {
+                return;
+            }
             let after = self.objects[i].clone();
             self.mark_dirty(before.bounds().union(after.bounds()));
-            self.undo.push(ModelOp::Modify(i, before, after));
+            self.undo.push(ModelOp::Modify { i, before, after, coalesce: false });
             self.redo.clear();
         }
     }
 
-    /// Like `record_modify`, but consecutive edits to the same object
-    /// merge into one undo step (panel sliders emit an edit per frame).
+    /// Like `record_modify`, but consecutive PANEL edits to the same
+    /// object merge into one undo step (sliders emit an edit per frame).
     /// The merged op keeps the original `before`, so one undo reverts the
-    /// whole slider session.
+    /// whole slider session; gesture records (coalesce: false) are never
+    /// merged into.
     pub fn record_modify_coalesced(&mut self, id: u64, before: SketchObject) {
         let Some(i) = self.find(id) else { return };
+        if self.objects[i] == before {
+            return;
+        }
         let after = self.objects[i].clone();
         self.mark_dirty(before.bounds().union(after.bounds()));
         self.redo.clear();
-        if let Some(ModelOp::Modify(j, _, top_after)) = self.undo.last_mut() {
+        if let Some(ModelOp::Modify { i: j, after: top_after, coalesce: true, .. }) =
+            self.undo.last_mut()
+        {
             if *j == i && top_after.id == id {
                 *top_after = after;
                 return;
             }
         }
-        self.undo.push(ModelOp::Modify(i, before, after));
+        self.undo.push(ModelOp::Modify { i, before, after, coalesce: true });
     }
 
     /// Remove an object added by the in-flight gesture along with its
@@ -522,8 +542,14 @@ impl SketchModel {
         }
     }
 
-    /// Replace the whole list (clear / presets), undoably.
+    /// Replace the whole list (clear / presets / scene loads), undoably.
     pub fn replace_all(&mut self, new: Vec<SketchObject>) {
+        // Scene loads carry ids minted by ANOTHER session's counter;
+        // advance ours past them or fresh_id() would mint duplicates
+        // (and every id-keyed op would then resolve to the wrong object).
+        self.next_id = self
+            .next_id
+            .max(new.iter().map(|o| o.id).max().unwrap_or(0));
         let old = std::mem::replace(&mut self.objects, new);
         self.undo
             .push(ModelOp::Replace(old, self.objects.clone()));
@@ -551,7 +577,7 @@ impl SketchModel {
                     self.mark_dirty(o.bounds());
                     self.objects.insert((*i).min(self.objects.len()), o.clone());
                 }
-                ModelOp::Modify(i, before, after) => {
+                ModelOp::Modify { i, before, after, .. } => {
                     if let Some(slot) = self.objects.get_mut(*i) {
                         *slot = before.clone();
                     }
@@ -581,7 +607,7 @@ impl SketchModel {
                         self.objects.pop();
                     }
                 }
-                ModelOp::Modify(i, before, after) => {
+                ModelOp::Modify { i, before, after, .. } => {
                     if let Some(slot) = self.objects.get_mut(*i) {
                         *slot = after.clone();
                     }

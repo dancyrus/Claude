@@ -62,12 +62,30 @@ it re-rasterizes crisply.
   outlet). Defaults for new objects sit in the side panel; selected
   objects edit their own copies.
 
+## Two solvers
+
+**Incompressible (LBM)** — the default: a D2Q9 lattice-Boltzmann
+method. Viscous, low Mach; smoke, wakes, vortex streets, Reynolds
+number control.
+
+**Compressible (Euler)** — one click in the Physics panel switches to a
+finite-volume compressible Euler solver (MUSCL reconstruction with a
+minmod limiter + HLLC fluxes, SSP-RK2 time stepping): **real gas
+dynamics**. Set the inlet Mach number (0.3–3) and you get bow shocks
+ahead of blunt bodies, expansion fans, shock diamonds — and rocket
+nozzles that genuinely choke at the throat and accelerate supersonic
+through the bell, instead of a scaled jet. It's inviscid (no boundary
+layers), runs on the same grid, same objects, same views; walls are
+slip walls, and the same off-screen margin + sponge absorb outgoing
+waves. The legend switches to compressible-flow numbers (sound speed,
+Mach, gauge pressure in Pa).
+
 **Fluid presets** (Physics panel): one click sets the regime — Still
 air, Gentle breeze, Wind tunnel (air), Storm (high Re), Water flume,
 Glycerin/syrup (creeping flow), and a stylized Supersonic tunnel
-(maximum speed and Reynolds number — the solver is incompressible, so
-no shocks). Each preset carries the fluid's real kinematic viscosity
-and density.
+(maximum speed and Reynolds number within the incompressible solver).
+Each preset carries the fluid's real kinematic viscosity, density and
+sound speed.
 
 **Real units everywhere**: the canvas maps to a physical domain
 (settable width, default 1 m), which anchors every readout — cell size,
@@ -157,6 +175,7 @@ cargo run --release
 | File | Role |
 | --- | --- |
 | `src/shaders/lbm.wgsl` | D2Q9 lattice-Boltzmann: BGK collision + pull streaming in one kernel; half-way bounce-back walls, equilibrium inlets, pressure outlets, divergence guard; freestream reset kernel. |
+| `src/shaders/euler.wgsl` | Compressible Euler: MUSCL (minmod, primitive variables) + HLLC finite-volume fluxes, SSP-RK2, slip-wall mirror ghosts, gusty inlets, absorbing sponge, positivity floors with freestream self-healing. |
 | `src/shaders/dye.wgsl` | Semi-Lagrangian advection of colored dye with wall-aware backtracing. |
 | `src/shaders/particles.wgsl` | Tracer particle advection with hash-based respawning. |
 | `src/shaders/render.wgsl` | Letterboxed field visualisation (colormaps, wall rims, boundary tints) and the additive particle overlay. |
@@ -166,10 +185,14 @@ cargo run --release
 | `src/app.rs` | The egui shell: gesture-based sketch tools, object/defaults panels, legend, menus, scene files. |
 | `src/generators.rs` | Parametric NACA airfoil and de Laval nozzle rasterizers (stamp payloads). |
 
-The solver runs in lattice units with `tau = 3 nu + 0.5`, a Mach guard at
-0.3 lattice speed, and a self-healing divergence check — the same
-numerics as the FingerFlow iOS app in this repository, scaled up ~30x in
-cell count.
+The LBM solver runs in lattice units with `tau = 3 nu + 0.5`, a Mach
+guard at 0.3 lattice speed, and a self-healing divergence check — the
+same numerics as the FingerFlow iOS app in this repository, scaled up
+~30x in cell count. The Euler solver is nondimensionalized on the
+freestream sound speed (ρ∞ = 1, a∞ = 1, γ = 1.4) with a CFL-limited
+time step, and shares the LBM path's velocity/pressure render buffers
+so every view, the dye advection and the tracer particles work
+identically in both modes.
 
 ## License
 

@@ -35,6 +35,16 @@ pub const PARTICLE_CHOICES: [(&str, u32); 5] = [
 ];
 pub const MAX_PARTICLES: u64 = 2_000_000;
 
+/// Which solver advances the flow.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SolverMode {
+    /// D2Q9 lattice-Boltzmann: incompressible, viscous, low Mach.
+    Lbm,
+    /// Finite-volume compressible Euler (MUSCL + HLLC): shocks and
+    /// expansion fans, inviscid.
+    Euler,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RenderMode {
     Dye = 0,
@@ -60,6 +70,9 @@ impl RenderMode {
 pub struct Settings {
     pub paused: bool,
     pub wind_tunnel: bool,
+    pub solver: SolverMode,
+    /// Euler mode: inlet Mach number (freestream speed / sound speed).
+    pub mach: f32,
     pub flow_speed: f32,   // lattice inlet speed
     pub viscosity: f32,    // lattice kinematic viscosity
     pub steps_per_frame: u32,
@@ -84,6 +97,8 @@ impl Default for Settings {
         Self {
             paused: false,
             wind_tunnel: true,
+            solver: SolverMode::Lbm,
+            mach: 1.6,
             flow_speed: 0.09,
             viscosity: 0.015,
             steps_per_frame: 8,
@@ -116,6 +131,23 @@ struct SimParamsRaw {
     free_u: [f32; 2],
     time: f32, // lattice steps elapsed (drives fan gusts)
     _pad1: f32,
+}
+
+// Matches EulerParams in euler.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct EulerParamsRaw {
+    width: u32,
+    height: u32,
+    gamma: f32,
+    mach: f32,
+    dt: f32,
+    blend: f32,
+    sponge_width: f32,
+    sponge_strength: f32,
+    free_u: [f32; 2],
+    time: f32,
+    write_render: f32,
 }
 
 #[repr(C)]
@@ -194,6 +226,11 @@ impl ViewportMapping {
 struct GridBuffers {
     f_a: wgpu::Buffer,
     f_b: wgpu::Buffer,
+    // Euler conserved-state buffers (SSP-RK2 needs U^n, the stage value
+    // and the result live at once, rotated cyclically).
+    u_a: wgpu::Buffer,
+    u_b: wgpu::Buffer,
+    u_c: wgpu::Buffer,
     vel: wgpu::Buffer,
     rho: wgpu::Buffer,
     cell: wgpu::Buffer,
@@ -205,11 +242,18 @@ struct GridBuffers {
     lbm_bind: [wgpu::BindGroup; 2],
     dye_bind: [wgpu::BindGroup; 2],
     part_bind: wgpu::BindGroup,
+    // Euler bind groups: [rotation][stage]. With the buffer triple
+    // rotated as (a,b,c) -> (c,a,b) -> (b,c,a), stage 1 reads slot 0 and
+    // writes slot 1; stage 2 reads slots 1 (src) + 0 (base) and writes
+    // slot 2, which becomes the next rotation's slot 0.
+    euler_bind: [[wgpu::BindGroup; 2]; 3],
     // Render bind groups keyed by which dye buffer is current.
     render_bind: [wgpu::BindGroup; 2],
     /// Which f/dye buffer holds the current state (0 = A, 1 = B).
     f_side: usize,
     dye_side: usize,
+    /// Current Euler rotation index (0..3).
+    euler_rot: usize,
 }
 
 pub struct GpuSim {
@@ -217,12 +261,15 @@ pub struct GpuSim {
     queue: Arc<wgpu::Queue>,
 
     lbm_layout: wgpu::BindGroupLayout,
+    euler_layout: wgpu::BindGroupLayout,
     dye_layout: wgpu::BindGroupLayout,
     part_layout: wgpu::BindGroupLayout,
     render_layout: wgpu::BindGroupLayout,
 
     collide_pipeline: wgpu::ComputePipeline,
     reset_pipeline: wgpu::ComputePipeline,
+    euler_step_pipeline: wgpu::ComputePipeline,
+    euler_reset_pipeline: wgpu::ComputePipeline,
     advect_pipeline: wgpu::ComputePipeline,
     clear_dye_pipeline: wgpu::ComputePipeline,
     part_update_pipeline: wgpu::ComputePipeline,
@@ -231,6 +278,9 @@ pub struct GpuSim {
     field_pipeline_rgba: wgpu::RenderPipeline, // for PNG export
 
     sim_uniform: wgpu::Buffer,
+    // Per-RK-stage Euler uniforms (blend / write_render differ).
+    euler_uniform_s1: wgpu::Buffer,
+    euler_uniform_s2: wgpu::Buffer,
     part_uniform: wgpu::Buffer,
     render_uniform: wgpu::Buffer,
     particles: wgpu::Buffer,
@@ -248,6 +298,9 @@ pub struct GpuSim {
     pub mapping: ViewportMapping,
 
     frame_counter: u32,
+    /// mach * euler_dt as of the last frame that wrote the velocity
+    /// buffer (see render_inlet_speed).
+    euler_render_ref: f32,
     /// Lattice time (steps) elapsed, fed to the fan-gust animation.
     lattice_time: f32,
     /// Total lattice steps since the last flow reset (never wraps; used
@@ -323,6 +376,10 @@ impl GpuSim {
             label: Some("lbm"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/lbm.wgsl").into()),
         });
+        let euler_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("euler"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/euler.wgsl").into()),
+        });
         let dye_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dye"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/dye.wgsl").into()),
@@ -347,6 +404,19 @@ impl GpuSim {
                 storage_entry(4, true, c),
                 storage_entry(5, false, c),
                 storage_entry(6, false, c),
+            ],
+        });
+        let euler_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("euler layout"),
+            entries: &[
+                uniform_entry(0, c),
+                storage_entry(1, true, c),  // u_src
+                storage_entry(2, true, c),  // u_base
+                storage_entry(3, false, c), // u_dst
+                storage_entry(4, true, c),  // cell
+                storage_entry(5, true, c),  // fan
+                storage_entry(6, false, c), // velocity
+                storage_entry(7, false, c), // density
             ],
         });
         let dye_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -394,6 +464,7 @@ impl GpuSim {
             })
         };
         let lbm_pl = compute_pl(&lbm_layout, "lbm pl");
+        let euler_pl = compute_pl(&euler_layout, "euler pl");
         let dye_pl = compute_pl(&dye_layout, "dye pl");
         let part_pl = compute_pl(&part_layout, "part pl");
 
@@ -409,6 +480,8 @@ impl GpuSim {
         };
         let collide_pipeline = make_cp(&lbm_pl, &lbm_module, "collide");
         let reset_pipeline = make_cp(&lbm_pl, &lbm_module, "reset_rest");
+        let euler_step_pipeline = make_cp(&euler_pl, &euler_module, "euler_step");
+        let euler_reset_pipeline = make_cp(&euler_pl, &euler_module, "euler_reset");
         let advect_pipeline = make_cp(&dye_pl, &dye_module, "advect");
         let clear_dye_pipeline = make_cp(&dye_pl, &dye_module, "clear_dye");
         let part_update_pipeline = make_cp(&part_pl, &part_module, "update");
@@ -500,6 +573,16 @@ impl GpuSim {
             usage: uniform_usage,
             mapped_at_creation: false,
         });
+        let mk_euler_uniform = |label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<EulerParamsRaw>() as u64,
+                usage: uniform_usage,
+                mapped_at_creation: false,
+            })
+        };
+        let euler_uniform_s1 = mk_euler_uniform("euler uniform s1");
+        let euler_uniform_s2 = mk_euler_uniform("euler uniform s2");
         let part_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("part uniform"),
             size: std::mem::size_of::<PartParamsRaw>() as u64,
@@ -534,10 +617,13 @@ impl GpuSim {
             w,
             h,
             &lbm_layout,
+            &euler_layout,
             &dye_layout,
             &part_layout,
             &render_layout,
             &sim_uniform,
+            &euler_uniform_s1,
+            &euler_uniform_s2,
             &part_uniform,
             &render_uniform,
             &particles,
@@ -547,11 +633,14 @@ impl GpuSim {
             device,
             queue,
             lbm_layout,
+            euler_layout,
             dye_layout,
             part_layout,
             render_layout,
             collide_pipeline,
             reset_pipeline,
+            euler_step_pipeline,
+            euler_reset_pipeline,
             advect_pipeline,
             clear_dye_pipeline,
             part_update_pipeline,
@@ -559,6 +648,8 @@ impl GpuSim {
             particle_pipeline,
             field_pipeline_rgba,
             sim_uniform,
+            euler_uniform_s1,
+            euler_uniform_s2,
             part_uniform,
             render_uniform,
             particles,
@@ -572,6 +663,7 @@ impl GpuSim {
             settings: Settings::default(),
             mapping: ViewportMapping::default(),
             frame_counter: 0,
+            euler_render_ref: 0.1,
             lattice_time: 0.0,
             total_steps: 0.0,
             pending_reset: true,
@@ -589,10 +681,13 @@ impl GpuSim {
         w: usize,
         h: usize,
         lbm_layout: &wgpu::BindGroupLayout,
+        euler_layout: &wgpu::BindGroupLayout,
         dye_layout: &wgpu::BindGroupLayout,
         part_layout: &wgpu::BindGroupLayout,
         render_layout: &wgpu::BindGroupLayout,
         sim_uniform: &wgpu::Buffer,
+        euler_uniform_s1: &wgpu::Buffer,
+        euler_uniform_s2: &wgpu::Buffer,
         part_uniform: &wgpu::Buffer,
         render_uniform: &wgpu::Buffer,
         particles: &wgpu::Buffer,
@@ -608,6 +703,9 @@ impl GpuSim {
         };
         let f_a = mk("f a", n * 9 * 4);
         let f_b = mk("f b", n * 9 * 4);
+        let u_a = mk("euler u a", n * 16);
+        let u_b = mk("euler u b", n * 16);
+        let u_c = mk("euler u c", n * 16);
         let vel = mk("velocity", n * 8);
         let rho = mk("density", n * 4);
         let cell = mk("cell type", n * 4);
@@ -654,6 +752,37 @@ impl GpuSim {
         let dye_bind =
             [dye_bind_for(&dye_a, &dye_b, "dye a->b"), dye_bind_for(&dye_b, &dye_a, "dye b->a")];
 
+        // Euler bind groups: buffer-triple rotations (t0, t1, t2) with
+        // stage 1 = (src t0, base t0, dst t1) and stage 2 =
+        // (src t1, base t0, dst t2); the next rotation starts at t2.
+        let euler_bind_for = |uniform: &wgpu::Buffer,
+                              src: &wgpu::Buffer,
+                              base: &wgpu::Buffer,
+                              dst: &wgpu::Buffer,
+                              label: &str| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: euler_layout,
+                entries: &[
+                    entry(0, uniform),
+                    entry(1, src),
+                    entry(2, base),
+                    entry(3, dst),
+                    entry(4, &cell),
+                    entry(5, &fan),
+                    entry(6, &vel),
+                    entry(7, &rho),
+                ],
+            })
+        };
+        let rotations = [[&u_a, &u_b, &u_c], [&u_c, &u_a, &u_b], [&u_b, &u_c, &u_a]];
+        let euler_bind = rotations.map(|[t0, t1, t2]| {
+            [
+                euler_bind_for(euler_uniform_s1, t0, t0, t1, "euler stage 1"),
+                euler_bind_for(euler_uniform_s2, t1, t0, t2, "euler stage 2"),
+            ]
+        });
+
         let part_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("particle bind"),
             layout: part_layout,
@@ -684,6 +813,9 @@ impl GpuSim {
         GridBuffers {
             f_a,
             f_b,
+            u_a,
+            u_b,
+            u_c,
             vel,
             rho,
             cell,
@@ -694,9 +826,11 @@ impl GpuSim {
             lbm_bind,
             dye_bind,
             part_bind,
+            euler_bind,
             render_bind,
             f_side: 0,
             dye_side: 0,
+            euler_rot: 0,
         }
     }
 
@@ -722,6 +856,28 @@ impl GpuSim {
         self.pending_reset = true;
         self.pending_clear_dye = true;
         self.total_steps = 0.0;
+    }
+
+    /// CFL-limited time step for the Euler solver (nondimensional).
+    /// Budgeted for the unsplit 2D update, dt * (Sx + Sy) <= CFL, against
+    /// the fastest state the solver DESIGN permits: fans boosted to 2x the
+    /// inlet Mach (|u| up to 2*mach) plus post-shock sound speeds up to
+    /// ~1.7 a_inf for M <= 3 — hence 2*mach + 3.5. States beyond that
+    /// envelope are caught by the in-kernel guard instead.
+    pub fn euler_dt(&self) -> f32 {
+        0.35 / (2.0 * self.settings.mach.max(0.3) + 3.5)
+    }
+
+    /// Inlet-speed normalization for the renderer, in the same units as
+    /// the velocity buffer (LBM: lattice cells/step; Euler: the velocity
+    /// buffer stores u * dt, so the reference is mach * dt AS OF the last
+    /// frame that actually wrote the buffer — changing Mach while paused
+    /// must not rescale stale data).
+    fn render_inlet_speed(&self) -> f32 {
+        match self.settings.solver {
+            SolverMode::Lbm => self.settings.flow_speed,
+            SolverMode::Euler => self.euler_render_ref.max(1e-4),
+        }
     }
 
 
@@ -767,10 +923,13 @@ impl GpuSim {
             w,
             h,
             &self.lbm_layout,
+            &self.euler_layout,
             &self.dye_layout,
             &self.part_layout,
             &self.render_layout,
             &self.sim_uniform,
+            &self.euler_uniform_s1,
+            &self.euler_uniform_s2,
             &self.part_uniform,
             &self.render_uniform,
             &self.particles,
@@ -856,9 +1015,45 @@ impl GpuSim {
         // common period of the shader's gust sinusoids (all exact
         // multiples of 2*pi/65536 per step), so wrapping is
         // phase-continuous, and 65536 is far below f32 precision loss.
+        let time_now = self.lattice_time;
         self.lattice_time = (self.lattice_time + steps as f32) % 65536.0;
         self.total_steps += steps as f64;
         self.queue.write_buffer(&self.sim_uniform, 0, bytemuck::bytes_of(&params));
+
+        let euler = self.settings.solver == SolverMode::Euler;
+        if euler {
+            let dt_e = self.euler_dt();
+            // The velocity buffer only changes when steps run or a reset
+            // rewrites it; keep the render normalization pinned to the
+            // dt/mach it was written with.
+            if steps > 0 || self.pending_reset {
+                self.euler_render_ref = self.settings.mach * dt_e;
+            }
+            let free_u = if self.settings.wind_tunnel {
+                [self.settings.mach, 0.0]
+            } else {
+                [0.0, 0.0]
+            };
+            let mut ep = EulerParamsRaw {
+                width: w as u32,
+                height: h as u32,
+                gamma: 1.4,
+                mach: self.settings.mach,
+                dt: dt_e,
+                blend: 0.0,
+                sponge_width: (self.margin.min(96)) as f32,
+                sponge_strength: self.settings.sponge_strength,
+                free_u,
+                time: time_now,
+                write_render: 0.0,
+            };
+            self.queue
+                .write_buffer(&self.euler_uniform_s1, 0, bytemuck::bytes_of(&ep));
+            ep.blend = 0.5;
+            ep.write_render = 1.0;
+            self.queue
+                .write_buffer(&self.euler_uniform_s2, 0, bytemuck::bytes_of(&ep));
+        }
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
         // Spawn tracers over the visible window plus an upstream band a
@@ -888,12 +1083,23 @@ impl GpuSim {
 
         if self.pending_reset {
             self.pending_reset = false;
-            pass.set_pipeline(&self.reset_pipeline);
-            for side in 0..2 {
-                pass.set_bind_group(0, &self.bufs.lbm_bind[side], &[]);
-                self.dispatch_grid(&mut pass, w, h);
+            if euler {
+                // The stage-1 bind groups' dst slots cover all three
+                // state buffers across the rotations.
+                pass.set_pipeline(&self.euler_reset_pipeline);
+                for rot in 0..3 {
+                    pass.set_bind_group(0, &self.bufs.euler_bind[rot][0], &[]);
+                    self.dispatch_grid(&mut pass, w, h);
+                }
+                self.bufs.euler_rot = 0;
+            } else {
+                pass.set_pipeline(&self.reset_pipeline);
+                for side in 0..2 {
+                    pass.set_bind_group(0, &self.bufs.lbm_bind[side], &[]);
+                    self.dispatch_grid(&mut pass, w, h);
+                }
+                self.bufs.f_side = 0;
             }
-            self.bufs.f_side = 0;
         }
         if self.pending_clear_dye {
             self.pending_clear_dye = false;
@@ -905,11 +1111,23 @@ impl GpuSim {
             self.bufs.dye_side = 0;
         }
 
-        pass.set_pipeline(&self.collide_pipeline);
-        for _ in 0..steps {
-            pass.set_bind_group(0, &self.bufs.lbm_bind[self.bufs.f_side], &[]);
-            self.dispatch_grid(&mut pass, w, h);
-            self.bufs.f_side ^= 1;
+        if euler {
+            pass.set_pipeline(&self.euler_step_pipeline);
+            for _ in 0..steps {
+                let rot = self.bufs.euler_rot;
+                pass.set_bind_group(0, &self.bufs.euler_bind[rot][0], &[]);
+                self.dispatch_grid(&mut pass, w, h);
+                pass.set_bind_group(0, &self.bufs.euler_bind[rot][1], &[]);
+                self.dispatch_grid(&mut pass, w, h);
+                self.bufs.euler_rot = (rot + 1) % 3;
+            }
+        } else {
+            pass.set_pipeline(&self.collide_pipeline);
+            for _ in 0..steps {
+                pass.set_bind_group(0, &self.bufs.lbm_bind[self.bufs.f_side], &[]);
+                self.dispatch_grid(&mut pass, w, h);
+                self.bufs.f_side ^= 1;
+            }
         }
 
         // Dye advection once per frame (also while paused so painted smoke
@@ -937,7 +1155,7 @@ impl GpuSim {
             vp_size: self.mapping.vp_size,
             lb_origin: self.mapping.lb_origin,
             px_per_cell: self.mapping.px_per_cell,
-            inlet_speed: self.settings.flow_speed,
+            inlet_speed: self.render_inlet_speed(),
             vis_origin: [self.margin as u32, self.margin as u32],
             vis_size: [self.vis_w as u32, self.vis_h as u32],
             display_gain: self.settings.display_gain,
@@ -991,7 +1209,7 @@ impl GpuSim {
             vp_size: [w as f32, h as f32],
             lb_origin: [0.0, 0.0],
             px_per_cell: 1.0,
-            inlet_speed: self.settings.flow_speed,
+            inlet_speed: self.render_inlet_speed(),
             vis_origin: [self.margin as u32, self.margin as u32],
             vis_size: [self.vis_w as u32, self.vis_h as u32],
             display_gain: self.settings.display_gain,

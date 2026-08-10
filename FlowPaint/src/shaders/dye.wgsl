@@ -56,18 +56,23 @@ fn advect(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
 
-    let pos = vec2f(gid.xy) + 0.5 - velocity[idx] * P.dye_dt;
-
-    // Don't pull dye through a solid: if the backtraced point lands inside
-    // a wall cell, keep the local dye instead of sampling across it.
-    let bx = clamp(i32(floor(pos.x)), 0, i32(W) - 1);
-    let by = clamp(i32(floor(pos.y)), 0, i32(H) - 1);
-    var d: vec4f;
-    if (cell_type[u32(by) * W + u32(bx)] == CELL_WALL) {
-        d = dye_in[idx] * P.dye_decay;
-    } else {
-        d = sample_dye(pos) * P.dye_decay;
+    // Backtrace in <= 1-cell substeps so a fast flow (compressible mode,
+    // or many sub-steps per frame) can't pull dye straight through a
+    // wall: the walk stops at the last free position before a solid.
+    let disp = velocity[idx] * P.dye_dt;
+    let n = max(1u, min(24u, u32(ceil(length(disp)))));
+    let step = disp / f32(n);
+    var pos = vec2f(gid.xy) + 0.5;
+    for (var k = 0u; k < n; k++) {
+        let cand = pos - step;
+        let bx = clamp(i32(floor(cand.x)), 0, i32(W) - 1);
+        let by = clamp(i32(floor(cand.y)), 0, i32(H) - 1);
+        if (cell_type[u32(by) * W + u32(bx)] == CELL_WALL) {
+            break;
+        }
+        pos = cand;
     }
+    var d = sample_dye(pos) * P.dye_decay;
 
     let src = dye_src[idx];
     if (src.a > 0.0) {

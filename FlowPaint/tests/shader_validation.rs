@@ -33,3 +33,8 @@ fn particles_shader_is_valid() {
 fn render_shader_is_valid() {
     validate("render.wgsl", include_str!("../src/shaders/render.wgsl"));
 }
+
+#[test]
+fn euler_shader_is_valid() {
+    validate("euler.wgsl", include_str!("../src/shaders/euler.wgsl"));
+}

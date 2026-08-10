@@ -79,9 +79,30 @@ fn update(@builtin(global_invocation_id) gid: vec3u) {
         p.z = 0.0;
         p.w = 200.0 + 600.0 * rand01(s ^ 0x68E31DA4u);
     } else {
-        let v = sample_vel(p.xy);
-        p.x += v.x * PP.dt;
-        p.y += v.y * PP.dt;
+        // Advect in <= 1-cell substeps so fast (compressible-mode) flow
+        // can't carry a tracer straight through a thin wall — it stops at
+        // the surface and the next frame's respawn check recycles it.
+        let v0 = sample_vel(p.xy) * PP.dt;
+        let n = max(1u, min(24u, u32(ceil(length(v0)))));
+        let sub_dt = PP.dt / f32(n);
+        var pos = p.xy;
+        for (var k = 0u; k < n; k++) {
+            let v = sample_vel(pos);
+            let cand = pos + v * sub_dt;
+            if (cand.x < 0.0 || cand.y < 0.0
+                || cand.x >= f32(W) || cand.y >= f32(H)) {
+                pos = cand; // off-domain: respawn logic handles it
+                break;
+            }
+            let cx = clamp(u32(cand.x), 0u, W - 1u);
+            let cy = clamp(u32(cand.y), 0u, H - 1u);
+            pos = cand;
+            if (cell_type[cy * W + cx] == CELL_WALL) {
+                break;
+            }
+        }
+        p.x = pos.x;
+        p.y = pos.y;
         p.z += PP.dt;
     }
     particles[i] = p;

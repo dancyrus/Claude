@@ -69,7 +69,7 @@ impl GridRect {
 /// the vector's magnitude is the per-fan speed multiplier on the global
 /// flow speed, gustiness in 0..1 adds time-varying direction/strength
 /// wander, and the phase decorrelates different fans' gusts.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeoRegion {
     pub rect: (i32, i32, i32, i32),
     pub cell: Vec<u32>,
