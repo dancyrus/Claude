@@ -458,6 +458,9 @@ pub struct FlowPaintApp {
     fluid_preset_idx: Option<usize>,
     /// Real exhaust velocity of the last-picked nozzle engine preset.
     nozzle_real_ve: Option<f32>,
+    /// True while the chamber-fan multiplier tracks the preset formula;
+    /// cleared when the user drags the slider manually.
+    nozzle_fan_auto: bool,
     // Physical scaling: the canvas maps to a real domain of this width,
     // and the current fluid's physical properties anchor all unit
     // conversions (lattice viscosity fixes the physical time step).
@@ -468,6 +471,9 @@ pub struct FlowPaintApp {
     show_legend: bool,
     stats_steps_per_s: f32,
     stats_sim_steps: f64,
+    /// Physical sim time accumulated at each frame's own dt, so changing
+    /// viscosity/domain later doesn't retroactively re-price history.
+    sim_time_s: f64,
     /// Cached physical scale for this frame (from the latest snapshot).
     phys_cache: PhysScale,
     // Whether the current selection contains fan cells (cached).
@@ -532,6 +538,7 @@ impl FlowPaintApp {
             show_nozzle_gen: false,
             fluid_preset_idx: Some(2),
             nozzle_real_ve: None,
+            nozzle_fan_auto: true,
             domain_width_m: 1.0,
             fluid_name: "air",
             fluid_nu: 1.5e-5,
@@ -539,6 +546,7 @@ impl FlowPaintApp {
             show_legend: true,
             stats_steps_per_s: 0.0,
             stats_sim_steps: 0.0,
+            sim_time_s: 0.0,
             phys_cache: PhysScale::default(),
             sel_has_fans: false,
             hover_cell: None,
@@ -550,7 +558,7 @@ impl FlowPaintApp {
             particle_index: 0,
             margin_index: DEFAULT_MARGIN_INDEX,
             status: String::from("Draw walls with the brush; hold right-click to erase."),
-            stats_grid: (0, 0),
+            stats_grid: (RESOLUTIONS[res_index].1, RESOLUTIONS[res_index].2),
             stats_full: (0, 0),
             stats_margin: 0,
             stats_mlups: 0.0,
@@ -868,7 +876,13 @@ impl eframe::App for FlowPaintApp {
         self.stats_mlups = n * sim.steps_last_frame as f32 / dt / 1.0e6;
         self.stats_re = sim.reynolds_estimate();
         self.stats_steps_per_s = sim.steps_last_frame as f32 / dt;
-        self.stats_sim_steps = sim.total_steps;
+        let steps_now = sim.total_steps;
+        if steps_now < self.stats_sim_steps {
+            self.sim_time_s = 0.0; // flow was reset
+        }
+        let delta = (steps_now - self.stats_sim_steps).max(0.0);
+        self.sim_time_s += delta * self.phys_cache.dt as f64;
+        self.stats_sim_steps = steps_now;
     }
 }
 
@@ -1035,7 +1049,16 @@ fn selection_update(sim: &mut GpuSim, app: &mut FlowPaintApp) {
 fn commit_selection(sim: &mut GpuSim, app: &mut FlowPaintApp) {
     if app.selection.take().is_some() {
         app.selection_bg = None;
+        let touched = app.pending_stroke_rect;
         push_stroke_undo(sim, app);
+        // If the session touched the tunnel's edge bands, re-assert them
+        // so a commit can never leave the boundary inconsistent.
+        if sim.settings.wind_tunnel && !touched.is_empty() {
+            let gw = sim.geo.w as i32;
+            if touched.x0 < 2 || touched.x1 > gw - 2 {
+                sim.reassert_tunnel();
+            }
+        }
     }
 }
 
@@ -1347,8 +1370,9 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::SelectCut { a, b } => {
             commit_selection(sim, app);
             let m = sim.margin() as f32;
-            // Clamp the marquee to the visible window: at margin 0 this
-            // keeps the wind tunnel's edge columns out of the cut.
+            // Clamp the marquee to the visible window (when a margin
+            // exists this also keeps the tunnel edge columns, which live
+            // at the full-grid border, out of the cut).
             let rect = GridRect {
                 x0: (a[0].min(b[0]) + m).floor() as i32,
                 y0: (a[1].min(b[1]) + m).floor() as i32,
@@ -1373,6 +1397,15 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             {
                 return;
             }
+            // The tunnel's own inlet columns are CELL_INLET too; keep them
+            // out of the fill (and refuse seeds inside them) so a click
+            // can never lift the tunnel boundary.
+            let in_tunnel_band = |x: i32| -> bool {
+                sim.settings.wind_tunnel && (x < 2 || x >= gw - 2)
+            };
+            if in_tunnel_band(cx) {
+                return;
+            }
             // Flood-fill the connected fan (4-neighbour) and select its
             // bounding box, so its physics can be retuned in place.
             let mut rect = GridRect { x0: cx, y0: cy, x1: cx + 1, y1: cy + 1 };
@@ -1389,8 +1422,9 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
                     if seen.len() >= FLOOD_CAP || seen.contains(&(nx, ny)) {
                         continue;
                     }
-                    if sim.geo.cell[(ny as usize) * sim.geo.w + nx as usize]
-                        == crate::geometry::CELL_INLET
+                    if !in_tunnel_band(nx)
+                        && sim.geo.cell[(ny as usize) * sim.geo.w + nx as usize]
+                            == crate::geometry::CELL_INLET
                     {
                         seen.insert((nx, ny));
                         stack.push((nx, ny));
@@ -2225,10 +2259,7 @@ impl FlowPaintApp {
                         "Sim rate",
                         format!("{:.2}× real", self.stats_steps_per_s * ps.dt),
                     );
-                    row(
-                        "Sim time",
-                        fmt_time(self.stats_sim_steps as f32 * ps.dt),
-                    );
+                    row("Sim time", fmt_time(self.sim_time_s as f32));
                 });
             ui.add_space(6.0);
             ui.separator();
@@ -2270,7 +2301,7 @@ impl FlowPaintApp {
                             |ui| ui.small(format!("+{:.1} 1/s", w_sat)),
                         );
                     });
-                    ui.small("blue: clockwise · red: counter-clockwise");
+                    ui.small("red: clockwise · blue: counter-clockwise");
                 }
                 RenderMode::Pressure => {
                     ui.label("Pressure Δp (gauge)");
@@ -2591,7 +2622,11 @@ impl FlowPaintApp {
                         if !drag.sel_move {
                             let w = (drag.last_cell[0] - drag.start_cell[0]).abs();
                             let h = (drag.last_cell[1] - drag.start_cell[1]).abs();
-                            if w >= 2.0 && h >= 2.0 {
+                            // Click threshold measured in screen points so
+                            // it doesn't shrink with grid resolution.
+                            let thresh =
+                                (4.0 * ppp / mapping.px_per_cell.max(1e-3)).max(2.0);
+                            if w >= thresh || h >= thresh {
                                 cmds.push(Cmd::SelectCut {
                                     a: drag.start_cell,
                                     b: drag.last_cell,
@@ -2953,6 +2988,7 @@ impl FlowPaintApp {
                                 p.fan_mult = (0.27
                                     / (snap.flow * p.chamber_ratio).max(1e-4))
                                 .clamp(0.2, 2.0);
+                                self.nozzle_fan_auto = true;
                                 self.nozzle_real_ve = Some(ve);
                             }
                         }
@@ -2984,14 +3020,26 @@ impl FlowPaintApp {
                     ui.radio_value(&mut p.contour, gen::NozzleContour::Conical, "Conical (15°-style)");
                 });
                 ui.checkbox(&mut p.chamber_fan, "Fan in the chamber (self-powered)");
-                ui.add(
-                    egui::Slider::new(&mut p.fan_mult, 0.2..=2.0).text("chamber fan ×"),
-                );
+                if ui
+                    .add(
+                        egui::Slider::new(&mut p.fan_mult, 0.2..=2.0)
+                            .text("chamber fan ×"),
+                    )
+                    .changed()
+                {
+                    self.nozzle_fan_auto = false;
+                }
                 // Expected jet speeds in real units, next to the engine's
-                // actual exhaust velocity.
-                let throat_sim =
-                    self.phys_cache.u_phys(snap.flow * p.fan_mult * p.chamber_ratio);
-                ui.label(format!("sim throat jet ≈ {}", fmt_speed(throat_sim)));
+                // actual exhaust velocity. The solver clamps lattice speed
+                // at 0.3, so the readout is capped the same way.
+                let throat_lattice = snap.flow * p.fan_mult * p.chamber_ratio;
+                let capped = throat_lattice > 0.3;
+                let throat_sim = self.phys_cache.u_phys(throat_lattice.min(0.3));
+                ui.label(format!(
+                    "sim throat jet ≈ {}{}",
+                    fmt_speed(throat_sim),
+                    if capped { " (speed-capped)" } else { "" }
+                ));
                 if let Some(ve) = self.nozzle_real_ve {
                     let factor = ve / throat_sim.max(1e-6);
                     ui.label(
@@ -3016,9 +3064,12 @@ impl FlowPaintApp {
                 );
                 ui.add_space(6.0);
                 if ui.button("Insert into scene").clicked() {
-                    // Rescale the fan for the flow speed at insert time.
-                    p.fan_mult = (0.27 / (snap.flow * p.chamber_ratio).max(1e-4))
-                        .clamp(0.2, 2.0);
+                    // Track the preset formula unless the user overrode
+                    // the slider — what the dialog shows is what inserts.
+                    if self.nozzle_fan_auto {
+                        p.fan_mult = (0.27 / (snap.flow * p.chamber_ratio).max(1e-4))
+                            .clamp(0.2, 2.0);
+                    }
                     let stamp = gen::generate_nozzle(p);
                     self.commit_sketch(cmds); // don't orphan a pending sketch
                     cmds.push(Cmd::InsertStamp(stamp));
