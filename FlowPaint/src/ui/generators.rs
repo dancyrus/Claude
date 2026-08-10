@@ -103,25 +103,41 @@ impl FlowPaintApp {
                 if self.nozzle_fan_auto {
                     p.fan_mult = nozzle_auto_fan_mult(&snap, p.chamber_ratio);
                 }
+                let mut back_to_auto = false;
                 let fan_resp = ui.horizontal(|ui| {
-                    let resp = ui.add(
-                        egui::DragValue::new(&mut p.fan_mult)
-                            .range(0.2..=2.0)
-                            .speed(0.01)
-                            .suffix(" ×"),
-                    );
+                    let resp = ui
+                        .add(
+                            egui::DragValue::new(&mut p.fan_mult)
+                                .range(0.2..=2.0)
+                                .speed(0.01)
+                                .suffix(" ×"),
+                        )
+                        .on_hover_text(
+                            "Set the chamber drive as a multiple of the inlet \
+                             speed. Drag the value to leave auto mode.",
+                        );
                     ui.label("chamber fan");
                     if self.nozzle_fan_auto {
                         ui.label(
                             egui::RichText::new("(auto)")
                                 .small()
                                 .color(super::theme::INK_3),
-                        );
+                        )
+                        .on_hover_text("The value follows the engine preset.");
+                    } else if ui
+                        .small_button("reset to auto")
+                        .on_hover_text("Return the drive to the preset formula.")
+                        .clicked()
+                    {
+                        back_to_auto = true;
                     }
                     resp
                 });
                 if fan_resp.inner.changed() {
                     self.nozzle_fan_auto = false;
+                }
+                if back_to_auto {
+                    self.nozzle_fan_auto = true;
                 }
                 // Expected jet speeds in real units, next to the engine's
                 // actual exhaust velocity.
@@ -143,7 +159,11 @@ impl FlowPaintApp {
                 ui.monospace(format!(
                     "sim throat jet ≈ {}{}",
                     fmt_speed(throat_sim),
-                    if capped { " (speed-capped)" } else { "" }
+                    if capped {
+                        " (clamped: LBM 0.3 lattice limit)"
+                    } else {
+                        ""
+                    }
                 ));
                 if let Some(ve) = self.nozzle_real_ve {
                     let factor = ve / throat_sim.max(1e-6);

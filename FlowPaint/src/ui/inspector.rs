@@ -1,12 +1,12 @@
 //! The object inspector (selected-object properties) and the defaults
 //! panel for newly drawn objects.
 
-use crate::app::{Cmd, FlowPaintApp, Gesture};
+use crate::app::{Cmd, FlowPaintApp, Gesture, UiSnapshot};
 use crate::model::{ObjMaterial, Shape};
-use crate::sim::RenderMode;
+use crate::sim::{RenderMode, SolverMode};
 use eframe::egui;
 
-use super::units::{fmt_len};
+use super::units::{fmt_factor, fmt_len, fmt_mach, fmt_speed};
 
 use super::theme;
 
@@ -16,7 +16,12 @@ impl FlowPaintApp {
     /// inspector, defaults) moved here unchanged from the old control
     /// column — the mid-gesture guard exists because the inspector
     /// fights an active drag.
-    pub(in crate::app) fn settings_panel(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
+    pub(in crate::app) fn settings_panel(
+        &mut self,
+        ctx: &egui::Context,
+        snap: UiSnapshot,
+        cmds: &mut Vec<Cmd>,
+    ) {
         egui::SidePanel::left("settings")
             .resizable(true)
             .default_width(theme::dim::SETTINGS_WIDTH)
@@ -36,7 +41,7 @@ impl FlowPaintApp {
                                 egui::RichText::new("(finish the gesture…)").weak(),
                             );
                         } else if let Some(id) = self.selected {
-                            self.object_panel(ui, id, cmds);
+                            self.object_panel(ui, id, snap, cmds);
                         } else {
                             self.defaults_panel(ui, cmds);
                         }
@@ -46,7 +51,13 @@ impl FlowPaintApp {
 
     /// Properties of the selected object: every knob edits the live model
     /// (undoably, with per-widget coalescing).
-    pub(in crate::app) fn object_panel(&mut self, ui: &mut egui::Ui, id: u64, cmds: &mut Vec<Cmd>) {
+    pub(in crate::app) fn object_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: u64,
+        snap: UiSnapshot,
+        cmds: &mut Vec<Cmd>,
+    ) {
         let Some(i) = self.model.find(id) else {
             self.selected = None;
             return;
@@ -112,15 +123,25 @@ impl FlowPaintApp {
             }
         }
 
-        // Fan physics: for drawn fans, and for generated parts that carry
-        // fan cells (a rocket nozzle's chamber inlet).
-        let stamp_has_fans = match &obj.shape {
-            Shape::Stamp { raster, .. } => {
-                raster.cell.iter().any(|&c| c == crate::geometry::CELL_INLET)
-            }
-            _ => false,
+        // Fan physics. A generated part that carries fan cells (a rocket
+        // nozzle's chamber inlet) is an ENGINE in the user's mental model
+        // and gets its own group; a hand-placed Fan object keeps the
+        // generic fan block below, unchanged. Blow direction and smoke
+        // color are withheld for stamps: the rasterizer rotates baked fan
+        // vectors with the part's geometry only and copies baked dye
+        // verbatim, so those two controls would do nothing (phase 5
+        // finding — see the report).
+        let stamp_fan_mag = match &obj.shape {
+            Shape::Stamp { raster, .. } => raster
+                .fan
+                .iter()
+                .map(|f| (f[0] * f[0] + f[1] * f[1]).sqrt())
+                .fold(0.0f32, f32::max),
+            _ => 0.0,
         };
-        if obj.material == ObjMaterial::Fan || stamp_has_fans {
+        if stamp_fan_mag > 0.0 {
+            changed |= self.engine_group(ui, snap, &mut obj, stamp_fan_mag);
+        } else if obj.material == ObjMaterial::Fan {
             changed |= ui
                 .add(egui::Slider::new(&mut obj.fan_mult, 0.2..=2.0).text("fan speed ×"))
                 .on_hover_text("Multiplier on the global flow speed")
@@ -132,11 +153,10 @@ impl FlowPaintApp {
                      0 is steady, 1 is a blustery day",
                 )
                 .changed();
-            // Chained shapes blow along their segments; solid shapes and
-            // stamps have a free direction (stamps rotate with the part).
-            if obj.material == ObjMaterial::Fan
-                && (matches!(obj.shape, Shape::Rect { .. } | Shape::Ellipse { .. })
-                    && obj.filled)
+            // Chained shapes blow along their segments; solid shapes have
+            // a free direction.
+            if matches!(obj.shape, Shape::Rect { .. } | Shape::Ellipse { .. })
+                && obj.filled
             {
                 let mut deg = obj.fan_angle.to_degrees();
                 if ui
@@ -218,6 +238,97 @@ impl FlowPaintApp {
                 .weak(),
             );
         }
+    }
+
+    /// The Engine group for a generated part with fan cells: chamber
+    /// drive, gustiness, and a readout naming which speed limit binds.
+    /// There is no single editable cap — six clamps in three layers, and
+    /// the binding ones are shader constants — so the panel reads out
+    /// the truth instead of pretending a field exists.
+    fn engine_group(
+        &self,
+        ui: &mut egui::Ui,
+        snap: UiSnapshot,
+        obj: &mut crate::model::SketchObject,
+        stamp_fan_mag: f32,
+    ) -> bool {
+        let mut changed = false;
+        ui.label(super::theme::heading("Engine"));
+        ui.horizontal(|ui| {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut obj.fan_mult)
+                        .range(0.2..=2.0)
+                        .speed(0.01)
+                        .suffix(" ×"),
+                )
+                .on_hover_text(
+                    "Set the chamber drive as a multiple of the inlet speed.",
+                )
+                .changed();
+            ui.label("chamber drive");
+        });
+        changed |= ui
+            .add(egui::Slider::new(&mut obj.fan_gust, 0.0..=1.0).text("gustiness"))
+            .on_hover_text("Add slow variation to the jet. Zero gives a steady jet.")
+            .changed();
+
+        // Which layer binds, and by how much the request exceeds it.
+        let ps = self.phys_cache;
+        let drive = stamp_fan_mag * obj.fan_mult;
+        match snap.solver {
+            SolverMode::Lbm => {
+                let req = snap.flow * drive; // lattice speed at the inlet cells
+                super::theme::derived(
+                    ui,
+                    format!("chamber inlet = {}", fmt_speed(ps.u_phys(req.min(0.3)))),
+                );
+                if req > 0.3 {
+                    super::theme::derived(
+                        ui,
+                        format!(
+                            "limit binds: LBM 0.3 lattice ({} requested)",
+                            fmt_factor(req / 0.3)
+                        ),
+                    );
+                } else {
+                    super::theme::derived(ui, "no speed limit binds".into());
+                }
+            }
+            SolverMode::Euler => {
+                let req_m = snap.mach * drive;
+                super::theme::derived(
+                    ui,
+                    format!(
+                        "chamber inlet = M {} = {}",
+                        fmt_mach(req_m.min(8.0)),
+                        fmt_speed(req_m.min(8.0) * self.fluid_a)
+                    ),
+                );
+                if req_m > 8.0 {
+                    super::theme::derived(
+                        ui,
+                        format!(
+                            "limit binds: Euler M 8 ({} requested)",
+                            fmt_factor(req_m / 8.0)
+                        ),
+                    );
+                } else {
+                    super::theme::derived(ui, "no speed limit binds (Euler: M 8)".into());
+                }
+            }
+        }
+        ui.label(
+            egui::RichText::new(
+                "The LBM solver limits inlet cells to 0.3 lattice speed. The \
+                 Euler solver limits them at Mach 8, which almost never binds. \
+                 In compressible mode the bell accelerates the jet through the \
+                 throat.",
+            )
+            .small()
+            .weak(),
+        );
+        changed
     }
 
     /// Defaults applied to newly drawn objects.
