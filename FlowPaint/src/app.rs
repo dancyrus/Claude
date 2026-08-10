@@ -59,6 +59,18 @@ impl RibbonTab {
     ];
 }
 
+/// A pending view-navigation request (ribbon buttons, shortcuts).
+/// Consumed by the canvas, where the viewport geometry is known.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewRequest {
+    /// Fit the whole domain in the window (and keep fitting on resize).
+    Fit,
+    /// One grid cell per framebuffer pixel.
+    OneToOne,
+    /// Zoom to the selected object's bounds.
+    Selection,
+}
+
 /// The in-progress pointer gesture.
 enum Gesture {
     None,
@@ -371,6 +383,9 @@ pub struct FlowPaintApp {
     margin_index: usize,
     status: String,
     hover_cell: Option<[f32; 2]>,
+    /// Set by ribbon buttons / shortcuts, consumed by the canvas next
+    /// frame (the canvas knows the viewport geometry).
+    view_request: Option<ViewRequest>,
     // Stats.
     stats_grid: (usize, usize),
     stats_full: (usize, usize),
@@ -464,6 +479,7 @@ impl FlowPaintApp {
                 "Draw with the sketch tools; every object stays selectable and editable.",
             ),
             hover_cell: None,
+            view_request: None,
             stats_grid: (vw, vh),
             stats_full: (0, 0),
             stats_margin: 0,
