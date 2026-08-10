@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlowPaint V2 — layout target</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --chrome:#22262c; --panel:#292e35; --panel-2:#2f353d; --view:#12151a;
+  --line:#3a4149; --line-2:#464e58;
+  --ink:#dfe4ea; --ink-2:#9aa4b0; --ink-3:#6d7783;
+  --sel:#3fb8ae; --sel-bg:#1e3f3e; --warn:#d1a24a; --bad:#cf6f62;
+  --mono:'JetBrains Mono',ui-monospace,monospace;
+  --r:3px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#15181c;font-family:Inter,system-ui,sans-serif;font-size:12px;color:var(--ink);
+  display:flex;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased}
+#app{width:1400px;height:860px;background:var(--chrome);border:1px solid var(--line);
+  display:flex;flex-direction:column;overflow:hidden}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* title + menu */
+.title{height:28px;display:flex;align-items:center;gap:10px;padding:0 10px;
+  background:#1b1f24;border-bottom:1px solid var(--line);color:var(--ink-2);font-size:11px}
+.title b{color:var(--ink);font-weight:500}
+.menu{height:26px;display:flex;align-items:center;gap:2px;padding:0 6px;
+  background:var(--chrome);border-bottom:1px solid var(--line)}
+.menu span{padding:3px 9px;border-radius:var(--r);color:var(--ink-2);cursor:default}
+.menu span:hover{background:var(--panel-2);color:var(--ink)}
+
+/* ribbon */
+.rtabs{height:27px;display:flex;align-items:flex-end;gap:1px;padding:0 6px;background:var(--chrome)}
+.rtab{padding:5px 14px;font-size:11.5px;color:var(--ink-2);border:1px solid transparent;
+  border-bottom:none;border-radius:var(--r) var(--r) 0 0;cursor:pointer;user-select:none}
+.rtab:hover{color:var(--ink)}
+.rtab.on{background:var(--panel);color:var(--ink);border-color:var(--line);
+  box-shadow:inset 0 2px 0 var(--sel)}
+.ribbon{height:86px;background:var(--panel);border-top:1px solid var(--line);
+  border-bottom:1px solid var(--line);display:flex;padding:5px 0 0}
+.rpane{display:none;width:100%}
+.rpane.on{display:flex}
+.grp{display:flex;flex-direction:column;justify-content:space-between;
+  padding:0 12px;border-right:1px solid var(--line);height:76px}
+.grp>.items{display:flex;gap:3px;align-items:flex-start;padding-top:2px}
+.cap{font-size:10px;color:var(--ink-3);text-align:center;padding-top:4px;letter-spacing:.03em}
+.bt{width:52px;padding:5px 2px;border:1px solid transparent;border-radius:var(--r);
+  display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;
+  color:var(--ink-2);font-size:10px;line-height:1.2;text-align:center}
+.bt:hover{background:var(--panel-2);border-color:var(--line-2);color:var(--ink)}
+.bt.on{background:var(--sel-bg);border-color:var(--sel);color:#cfeeeb}
+.bt.bad:hover{border-color:var(--bad);color:#e8a49a}
+.bt i{font-size:17px;font-style:normal;line-height:1}
+.stk{display:flex;flex-direction:column;gap:5px;padding-top:3px;min-width:150px}
+.fld{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-2)}
+.fld label{width:66px;text-align:right;color:var(--ink-3)}
+.dv{font-family:var(--mono);font-size:11px;background:#1c2025;border:1px solid var(--line-2);
+  border-radius:2px;padding:2px 6px;min-width:58px;text-align:right;color:var(--ink)}
+.unit{color:var(--ink-3);font-size:10.5px;min-width:26px}
+.ck{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-2)}
+.bx{width:12px;height:12px;border:1px solid var(--line-2);border-radius:2px;background:#1c2025}
+.bx.on{background:var(--sel);border-color:var(--sel);position:relative}
+.bx.on:after{content:'';position:absolute;left:3px;top:1px;width:4px;height:7px;
+  border:solid #12151a;border-width:0 1.5px 1.5px 0;transform:rotate(42deg)}
+.seg{display:flex;border:1px solid var(--line-2);border-radius:2px;overflow:hidden}
+.seg div{padding:3px 9px;font-size:11px;color:var(--ink-2);cursor:pointer}
+.seg div.on{background:var(--sel-bg);color:#cfeeeb}
+
+/* body */
+.body{flex:1;display:flex;min-height:0}
+.col{background:var(--panel);display:flex;flex-direction:column;min-height:0}
+.ph{height:24px;display:flex;align-items:center;padding:0 9px;font-size:11px;
+  color:var(--ink);background:var(--panel-2);border-bottom:1px solid var(--line);
+  letter-spacing:.02em}
+.ph em{font-style:normal;color:var(--ink-3);margin-left:auto;font-size:10px}
+.split{width:1px;background:var(--line);cursor:col-resize}
+
+/* tree */
+.tree{padding:5px 0;overflow:auto;font-size:11.5px}
+.tn{display:flex;align-items:center;gap:5px;padding:3px 8px;cursor:pointer;color:var(--ink-2);
+  white-space:nowrap}
+.tn:hover{background:var(--panel-2)}
+.tn.on{background:var(--sel-bg);color:#d6efec;box-shadow:inset 2px 0 0 var(--sel)}
+.tw{color:var(--ink-3);width:9px;font-size:9px}
+.tn i{font-style:normal;font-size:12px;color:var(--ink-3);width:13px}
+.tn.on i{color:var(--sel)}
+.tn .id{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--ink-3);padding-left:10px}
+
+/* settings */
+.set{overflow:auto;padding:2px 0 10px}
+.sg{border-bottom:1px solid var(--line)}
+.sgh{display:flex;align-items:center;gap:6px;padding:6px 9px;font-size:11px;color:var(--ink);
+  background:#262b31;cursor:pointer}
+.sgh .tw{color:var(--ink-2)}
+.sgb{padding:7px 9px 9px;display:flex;flex-direction:column;gap:6px}
+.sr{display:flex;align-items:center;gap:6px;font-size:11px}
+.sr>label{width:96px;color:var(--ink-2);text-align:right;flex:none}
+.der{font-size:10.5px;color:var(--ink-3);padding-left:102px;font-family:var(--mono)}
+.help{font-size:10.5px;color:var(--ink-3);line-height:1.45;padding:0 2px}
+.note{font-size:10.5px;color:var(--warn);line-height:1.45;background:#312a1c;
+  border-left:2px solid var(--warn);padding:5px 7px}
+.lock{color:var(--warn);font-size:10px;font-family:var(--mono)}
+.slid{flex:1;height:3px;background:var(--line-2);border-radius:2px;position:relative}
+.slid:after{content:'';position:absolute;top:-4px;width:9px;height:11px;background:var(--ink-2);
+  border-radius:1px;left:var(--p,50%)}
+
+/* view */
+.view{flex:1;display:flex;flex-direction:column;background:var(--view);min-width:0}
+.vbar{height:24px;display:flex;align-items:center;gap:8px;padding:0 8px;background:#1a1e23;
+  border-bottom:1px solid var(--line);font-size:11px;color:var(--ink-2)}
+.vbar .pill{border:1px solid var(--line-2);border-radius:2px;padding:2px 7px;font-size:10.5px}
+.vbar .pill.on{background:var(--sel-bg);border-color:var(--sel);color:#cfeeeb}
+.canvas{flex:1;position:relative;min-height:0}
+.canvas svg{position:absolute;inset:0;width:100%;height:100%}
+.legend{position:absolute;right:12px;top:12px;background:#1a1e23cc;border:1px solid var(--line);
+  border-radius:2px;padding:7px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-2)}
+.lbar{width:12px;height:96px;margin:0 auto 4px;border:1px solid var(--line-2)}
+.probe{position:absolute;left:12px;bottom:12px;background:#1a1e23cc;border:1px solid var(--line);
+  border-radius:2px;padding:6px 8px;font-family:var(--mono);font-size:10px;color:var(--ink-2);
+  line-height:1.6}
+
+/* status */
+.msg{height:22px;display:flex;align-items:center;gap:7px;padding:0 9px;background:var(--panel);
+  border-top:1px solid var(--line);font-size:11px;color:var(--ink-2)}
+.status{height:24px;display:flex;align-items:center;background:#1b1f24;
+  border-top:1px solid var(--line);font-family:var(--mono);font-size:10.5px;color:var(--ink-2)}
+.st{padding:0 11px;border-right:1px solid var(--line);display:flex;gap:6px;align-items:center;
+  height:100%}
+.st u{text-decoration:none;color:var(--ink-3);font-family:Inter,sans-serif;font-size:10px}
+.st b{font-weight:500;color:var(--ink)}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--sel)}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div class="title"><b>FlowPaint V2</b><span>rocket-nozzle-study.fpt</span><span style="margin-left:auto" class="num">wgpu · vulkan · 512 × 512</span></div>
+
+  <div class="menu"><span>File</span><span>Edit</span><span>Simulation</span><span>View</span><span>Help</span></div>
+
+  <div class="rtabs">
+    <div class="rtab" data-t="home">Home</div>
+    <div class="rtab" data-t="geom">Geometry</div>
+    <div class="rtab on" data-t="phys">Physics</div>
+    <div class="rtab" data-t="study">Study</div>
+    <div class="rtab" data-t="res">Results</div>
+  </div>
+
+  <div class="ribbon">
+
+    <div class="rpane" data-p="home">
+      <div class="grp"><div class="items">
+        <div class="bt on"><i>❚❚</i>Pause</div><div class="bt"><i>▶</i>Step</div>
+      </div><div class="cap">Run</div></div>
+      <div class="grp"><div class="items">
+        <div class="bt"><i>↺</i>Reset flow</div><div class="bt bad"><i>⌫</i>Clear all</div>
+      </div><div class="cap">Scene</div></div>
+      <div class="grp"><div class="items">
+        <div class="bt"><i>↶</i>Undo</div><div class="bt"><i>↷</i>Redo</div>
+      </div><div class="cap">History</div></div>
+      <div class="grp"><div class="items">
+        <div class="bt"><i>⤓</i>Save</div><div class="bt"><i>⧉</i>Snapshot</div>
+      </div><div class="cap">File</div></div>
+    </div>
+
+    <div class="rpane" data-p="geom">
+      <div class="grp"><div class="items">
+        <div class="bt on"><i>➚</i>Select</div><div class="bt"><i>╱</i>Line</div>
+        <div class="bt"><i>▭</i>Rect</div><div class="bt"><i>◯</i>Ellipse</div>
+        <div class="bt"><i>⌇</i>Polyline</div><div class="bt"><i>✎</i>Pencil</div>
+        <div class="bt"><i>◨</i>Eraser</div>
+      </div><div class="cap">Sketch tools</div></div>
+      <div class="grp"><div class="items">
+        <div class="bt on"><i>▬</i>Wall</div><div class="bt"><i>❋</i>Fan</div>
+        <div class="bt"><i>☁</i>Smoke</div><div class="bt"><i>⌄</i>Drain</div>
+      </div><div class="cap">Material</div></div>
+      <div class="grp"><div class="stk">
+        <div class="fld"><label>Thickness</label><span class="dv">3.10</span><span class="unit">mm</span></div>
+        <div class="ck"><span class="bx"></span>Filled rectangle or ellipse</div>
+        <div class="fld"><label>Angle snap</label><span class="dv">45.0</span><span class="unit">deg</span></div>
+      </div><div class="cap">Sketch aids</div></div>
+    </div>
+
+    <div class="rpane on" data-p="phys">
+      <div class="grp"><div class="items">
+        <div class="bt"><i>≈</i>Incompressible<br>D2Q9 LBM</div>
+        <div class="bt on"><i>◭</i>Compressible<br>Euler FV</div>
+      </div><div class="cap">Solver</div></div>
+      <div class="grp"><div class="stk" style="min-width:184px">
+        <div class="fld"><label>Inlet Mach</label><span class="dv">1.600</span><span class="unit">M</span></div>
+        <div class="der">= 548.8 m/s &nbsp;(a<sub>∞</sub> = 343.0 m/s)</div>
+        <div class="fld"><label>Fluid</label><span class="dv" style="min-width:96px;text-align:left">Wind tunnel (air)</span></div>
+      </div><div class="cap">Inlet condition</div></div>
+      <div class="grp"><div class="stk" style="min-width:172px">
+        <div class="fld"><label>Steps / frame</label><span class="dv">8</span><span class="unit"></span></div>
+        <div class="fld"><label>Sponge</label><span class="dv">0.080</span><span class="unit"></span></div>
+        <div class="ck"><span class="bx on"></span>Wind tunnel, left to right</div>
+      </div><div class="cap">Integration</div></div>
+      <div class="grp"><div class="stk" style="min-width:150px">
+        <div class="fld"><label>Domain width</label><span class="dv">1.000</span><span class="unit">m</span></div>
+        <div class="der">cell = 1.95 mm</div>
+      </div><div class="cap">Domain</div></div>
+    </div>
+
+    <div class="rpane" data-p="study">
+      <div class="grp"><div class="items">
+        <div class="bt"><i>✈</i>Airfoil…</div><div class="bt on"><i>◮</i>Nozzle…</div>
+      </div><div class="cap">Generators</div></div>
+      <div class="grp"><div class="items">
+        <div class="bt"><i>◯</i>Cylinder</div><div class="bt"><i>✈</i>Airfoil</div>
+        <div class="bt"><i>⧗</i>Venturi</div><div class="bt"><i>⌐</i>Step</div>
+        <div class="bt"><i>⁙</i>Pinball</div>
+      </div><div class="cap">Scene presets</div></div>
+      <div class="grp"><div class="stk">
+        <div class="fld"><label>Preset</label><span class="dv" style="min-width:104px;text-align:left">RS-25 bell</span></div>
+        <div class="help">Insert at cursor, then retune in the settings panel.</div>
+      </div><div class="cap">Famous engines</div></div>
+    </div>
+
+    <div class="rpane" data-p="res">
+      <div class="grp"><div class="items">
+        <div class="bt"><i>☁</i>Smoke</div><div class="bt"><i>⇢</i>Speed</div>
+        <div class="bt"><i>⟳</i>Vorticity</div><div class="bt on"><i>◐</i>Pressure</div>
+      </div><div class="cap">Field</div></div>
+      <div class="grp"><div class="stk" style="min-width:196px">
+        <div class="ck"><span class="bx on"></span>Show legend</div>
+        <div class="ck" id="dtog"><span class="bx" id="dbx"></span>Show full domain, sponge included</div>
+        <div class="fld"><label>Particles</label><span class="dv" style="min-width:70px">500 k</span></div>
+      </div><div class="cap">Display</div></div>
+      <div class="grp"><div class="stk" style="min-width:164px">
+        <div class="fld"><label>Display gain</label><span class="dv">1.00</span></div>
+        <div class="fld"><label>Smoke bright</label><span class="dv">1.00</span></div>
+        <div class="fld"><label>Particle size</label><span class="dv">1.60</span><span class="unit">px</span></div>
+      </div><div class="cap">Mapping</div></div>
+    </div>
+
+  </div>
+
+  <div class="body">
+
+    <div class="col" style="width:212px"><div class="ph">Model tree<em>6 objects</em></div>
+      <div class="tree">
+        <div class="tn" data-s="dom"><span class="tw">▾</span><i>▣</i>Domain</div>
+        <div class="tn" data-s="solv" style="padding-left:22px"><i>◭</i>Solver — Euler FV</div>
+        <div class="tn" style="padding-left:22px"><i>≡</i>Boundary conditions</div>
+        <div class="tn"><span class="tw">▾</span><i>▤</i>Geometry</div>
+        <div class="tn" data-s="noz" style="padding-left:22px"><span class="tw">▾</span><i>◮</i>Nozzle bell<span class="id">#04</span></div>
+        <div class="tn on" data-s="eng" style="padding-left:40px"><i>❋</i>Chamber engine<span class="id">#05</span></div>
+        <div class="tn" data-s="foil" style="padding-left:22px"><i>✈</i>Airfoil NACA 0012<span class="id">#01</span></div>
+        <div class="tn" data-s="wall" style="padding-left:22px"><i>▬</i>Wall<span class="id">#02</span></div>
+        <div class="tn" data-s="wall" style="padding-left:22px"><i>▬</i>Wall<span class="id">#03</span></div>
+        <div class="tn" data-s="drain" style="padding-left:22px"><i>⌄</i>Drain<span class="id">#06</span></div>
+        <div class="tn"><span class="tw">▸</span><i>◔</i>Results</div>
+      </div>
+    </div>
+
+    <div class="split"></div>
+
+    <div class="col" style="width:258px"><div class="ph">Settings<em id="sel-name">Chamber engine · #05</em></div>
+      <div class="set" id="set">
+        <div class="sg"><div class="sgh"><span class="tw">▾</span>Engine</div><div class="sgb">
+          <div class="sr"><label>Chamber drive</label><span class="dv">1.00</span></div>
+          <div class="sr"><label>Gustiness</label><span class="dv">0.00</span><div class="slid" style="--p:2%"></div></div>
+          <div class="sr"><label>Speed cap</label><span class="dv">2.40</span><span class="unit">M</span><span class="lock">bound</span></div>
+          <div class="help">The cap holds the chamber drive below the value at which the HLLC flux limiter loses stability. Increase the cap only if you also increase steps per frame.</div>
+        </div></div>
+        <div class="sg"><div class="sgh"><span class="tw">▾</span>Bell geometry</div><div class="sgb">
+          <div class="sr"><label>Throat width</label><span class="dv">14</span><span class="unit">cells</span></div>
+          <div class="sr"><label>Exit / throat</label><span class="dv">4.20</span></div>
+          <div class="sr"><label>Chamber / throat</label><span class="dv">2.60</span></div>
+          <div class="sr"><label>Converging L / t</label><span class="dv">1.10</span></div>
+          <div class="sr"><label>Bell L / t</label><span class="dv">6.40</span></div>
+          <div class="der">exit area ratio 4.20 · A* = 27.3 mm</div>
+        </div></div>
+        <div class="sg"><div class="sgh"><span class="tw">▾</span>Solver dependency</div><div class="sgb">
+          <div class="note">Chamber drive and throat geometry act only in compressible mode. In incompressible mode the bell gives a jet, not choked flow.</div>
+        </div></div>
+        <div class="sg"><div class="sgh"><span class="tw">▸</span>Transform</div></div>
+        <div class="sg"><div class="sgh"><span class="tw">▸</span>Appearance</div></div>
+      </div>
+    </div>
+
+    <div class="split"></div>
+
+    <div class="view">
+      <div class="vbar"><span class="pill on">Graphics</span><span class="pill">Probe plot</span>
+        <span style="margin-left:auto" class="num" id="vlab">pressure · full range</span></div>
+      <div class="canvas">
+        <svg viewBox="0 0 860 520" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="plume" x1="0" x2="1">
+              <stop offset="0" stop-color="#cf6f62" stop-opacity=".85"/>
+              <stop offset=".35" stop-color="#d1a24a" stop-opacity=".6"/>
+              <stop offset="1" stop-color="#3fb8ae" stop-opacity=".08"/>
+            </linearGradient>
+            <pattern id="grid" width="43" height="43" patternUnits="userSpaceOnUse">
+              <path d="M43 0H0v43" fill="none" stroke="#1c2128" stroke-width="1"/>
+            </pattern>
+          </defs>
+          <rect width="860" height="520" fill="#12151a"/>
+          <rect width="860" height="520" fill="url(#grid)"/>
+          <g id="sponge" style="display:none">
+            <rect x="0" y="0" width="860" height="46" fill="#3fb8ae" opacity=".07"/>
+            <rect x="0" y="474" width="860" height="46" fill="#3fb8ae" opacity=".07"/>
+            <rect x="0" y="46" width="46" height="428" fill="#3fb8ae" opacity=".07"/>
+            <rect x="814" y="46" width="46" height="428" fill="#3fb8ae" opacity=".07"/>
+            <rect x="46" y="46" width="768" height="428" fill="none" stroke="#3fb8ae"
+              stroke-width="1" stroke-dasharray="5 4" opacity=".8"/>
+            <text x="52" y="38" fill="#3fb8ae" font-family="JetBrains Mono" font-size="10"
+              opacity=".9">sponge margin  24 cells  ·  46.8 mm</text>
+          </g>
+          <path d="M300 250 C420 244 560 240 830 238" stroke="#3fb8ae" stroke-width="1"
+            fill="none" opacity=".5"/>
+          <path d="M300 262 C430 272 580 286 830 300" stroke="#3fb8ae" stroke-width="1"
+            fill="none" opacity=".4"/>
+          <path d="M300 238 C430 226 580 210 830 194" stroke="#3fb8ae" stroke-width="1"
+            fill="none" opacity=".4"/>
+          <path d="M296 256 L830 262 L830 232 Z" fill="url(#plume)"/>
+          <g stroke="#dfe4ea" stroke-width="1.6" fill="none" opacity=".9">
+            <path d="M190 196 L246 224 L262 240 L296 210"/>
+            <path d="M190 304 L246 276 L262 260 L296 290"/>
+            <path d="M190 196 L190 304"/>
+          </g>
+          <g stroke="#cf6f62" stroke-width="1" opacity=".75">
+            <path d="M372 214 L366 288"/><path d="M436 208 L430 294"/><path d="M508 204 L502 298"/>
+          </g>
+          <g stroke="#dfe4ea" stroke-width="1.4" fill="none" opacity=".85">
+            <path d="M150 402 C176 392 214 392 240 402 C214 410 176 410 150 402 Z"/>
+          </g>
+          <rect x="640" y="120" width="4" height="72" fill="#7f6fb0" opacity=".8"/>
+          <text x="600" y="112" fill="#9a8fc4" font-family="JetBrains Mono" font-size="10">drain #06</text>
+          <text x="188" y="188" fill="#9aa4b0" font-family="JetBrains Mono" font-size="10">nozzle #04</text>
+          <text x="148" y="428" fill="#9aa4b0" font-family="JetBrains Mono" font-size="10">airfoil #01</text>
+          <text x="352" y="206" fill="#cf6f62" font-family="JetBrains Mono" font-size="10">shock train</text>
+        </svg>
+        <div class="legend">
+          <div class="lbar" style="background:linear-gradient(to top,#2b3f8a,#3fb8ae,#e8e4d8,#d1a24a,#cf6f62)"></div>
+          <div style="text-align:center">p / p<sub>∞</sub></div>
+          <div style="display:flex;justify-content:space-between;gap:8px;padding-top:3px">
+            <span>0.18</span><span>3.42</span></div>
+        </div>
+        <div class="probe">probe 214, 256<br>p / p<sub>∞</sub> &nbsp;2.14<br>M &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;3.06</div>
+      </div>
+      <div class="msg"><span class="dot" style="background:var(--warn)"></span>
+        Choked flow at throat, station 214. Expansion fan resolved over 9 cells.</div>
+    </div>
+  </div>
+
+  <div class="status">
+    <div class="st"><u>grid</u><b>512 × 512</b></div>
+    <div class="st"><u>cell</u><b>1.95 mm</b></div>
+    <div class="st"><u>dt</u><b>4.31e-5 s</b></div>
+    <div class="st"><u>t</u><b>4.8117 s</b></div>
+    <div class="st"><u>u<sub>∞</sub></u><b>548.8 m/s</b></div>
+    <div class="st"><u>CFL</u><b>0.41</b></div>
+    <div class="st"><u>frame</u><b>16.4 ms</b></div>
+    <div class="st" style="margin-left:auto;border-right:none"><span class="dot"></span><b>stable</b></div>
+  </div>
+</div>
+
+<script>
+document.querySelectorAll('.rtab').forEach(t=>t.onclick=()=>{
+  document.querySelectorAll('.rtab').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('.rpane').forEach(x=>x.classList.remove('on'));
+  t.classList.add('on');
+  document.querySelector('[data-p="'+t.dataset.t+'"]').classList.add('on');
+});
+
+const S={
+  eng:['Chamber engine · #05',null],
+  noz:['Nozzle bell · #04',`<div class="sg"><div class="sgh"><span class="tw">▾</span>Bell geometry</div><div class="sgb">
+    <div class="sr"><label>Throat width</label><span class="dv">14</span><span class="unit">cells</span></div>
+    <div class="sr"><label>Exit / throat</label><span class="dv">4.20</span></div>
+    <div class="sr"><label>Chamber / throat</label><span class="dv">2.60</span></div>
+    <div class="der">A* = 27.3 mm · exit 114.7 mm</div></div></div>
+    <div class="sg"><div class="sgh"><span class="tw">▾</span>Wall</div><div class="sgb">
+    <div class="sr"><label>Thickness</label><span class="dv">3.10</span><span class="unit">mm</span></div>
+    <div class="sr"><label>Rotation</label><span class="dv">0.0</span><span class="unit">deg</span></div></div></div>
+    <div class="sg"><div class="sgh"><span class="tw">▸</span>Children (1)</div></div>`],
+  foil:['Airfoil NACA 0012 · #01',`<div class="sg"><div class="sgh"><span class="tw">▾</span>Section</div><div class="sgb">
+    <div class="sr"><label>Profile</label><span class="dv" style="min-width:86px;text-align:left">NACA 0012</span></div>
+    <div class="sr"><label>Chord</label><span class="dv">88.0</span><span class="unit">mm</span></div>
+    <div class="sr"><label>Angle of attack</label><span class="dv">5.0</span><span class="unit">deg</span></div>
+    <div class="der">Re = 3.21e5 · c / cell = 45.1</div></div></div>
+    <div class="sg"><div class="sgh"><span class="tw">▸</span>Transform</div></div>`],
+  wall:['Wall · #02',`<div class="sg"><div class="sgh"><span class="tw">▾</span>Wall</div><div class="sgb">
+    <div class="sr"><label>Thickness</label><span class="dv">3.10</span><span class="unit">mm</span></div>
+    <div class="sr"><label>Vertices</label><span class="dv">4</span></div>
+    <div class="ck"><span class="bx on"></span>Closed</div>
+    <div class="ck"><span class="bx"></span>Filled</div></div></div>
+    <div class="sg"><div class="sgh"><span class="tw">▸</span>Transform</div></div>`],
+  drain:['Drain · #06',`<div class="sg"><div class="sgh"><span class="tw">▾</span>Drain</div><div class="sgb">
+    <div class="sr"><label>Suction</label><span class="dv">1.00</span><div class="slid" style="--p:40%"></div></div>
+    <div class="sr"><label>Length</label><span class="dv">14.0</span><span class="unit">mm</span></div>
+    <div class="help">Drain cells hold reference density and keep local momentum.</div></div></div>`],
+  dom:['Domain',`<div class="sg"><div class="sgh"><span class="tw">▾</span>Extent</div><div class="sgb">
+    <div class="sr"><label>Width</label><span class="dv">1.000</span><span class="unit">m</span></div>
+    <div class="sr"><label>Resolution</label><span class="dv">512</span><span class="unit">cells</span></div>
+    <div class="der">cell = 1.95 mm · dt = 4.31e-5 s</div>
+    <div class="sr"><label>Sponge</label><span class="dv">0.080</span></div>
+    <div class="der">margin 24 cells · 46.8 mm</div></div></div>`],
+  solv:['Solver — Euler FV',`<div class="sg"><div class="sgh"><span class="tw">▾</span>Scheme</div><div class="sgb">
+    <div class="sr"><label>Method</label><span class="dv" style="min-width:96px;text-align:left">Euler FV</span></div>
+    <div class="sr"><label>Reconstruction</label><span class="dv" style="min-width:78px;text-align:left">MUSCL</span></div>
+    <div class="sr"><label>Flux</label><span class="dv" style="min-width:78px;text-align:left">HLLC</span></div>
+    <div class="sr"><label>gamma</label><span class="dv">1.400</span></div>
+    <div class="sr"><label>Steps / frame</label><span class="dv">8</span></div>
+    <div class="der">CFL 0.41 · inviscid, no boundary layer</div></div></div>`]
+};
+const first=document.getElementById('set').innerHTML;
+document.querySelectorAll('.tn').forEach(n=>n.onclick=()=>{
+  document.querySelectorAll('.tn').forEach(x=>x.classList.remove('on'));
+  n.classList.add('on');
+  const e=S[n.dataset.s]; if(!e)return;
+  document.getElementById('sel-name').textContent=e[0];
+  document.getElementById('set').innerHTML=e[1]===null?first:e[1];
+});
+document.getElementById('dtog').onclick=()=>{
+  const b=document.getElementById('dbx'),on=b.classList.toggle('on');
+  document.getElementById('sponge').style.display=on?'block':'none';
+  document.getElementById('vlab').textContent=on?'pressure · full domain':'pressure · full range';
+};
+</script>
+</body>
+</html>
