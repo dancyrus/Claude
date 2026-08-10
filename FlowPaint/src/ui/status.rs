@@ -18,7 +18,7 @@ impl FlowPaintApp {
                     } else {
                         format!("Re ≈ {}", self.stats_re)
                     };
-                    ui.label(format!(
+                    ui.monospace(format!(
                         "{} objects   |   canvas {} x {} (sim {} x {}, +{} margin)   |   {:.0} MLUPS   |   {}",
                         self.model.objects.len(),
                         self.stats_grid.0,

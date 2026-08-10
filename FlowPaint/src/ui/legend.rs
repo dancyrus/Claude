@@ -18,8 +18,7 @@ impl FlowPaintApp {
         let ps = self.phys_cache;
         let (_vw, vh) = self.stats_grid;
         egui::SidePanel::right("legend").default_width(200.0).show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("Flow numbers");
+            ui.label(super::theme::heading("Flow numbers"));
             egui::Grid::new("legend_grid")
                 .num_columns(2)
                 .striped(true)
@@ -79,7 +78,6 @@ impl FlowPaintApp {
                     );
                     row("Sim time", fmt_time(self.sim_time_s as f32));
                 });
-            ui.add_space(6.0);
             ui.separator();
 
             // Color-scale legend for the current view. The saturation
@@ -108,10 +106,10 @@ impl FlowPaintApp {
                     };
                     Self::colormap_bar(ui, |t| inferno_color(t));
                     ui.horizontal(|ui| {
-                        ui.small("0");
+                        super::theme::mono_small(ui, "0".into());
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| ui.small(format!("≥ {}", fmt_speed(u_sat))),
+                            |ui| super::theme::mono_small(ui, format!("≥ {}", fmt_speed(u_sat))),
                         );
                     });
                 }
@@ -125,10 +123,10 @@ impl FlowPaintApp {
                     let w_sat = inlet_render.max(0.02) / (4.0 * gain) / ps.dt;
                     Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
                     ui.horizontal(|ui| {
-                        ui.small(format!("-{:.1} 1/s", w_sat));
+                        super::theme::mono_small(ui, format!("-{:.1} 1/s", w_sat));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| ui.small(format!("+{:.1} 1/s", w_sat)),
+                            |ui| super::theme::mono_small(ui, format!("+{:.1} 1/s", w_sat)),
                         );
                     });
                     ui.small("red: clockwise · blue: counter-clockwise");
@@ -147,10 +145,10 @@ impl FlowPaintApp {
                     };
                     Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
                     ui.horizontal(|ui| {
-                        ui.small(format!("-{}", fmt_pressure(p_sat)));
+                        super::theme::mono_small(ui, format!("-{}", fmt_pressure(p_sat)));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| ui.small(format!("+{}", fmt_pressure(p_sat))),
+                            |ui| super::theme::mono_small(ui, format!("+{}", fmt_pressure(p_sat))),
                         );
                     });
                     ui.small("relative to ambient (0 = undisturbed)");

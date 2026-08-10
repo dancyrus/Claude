@@ -22,7 +22,6 @@ impl FlowPaintApp {
     }
 
     fn side_panel_contents(&mut self, ui: &mut egui::Ui, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
-        ui.add_space(4.0);
         // Everyday actions live at the top of the panel.
         ui.horizontal(|ui| {
             if ui
@@ -37,7 +36,7 @@ impl FlowPaintApp {
             if ui
                 .button(
                     egui::RichText::new("Clear all")
-                        .color(egui::Color32::from_rgb(255, 140, 120)),
+                        .color(super::theme::BAD),
                 )
                 .on_hover_text("Remove every object (undoable) and reset the flow")
                 .clicked()
@@ -67,14 +66,12 @@ impl FlowPaintApp {
             }
         });
 
-        ui.add_space(6.0);
         ui.separator();
-        ui.heading("Tools");
+        ui.label(super::theme::heading("Tools"));
         ui.horizontal_wrapped(|ui| {
             for (tool, label, key) in Tool::ALL {
                 let selected = self.tool == tool;
-                if ui
-                    .selectable_label(selected, format!("{label} ({key})"))
+                if super::theme::toggle(ui, selected, format!("{label} ({key})"))
                     .clicked()
                     && !selected
                 {
@@ -92,11 +89,10 @@ impl FlowPaintApp {
             .weak(),
         );
 
-        ui.add_space(6.0);
         ui.separator();
         if self.selected.is_some() && !matches!(self.gesture, Gesture::None) {
             // Mid-gesture: the object panel would fight the drag.
-            ui.heading("Object");
+            ui.label(super::theme::heading("Object"));
             ui.label(egui::RichText::new("(finish the gesture…)").weak());
         } else if let Some(id) = self.selected {
             self.object_panel(ui, id, cmds);
@@ -104,9 +100,8 @@ impl FlowPaintApp {
             self.defaults_panel(ui, cmds);
         }
 
-        ui.add_space(6.0);
         ui.separator();
-        ui.heading("Sketch aids");
+        ui.label(super::theme::heading("Sketch aids"));
         let ps = self.phys_cache;
         ui.horizontal(|ui| {
             ui.label("angle snap (Shift)");
@@ -133,9 +128,8 @@ impl FlowPaintApp {
             );
         }
 
-        ui.add_space(6.0);
         ui.separator();
-        ui.heading("Generators");
+        ui.label(super::theme::heading("Generators"));
         ui.horizontal(|ui| {
             if ui.button("✈ Airfoil…").clicked() {
                 self.show_airfoil_gen = true;
@@ -145,9 +139,8 @@ impl FlowPaintApp {
             }
         });
 
-        ui.add_space(6.0);
         ui.separator();
-        ui.heading("Scene presets");
+        ui.label(super::theme::heading("Scene presets"));
         ui.horizontal_wrapped(|ui| {
             for (p, short, desc) in ScenePreset::ALL {
                 if ui
@@ -166,12 +159,11 @@ impl FlowPaintApp {
             }
         });
 
-        ui.add_space(6.0);
         ui.separator();
-        ui.heading("View");
+        ui.label(super::theme::heading("View"));
         ui.horizontal_wrapped(|ui| {
             for m in RenderMode::ALL {
-                if ui.selectable_label(snap.mode == m, m.label()).clicked() {
+                if super::theme::toggle(ui, snap.mode == m, m.label()).clicked() {
                     cmds.push(Cmd::SetRenderMode(m));
                 }
             }
@@ -185,8 +177,7 @@ impl FlowPaintApp {
             .selected_text(PARTICLE_CHOICES[self.particle_index].0)
             .show_ui(ui, |ui| {
                 for (i, (label, count)) in PARTICLE_CHOICES.iter().enumerate() {
-                    if ui
-                        .selectable_label(i == self.particle_index, *label)
+                    if super::theme::toggle(ui, i == self.particle_index, *label)
                         .clicked()
                     {
                         self.particle_index = i;
@@ -195,9 +186,8 @@ impl FlowPaintApp {
                 }
             });
 
-        ui.add_space(6.0);
         ui.separator();
-        ui.heading("Physics");
+        ui.label(super::theme::heading("Physics"));
         ui.horizontal_wrapped(|ui| {
             for (m, label, tip) in [
                 (
@@ -213,8 +203,7 @@ impl FlowPaintApp {
                      expansion fans, choked nozzles (inviscid)",
                 ),
             ] {
-                if ui
-                    .selectable_label(snap.solver == m, label)
+                if super::theme::toggle(ui, snap.solver == m, label)
                     .on_hover_text(tip)
                     .clicked()
                     && snap.solver != m
@@ -232,8 +221,7 @@ impl FlowPaintApp {
             .show_ui(ui, |ui| {
                 for (i, p) in FLUID_PRESETS.iter().enumerate() {
                     let sel = self.fluid_preset_idx == Some(i);
-                    if ui
-                        .selectable_label(sel, p.name)
+                    if super::theme::toggle(ui, sel, p.name)
                         .on_hover_text(p.desc)
                         .clicked()
                     {
@@ -320,7 +308,6 @@ impl FlowPaintApp {
             cmds.push(Cmd::SetWindTunnel(tunnel));
         }
 
-        ui.add_space(6.0);
         egui::CollapsingHeader::new("Advanced").show(ui, |ui| {
             ui.add(
                 egui::Slider::new(&mut self.domain_width_m, 0.05..=100.0)

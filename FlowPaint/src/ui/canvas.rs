@@ -445,7 +445,7 @@ impl FlowPaintApp {
                 let (vw, vh) = self.stats_grid;
                 let stroke = egui::Stroke::new(
                     1.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                    super::theme::GRID_HINT,
                 );
                 let mut x = 0.0f32;
                 while x <= vw as f32 + 0.1 {
@@ -479,7 +479,7 @@ impl FlowPaintApp {
         let Some(i) = self.model.find(id) else { return };
         let obj = &self.model.objects[i];
 
-        let accent = egui::Color32::from_rgb(255, 200, 90);
+        let accent = super::theme::SEL;
         let stroke = egui::Stroke::new(1.5, accent);
 
         match &obj.shape {
@@ -537,8 +537,8 @@ impl FlowPaintApp {
         for h in obj.handles() {
             let pos = to_screen(h);
             let r = egui::Rect::from_center_size(pos, egui::vec2(7.0, 7.0));
-            painter.rect_filled(r, 1.0, egui::Color32::WHITE);
-            painter.rect_stroke(r, 1.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+            painter.rect_filled(r, 1.0, super::theme::HANDLE_FILL);
+            painter.rect_stroke(r, 1.0, egui::Stroke::new(1.0, super::theme::HANDLE_OUTLINE));
         }
 
         // Dimensions in physical units.
@@ -580,7 +580,7 @@ impl FlowPaintApp {
             pos,
             egui::Align2::LEFT_BOTTOM,
             dims,
-            egui::FontId::monospace(12.0),
+            egui::TextStyle::Monospace.resolve(ui.style()),
             accent,
         );
     }

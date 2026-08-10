@@ -17,13 +17,11 @@ impl FlowPaintApp {
                      time with a D2Q9 lattice-Boltzmann method in GPU compute \
                      shaders (wgpu: Vulkan / DX12 / Metal).",
                 );
-                ui.add_space(6.0);
                 ui.label(
                     "The Compressible solver mode switches to a finite-volume \
                      Euler method (MUSCL reconstruction + HLLC fluxes): real \
                      shocks, expansion fans and choked nozzles, inviscid.",
                 );
-                ui.add_space(6.0);
                 ui.label(
                     "Everything you sketch is a live object: select it any time \
                      to move, rotate, resize or retune its physics while the \

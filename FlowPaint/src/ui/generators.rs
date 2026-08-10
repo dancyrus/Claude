@@ -26,7 +26,6 @@ impl FlowPaintApp {
                             }
                         }
                     });
-                ui.add_space(4.0);
                 ui.add(egui::Slider::new(&mut p.camber, 0.0..=9.0).text("camber %"));
                 ui.add(
                     egui::Slider::new(&mut p.camber_pos, 15.0..=70.0)
@@ -43,11 +42,10 @@ impl FlowPaintApp {
                 } else {
                     0.0 // symmetric airfoils are NACA 00xx
                 };
-                ui.label(format!(
+                ui.monospace(format!(
                     "≈ NACA {:.0}{:.0}{:02.0} at {:.1}°",
                     p.camber, pos_digit, p.thickness, p.aoa_deg
                 ));
-                ui.add_space(6.0);
                 if ui.button("Insert into scene").clicked() {
                     let stamp = gen::generate_airfoil(p);
                     self.insert_stamp_object(stamp);
@@ -81,7 +79,6 @@ impl FlowPaintApp {
                             }
                         }
                     });
-                ui.add_space(4.0);
                 ui.add(
                     egui::Slider::new(&mut p.throat_cells, 12.0..=100.0)
                         .text("throat width (cells)"),
@@ -140,31 +137,45 @@ impl FlowPaintApp {
                         throat_lattice > 0.3,
                     )
                 };
-                ui.label(format!(
+                ui.monospace(format!(
                     "sim throat jet ≈ {}{}",
                     fmt_speed(throat_sim),
                     if capped { " (speed-capped)" } else { "" }
                 ));
                 if let Some(ve) = self.nozzle_real_ve {
                     let factor = ve / throat_sim.max(1e-6);
-                    let note = if euler_mode {
-                        format!(
-                            "real engine exhaust ≈ {:.0} m/s — in compressible \
-                             mode the bell itself accelerates the jet through \
-                             the sonic throat; expect a supersonic plume",
-                            ve
-                        )
+                    if euler_mode {
+                        super::theme::mono_small(
+                            ui,
+                            format!("real engine exhaust ≈ {:.0} m/s", ve),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "In compressible mode the bell itself accelerates \
+                                 the jet through the sonic throat; expect a \
+                                 supersonic plume.",
+                            )
+                            .small()
+                            .weak(),
+                        );
                     } else {
-                        format!(
-                            "real engine exhaust ≈ {:.0} m/s (~{:.0}× faster — the \
-                             incompressible solver caps jet speed, so this is a \
-                             scaled approximation)",
-                            ve, factor
-                        )
-                    };
-                    ui.label(egui::RichText::new(note).small().weak());
+                        super::theme::mono_small(
+                            ui,
+                            format!(
+                                "real engine exhaust ≈ {:.0} m/s (~{:.0}× faster)",
+                                ve, factor
+                            ),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "The incompressible solver caps jet speed, so \
+                                 this is a scaled approximation.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
                 }
-                ui.add_space(2.0);
                 let solver_note = if euler_mode {
                     "Compressible Euler mode: choked flow, expansion fans and \
                      shocks are real gas dynamics (inviscid)."
@@ -174,7 +185,6 @@ impl FlowPaintApp {
                      Switch Physics → Compressible for the real thing."
                 };
                 ui.label(egui::RichText::new(solver_note).small().weak());
-                ui.add_space(6.0);
                 if ui.button("Insert into scene").clicked() {
                     let stamp = gen::generate_nozzle(p);
                     self.insert_stamp_object(stamp);

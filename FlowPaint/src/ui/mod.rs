@@ -9,6 +9,7 @@ mod legend;
 mod menu;
 mod panels;
 mod status;
+pub(super) mod theme;
 mod windows;
 
 use super::{Cmd, FlowPaintApp, UiSnapshot};

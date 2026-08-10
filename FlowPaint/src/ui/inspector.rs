@@ -26,7 +26,7 @@ impl FlowPaintApp {
             Shape::Ellipse { .. } => "Ellipse",
             Shape::Stamp { .. } => "Generated part",
         };
-        ui.heading(format!("Object — {kind}"));
+        ui.label(super::theme::heading(format!("Object — {kind}")));
 
         let is_stamp = matches!(obj.shape, Shape::Stamp { .. });
         let can_fill = matches!(obj.shape, Shape::Rect { .. } | Shape::Ellipse { .. });
@@ -41,8 +41,7 @@ impl FlowPaintApp {
             ];
             ui.horizontal_wrapped(|ui| {
                 for (m, tip) in mats {
-                    let resp = ui
-                        .selectable_label(obj.material == m, m.label())
+                    let resp = super::theme::toggle(ui, obj.material == m, m.label())
                         .on_hover_text(tip);
                     if resp.clicked() && obj.material != m {
                         obj.material = m;
@@ -75,7 +74,6 @@ impl FlowPaintApp {
             _ => false,
         };
         if obj.material == ObjMaterial::Fan || stamp_has_fans {
-            ui.add_space(2.0);
             changed |= ui
                 .add(egui::Slider::new(&mut obj.fan_mult, 0.2..=2.0).text("fan speed ×"))
                 .on_hover_text("Multiplier on the global flow speed")
@@ -125,7 +123,6 @@ impl FlowPaintApp {
             });
         }
 
-        ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.label("Rotate");
             for (label, da) in [("-15°", -15.0f32), ("+15°", 15.0), ("+90°", 90.0)] {
@@ -145,7 +142,6 @@ impl FlowPaintApp {
             }
         });
 
-        ui.add_space(2.0);
         ui.horizontal(|ui| {
             if ui.button("Duplicate (Ctrl+D)").clicked() {
                 self.duplicate_selected();
@@ -179,7 +175,7 @@ impl FlowPaintApp {
 
     /// Defaults applied to newly drawn objects.
     pub(in crate::app) fn defaults_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
-        ui.heading("New objects");
+        ui.label(super::theme::heading("New objects"));
         let mats: [(ObjMaterial, &str); 4] = [
             (ObjMaterial::Wall, "Solid, no-slip"),
             (ObjMaterial::Fan, "Blows along the shape"),
@@ -188,8 +184,7 @@ impl FlowPaintApp {
         ];
         ui.horizontal_wrapped(|ui| {
             for (m, tip) in mats {
-                let resp = ui
-                    .selectable_label(self.def_material == m, m.label())
+                let resp = super::theme::toggle(ui, self.def_material == m, m.label())
                     .on_hover_text(tip);
                 if resp.clicked() {
                     self.def_material = m;

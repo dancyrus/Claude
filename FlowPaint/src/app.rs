@@ -421,6 +421,7 @@ const BENCH_FRAMES: usize = 300;
 
 impl FlowPaintApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        ui::theme::apply(&cc.egui_ctx);
         let rs = cc
             .wgpu_render_state
             .as_ref()
