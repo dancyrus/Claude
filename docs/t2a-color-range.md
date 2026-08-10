@@ -5,6 +5,13 @@ implemented (the shader edit was approved: `render.wgsl` flags bit 1,
 no uniform added or reordered). Asymmetric manual min/max remains
 deliberately unimplemented (see the report section at the bottom).
 
+**Track-merge update:** the two deferred items below are done. The
+`sim::color_ranges()` Mutex is gone — the state is `Settings.ranges`,
+edited through `Cmd::SetRangeMode`/`SetRangeMax`/`SetColorMap`, with
+the per-frame twin sync running in `update` before the panels draw.
+Locked ranges and colormap picks persist in scene format v7. The
+"How it works" sections below describe the track-era plumbing.
+
 ## What exists
 
 Per render mode (Speed, Vorticity, Pressure), the color-scale range is

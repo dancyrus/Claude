@@ -31,17 +31,19 @@ Per-unit decisions later units must not re-derive live in
   unimplemented (needs a per-mode offset in `render.wgsl`).
 - **T2-B (probes + Re input): done**, branch
   `claude/flowpaint-v4.1-t2b-probes` (off the U1 tip).
-- Scene format: **v6** current, loads v3+ (v3 lacks solver fields;
+- Scene format: **v7** current, loads v3+ (v3 lacks solver fields;
   v4/v5 share a layout; v6 appends per-object `locked`/`hidden`, so
-  pre-v6 objects decode via the `SketchObjectV5` mirror — see
-  `SceneV3`/`SceneV4`/`SceneV6` in `app.rs`). **Version-number
-  correction**: plan v4.1's U2 text says "scene format to v5", but v5
-  was already current before U2 — U2 went to **v6**. U3 and T2-C: the
-  next bump is **v7**; do not repeat the plan's off-by-one.
-- T2-A's locked color ranges and colormap picks live behind a Mutex in
-  `sim.rs` (app.rs was frozen while both tracks ran) and are NOT in
-  scene v6. Folding them into `Settings` + `Cmd` and persisting them
-  is a track-merge task; U5 depends on it.
+  pre-v6 objects decode via the `SketchObjectV5` mirror; v7 appends
+  the color ranges + colormap picks, defaulted for older files — see
+  `SceneV3`/`SceneV4`/`SceneV6`/`SceneV7` in `app.rs`). U3 and T2-C:
+  the next bump is **v8** (plan v4.1's version numbers run one low —
+  do not repeat the off-by-one).
+- The track merge folded T2-A's color-range state out of the sim.rs
+  Mutex into `Settings.ranges` + `Cmd`, and persists it in scene v7
+  (U5's PNG export needs a locked range to survive a save). T2-B's
+  probe store still uses the track-era `sim::probes()` Mutex — folding
+  it and unifying the plot/legend conversions in `ui/units.rs` are
+  open follow-ups (see `docs/unit-decisions.md`).
 
 ## Hard rules
 
@@ -65,7 +67,7 @@ Per-unit decisions later units must not re-derive live in
 
 ## Structure
 
-- `src/app.rs` — state, `Cmd` dispatch, keyboard, scene IO (v3–v6
+- `src/app.rs` — state, `Cmd` dispatch, keyboard, scene IO (v3–v7
   bincode, version peek on first 4 LE bytes), `--bench` harness,
   `ViewRequest` + view state fields, selection set + clipboard.
 - `src/ui/` — one file per panel; child of `app` via `#[path]` so panel

@@ -194,10 +194,86 @@ struct SceneV6 {
     fluid_a: f32,
 }
 
+/// One render mode's persisted color scale (v7): everything needed to
+/// restore a pinned range and colormap pick. `sat_render` is not saved —
+/// the per-frame sync re-derives it from the physical value.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct SceneRange {
+    /// 0 = Auto, 1 = Locked, 2 = Manual (RangeMode).
+    mode: u32,
+    /// Saturation point in physical units (m/s, 1/s, Pa).
+    sat_phys: f32,
+    /// 0 = Inferno, 1 = Coolwarm (ColorMap).
+    map: u32,
+}
+
+/// Scene file (version 7): the v6 layout plus the per-render-mode color
+/// range and colormap picks (T2-A, persisted at the track merge — U5's
+/// PNG export needs a locked range to survive a save/load).
+#[derive(Serialize, Deserialize)]
+struct SceneV7 {
+    version: u32,
+    objects: Vec<SketchObject>,
+    wind_tunnel: bool,
+    flow_speed: f32,
+    viscosity: f32,
+    steps_per_frame: u32,
+    domain_width_m: f32,
+    fluid_nu: f32,
+    fluid_rho: f32,
+    ref_width: u32,
+    /// 0 = LBM (incompressible), 1 = Euler (compressible).
+    solver: u32,
+    mach: f32,
+    fluid_a: f32,
+    /// Indexed by `RenderMode as usize`; the Dye entry is unused.
+    ranges: [SceneRange; 4],
+}
+
+impl SceneV7 {
+    /// A pre-v7 scene: same settings, default (Auto) color ranges.
+    fn from_v6(s: SceneV6) -> Self {
+        SceneV7 {
+            version: s.version,
+            objects: s.objects,
+            wind_tunnel: s.wind_tunnel,
+            flow_speed: s.flow_speed,
+            viscosity: s.viscosity,
+            steps_per_frame: s.steps_per_frame,
+            domain_width_m: s.domain_width_m,
+            fluid_nu: s.fluid_nu,
+            fluid_rho: s.fluid_rho,
+            ref_width: s.ref_width,
+            solver: s.solver,
+            mach: s.mach,
+            fluid_a: s.fluid_a,
+            ranges: crate::sim::FIELD_RANGE_DEFAULTS.map(SceneRange::from),
+        }
+    }
+}
+
+impl From<FieldRange> for SceneRange {
+    fn from(fr: FieldRange) -> Self {
+        SceneRange {
+            mode: match fr.mode {
+                RangeMode::Auto => 0,
+                RangeMode::Locked => 1,
+                RangeMode::Manual => 2,
+            },
+            sat_phys: fr.sat_phys,
+            map: match fr.map {
+                ColorMap::Inferno => 0,
+                ColorMap::Coolwarm => 1,
+            },
+        }
+    }
+}
+
 const SCENE_V3: u32 = 3;
 const SCENE_V4: u32 = 4;
 const SCENE_V5: u32 = 5;
 const SCENE_V6: u32 = 6;
+const SCENE_V7: u32 = 7;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -1574,8 +1650,8 @@ impl FlowPaintApp {
         // Commit any in-flight gesture so the file doesn't capture a
         // polyline's cursor-tracking rubber vertex.
         self.finish_gesture();
-        let scene = SceneV6 {
-            version: SCENE_V6,
+        let scene = SceneV7 {
+            version: SCENE_V7,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -1591,6 +1667,7 @@ impl FlowPaintApp {
             },
             mach: snap.mach,
             fluid_a: self.fluid_a,
+            ranges: snap.ranges.map(SceneRange::from),
         };
         match bincode::serialize(&scene) {
             Ok(bytes) => {
@@ -1616,7 +1693,7 @@ impl FlowPaintApp {
         } else {
             0
         };
-        if !(SCENE_V3..=SCENE_V6).contains(&version) {
+        if !(SCENE_V3..=SCENE_V7).contains(&version) {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
@@ -1624,40 +1701,47 @@ impl FlowPaintApp {
         }
         // A v3 file is a v4 file without the solver fields; v5 shares
         // the v4 layout; v6 appends per-object lock/hide, so pre-v6
-        // objects decode via the SketchObjectV5 mirror and convert.
-        let decoded = if version >= SCENE_V6 {
-            bincode::deserialize::<SceneV6>(&bytes)
+        // objects decode via the SketchObjectV5 mirror and convert; v7
+        // appends the color ranges, defaulted for anything older.
+        let decoded = if version >= SCENE_V7 {
+            bincode::deserialize::<SceneV7>(&bytes)
+        } else if version >= SCENE_V6 {
+            bincode::deserialize::<SceneV6>(&bytes).map(SceneV7::from_v6)
         } else if version >= SCENE_V4 {
-            bincode::deserialize::<SceneV4>(&bytes).map(|s| SceneV6 {
-                version: s.version,
-                objects: s.objects.into_iter().map(Into::into).collect(),
-                wind_tunnel: s.wind_tunnel,
-                flow_speed: s.flow_speed,
-                viscosity: s.viscosity,
-                steps_per_frame: s.steps_per_frame,
-                domain_width_m: s.domain_width_m,
-                fluid_nu: s.fluid_nu,
-                fluid_rho: s.fluid_rho,
-                ref_width: s.ref_width,
-                solver: s.solver,
-                mach: s.mach,
-                fluid_a: s.fluid_a,
+            bincode::deserialize::<SceneV4>(&bytes).map(|s| {
+                SceneV7::from_v6(SceneV6 {
+                    version: s.version,
+                    objects: s.objects.into_iter().map(Into::into).collect(),
+                    wind_tunnel: s.wind_tunnel,
+                    flow_speed: s.flow_speed,
+                    viscosity: s.viscosity,
+                    steps_per_frame: s.steps_per_frame,
+                    domain_width_m: s.domain_width_m,
+                    fluid_nu: s.fluid_nu,
+                    fluid_rho: s.fluid_rho,
+                    ref_width: s.ref_width,
+                    solver: s.solver,
+                    mach: s.mach,
+                    fluid_a: s.fluid_a,
+                })
             })
         } else {
-            bincode::deserialize::<SceneV3>(&bytes).map(|s| SceneV6 {
-                version: s.version,
-                objects: s.objects.into_iter().map(Into::into).collect(),
-                wind_tunnel: s.wind_tunnel,
-                flow_speed: s.flow_speed,
-                viscosity: s.viscosity,
-                steps_per_frame: s.steps_per_frame,
-                domain_width_m: s.domain_width_m,
-                fluid_nu: s.fluid_nu,
-                fluid_rho: s.fluid_rho,
-                ref_width: s.ref_width,
-                solver: 0,
-                mach: 1.6,
-                fluid_a: 343.0,
+            bincode::deserialize::<SceneV3>(&bytes).map(|s| {
+                SceneV7::from_v6(SceneV6 {
+                    version: s.version,
+                    objects: s.objects.into_iter().map(Into::into).collect(),
+                    wind_tunnel: s.wind_tunnel,
+                    flow_speed: s.flow_speed,
+                    viscosity: s.viscosity,
+                    steps_per_frame: s.steps_per_frame,
+                    domain_width_m: s.domain_width_m,
+                    fluid_nu: s.fluid_nu,
+                    fluid_rho: s.fluid_rho,
+                    ref_width: s.ref_width,
+                    solver: 0,
+                    mach: 1.6,
+                    fluid_a: 343.0,
+                })
             })
         };
         match decoded {
@@ -1717,6 +1801,24 @@ impl FlowPaintApp {
                 }));
                 cmds.push(Cmd::SetMach(sane_f32(scene.mach, 0.3, 3.0, 1.6)));
                 cmds.push(Cmd::SetWindTunnel(scene.wind_tunnel));
+                // Color ranges (v7; defaults for older files). Dye has
+                // no scale, so its entry stays untouched.
+                for mode in [RenderMode::Speed, RenderMode::Vorticity, RenderMode::Pressure] {
+                    let r = scene.ranges[mode as usize];
+                    cmds.push(Cmd::SetRangeMode(
+                        mode,
+                        match r.mode {
+                            1 => RangeMode::Locked,
+                            2 => RangeMode::Manual,
+                            _ => RangeMode::Auto,
+                        },
+                    ));
+                    cmds.push(Cmd::SetRangeMax(mode, sane_f32(r.sat_phys, 1e-6, 1e9, 1.0)));
+                    cmds.push(Cmd::SetColorMap(
+                        mode,
+                        if r.map == 1 { ColorMap::Coolwarm } else { ColorMap::Inferno },
+                    ));
+                }
                 cmds.push(Cmd::ResetFlow);
                 self.status = if dropped > 0 {
                     format!(
@@ -1860,5 +1962,68 @@ mod scene_tests {
         assert_eq!(version, SCENE_V6);
         let back = bincode::deserialize::<SceneV6>(&bytes).unwrap();
         assert!(back.objects[0].locked && back.objects[0].hidden);
+    }
+
+    /// v7 round-trips the color ranges: a locked physical value and a
+    /// non-default colormap pick survive save/load (U5 depends on this).
+    #[test]
+    fn v7_roundtrip_persists_ranges() {
+        let mut ranges = crate::sim::FIELD_RANGE_DEFAULTS.map(SceneRange::from);
+        ranges[RenderMode::Speed as usize] =
+            SceneRange { mode: 1, sat_phys: 12.5, map: 1 };
+        let scene = SceneV7 {
+            version: SCENE_V7,
+            objects: vec![v5_obj(4).into()],
+            wind_tunnel: true,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 0,
+            mach: 1.6,
+            fluid_a: 343.0,
+            ranges,
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(version, SCENE_V7);
+        let back = bincode::deserialize::<SceneV7>(&bytes).unwrap();
+        let r = back.ranges[RenderMode::Speed as usize];
+        assert_eq!(r.mode, 1);
+        assert_eq!(r.sat_phys, 12.5);
+        assert_eq!(r.map, 1);
+    }
+
+    /// A v6 file (written by the U2-era code) still decodes through the
+    /// v6 arm and comes out with default (Auto) color ranges.
+    #[test]
+    fn v6_bytes_decode_with_default_ranges() {
+        let scene = SceneV6 {
+            version: SCENE_V6,
+            objects: vec![v5_obj(9).into()],
+            wind_tunnel: true,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 0,
+            mach: 1.6,
+            fluid_a: 343.0,
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        let back = SceneV7::from_v6(bincode::deserialize::<SceneV6>(&bytes).unwrap());
+        for (i, r) in back.ranges.iter().enumerate() {
+            assert_eq!(r.mode, 0, "range {i} should load as Auto");
+        }
+        // Default map bindings: Speed inferno, Vorticity/Pressure coolwarm.
+        assert_eq!(back.ranges[RenderMode::Speed as usize].map, 0);
+        assert_eq!(back.ranges[RenderMode::Vorticity as usize].map, 1);
+        assert_eq!(back.ranges[RenderMode::Pressure as usize].map, 1);
     }
 }
