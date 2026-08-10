@@ -7,7 +7,7 @@
 use crate::app::{FlowPaintApp};
 use eframe::egui;
 
-use super::units::{fmt_cfl, fmt_len, fmt_speed, fmt_time};
+use super::units::{fmt_cfl, fmt_len, fmt_speed, fmt_time, fmt_zoom};
 
 impl FlowPaintApp {
     pub(in crate::app) fn status_bar(&mut self, ctx: &egui::Context) {
@@ -37,6 +37,7 @@ impl FlowPaintApp {
                     format!("cell {}", fmt_len(ps.dx)),
                     format!("dt {}", fmt_time(ps.dt)),
                     format!("t {}", fmt_time(self.sim_time_s as f32)),
+                    format!("zoom {}", fmt_zoom(self.view_px_per_cell)),
                     format!("u∞ {}", fmt_speed(self.stats_u_inf)),
                     format!("CFL (inlet) {}", fmt_cfl(self.stats_cfl)),
                     format!("{} obj", self.model.objects.len()),

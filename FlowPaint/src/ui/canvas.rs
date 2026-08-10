@@ -1,12 +1,22 @@
 //! The graphics window: the wgpu paint callback, the pointer gesture
 //! state machine, and the selection/snap overlays.
 
-use crate::app::{Cmd, FlowPaintApp, Gesture, Tool};
+use crate::app::{Cmd, FlowPaintApp, Gesture, Tool, ViewRequest};
 use crate::model::Shape;
 use crate::sim::{GpuSim, ViewportMapping};
 use eframe::egui;
 
 use super::units::{fmt_angle, fmt_len};
+
+// Free-zoom bounds: view_zoom is a multiplier over the letterbox fit
+// scale, additionally capped in absolute framebuffer px per cell; the
+// pan clamp keeps at least this much grid on screen in each axis.
+const ZOOM_MIN: f32 = 0.125;
+const ZOOM_MAX: f32 = 64.0;
+const MAX_PX_PER_CELL: f32 = 512.0;
+const MIN_VISIBLE_PX: f32 = 64.0;
+/// Wheel-zoom rate per scroll point (factor = exp(rate * delta)).
+const ZOOM_WHEEL_RATE: f32 = 0.005;
 
 impl FlowPaintApp {
     pub(in crate::app) fn canvas(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
@@ -31,11 +41,22 @@ impl FlowPaintApp {
                 let y0 = (rect.min.y * ppp).round();
                 let x1 = (rect.max.x * ppp).round();
                 let y1 = (rect.max.y * ppp).round();
-                let mapping =
+                let fit =
                     ViewportMapping::fit([x0, y0], [x1 - x0, y1 - y0], gw, gh);
+
+                // Zoom and pan are a view transform on px_per_cell and
+                // lb_origin only — grid, margin and physics untouched.
+                self.apply_view_request(&fit);
+                if self.view_fit {
+                    self.view_zoom = 1.0;
+                    self.view_center = [gw as f32 * 0.5, gh as f32 * 0.5];
+                }
+                let pan_mode = self.view_nav(ctx, &response, &fit, ppp);
+                let mapping = self.view_mapping(&fit, gw, gh);
+                self.view_px_per_cell = mapping.px_per_cell;
                 cmds.push(Cmd::SetMapping(mapping));
 
-                self.canvas_interaction(&response, mapping, ppp);
+                self.canvas_interaction(&response, mapping, ppp, pan_mode);
 
                 // The simulation paints itself via the wgpu callback.
                 ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -44,7 +65,197 @@ impl FlowPaintApp {
                 ));
 
                 self.canvas_overlays(ui, mapping, ppp);
+                self.scale_bar(ui, rect, mapping, ppp);
             });
+    }
+
+    /// Clamp the zoom multiplier: the [ZOOM_MIN, ZOOM_MAX] range, and an
+    /// absolute cap of MAX_PX_PER_CELL framebuffer px per cell.
+    fn clamp_zoom(&self, fit_scale: f32, z: f32) -> f32 {
+        let max_abs = MAX_PX_PER_CELL / fit_scale.max(1e-6);
+        z.clamp(ZOOM_MIN, ZOOM_MAX.min(max_abs).max(ZOOM_MIN))
+    }
+
+    /// Consume a pending Fit / OneToOne / Selection request (ribbon
+    /// buttons and Ctrl+0/1/2 set it; only the canvas knows the viewport).
+    fn apply_view_request(&mut self, fit: &ViewportMapping) {
+        let Some(req) = self.view_request.take() else { return };
+        match req {
+            ViewRequest::Fit => self.view_fit = true,
+            ViewRequest::OneToOne => {
+                // Exactly one framebuffer px per cell (up to the clamps).
+                self.view_zoom =
+                    self.clamp_zoom(fit.px_per_cell, 1.0 / fit.px_per_cell.max(1e-6));
+                self.view_fit = false;
+            }
+            ViewRequest::Selection => {
+                let Some(id) = self.selected else { return };
+                let Some(i) = self.model.find(id) else { return };
+                let b = self.model.objects[i].bounds();
+                let bw = (b.x1 - b.x0).max(1) as f32;
+                let bh = (b.y1 - b.y0).max(1) as f32;
+                // ~10% padding on each side of the object's bounds.
+                let s = (fit.vp_size[0] / (bw * 1.2))
+                    .min(fit.vp_size[1] / (bh * 1.2));
+                self.view_zoom =
+                    self.clamp_zoom(fit.px_per_cell, s / fit.px_per_cell.max(1e-6));
+                self.view_center = [
+                    (b.x0 + b.x1) as f32 * 0.5,
+                    (b.y0 + b.y1) as f32 * 0.5,
+                ];
+                self.view_fit = false;
+            }
+        }
+    }
+
+    /// Wheel/pinch zoom at the cursor plus middle- or space-drag pan.
+    /// Returns true while Space claims the primary button for panning,
+    /// so canvas_interaction must not draw or select with it.
+    fn view_nav(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        fit: &ViewportMapping,
+        ppp: f32,
+    ) -> bool {
+        let vc = [
+            fit.vp_origin[0] + fit.vp_size[0] * 0.5,
+            fit.vp_origin[1] + fit.vp_size[1] * 0.5,
+        ];
+
+        // Zoom, only with the pointer over the canvas. Wheel comes via
+        // smooth_scroll_delta, pinch (and Ctrl+wheel, which egui folds
+        // into it) via zoom_delta — the two sources are disjoint, so
+        // multiplying them never double-counts an event.
+        if let Some(pos) = response.hover_pos() {
+            let (scroll, pinch) =
+                ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            let factor = (scroll * ZOOM_WHEEL_RATE).exp() * pinch;
+            if (factor - 1.0).abs() > 1e-4 {
+                let z0 = self.view_zoom;
+                let z1 = self.clamp_zoom(fit.px_per_cell, z0 * factor);
+                if z1 != z0 {
+                    let s0 = fit.px_per_cell * z0;
+                    let s1 = fit.px_per_cell * z1;
+                    let p = [pos.x * ppp, pos.y * ppp];
+                    // Keep the cell under the cursor under the cursor:
+                    // c = center + (p - vc)/s is invariant across s0→s1.
+                    self.view_center[0] += (p[0] - vc[0]) * (1.0 / s0 - 1.0 / s1);
+                    self.view_center[1] += (p[1] - vc[1]) * (1.0 / s0 - 1.0 / s1);
+                    self.view_zoom = z1;
+                    self.view_fit = false;
+                }
+            }
+        }
+
+        // Pan: middle-drag, or primary-drag while Space is held (the
+        // trackpad alternative). While Space is down it owns the primary
+        // button on the canvas outright.
+        let space_down = ctx.input(|i| i.key_down(egui::Key::Space));
+        let mid_pan = response.dragged_by(egui::PointerButton::Middle);
+        let space_pan =
+            space_down && response.dragged_by(egui::PointerButton::Primary);
+        if mid_pan || space_pan {
+            let d = response.drag_delta();
+            let s = (fit.px_per_cell * self.view_zoom).max(1e-6);
+            if d != egui::Vec2::ZERO {
+                self.view_center[0] -= d.x * ppp / s;
+                self.view_center[1] -= d.y * ppp / s;
+                self.view_fit = false;
+                if space_pan {
+                    self.space_pan_suppress = true;
+                }
+            }
+        }
+        space_down
+    }
+
+    /// Build the frame's mapping from the fit scale and the view state,
+    /// clamping the pan so at least MIN_VISIBLE_PX of grid stays on
+    /// screen in each axis (the domain can never leave the screen).
+    fn view_mapping(
+        &mut self,
+        fit: &ViewportMapping,
+        gw: usize,
+        gh: usize,
+    ) -> ViewportMapping {
+        self.view_zoom = self.clamp_zoom(fit.px_per_cell, self.view_zoom);
+        let s = fit.px_per_cell * self.view_zoom;
+        let vc = [
+            fit.vp_origin[0] + fit.vp_size[0] * 0.5,
+            fit.vp_origin[1] + fit.vp_size[1] * 0.5,
+        ];
+        let grid = [gw as f32, gh as f32];
+        for a in 0..2 {
+            let vp_lo = fit.vp_origin[a];
+            let vp_hi = fit.vp_origin[a] + fit.vp_size[a];
+            // lb <= vp_hi - MIN and lb + grid*s >= vp_lo + MIN, with
+            // lb = vc - center*s, solved for center.
+            let lo = (vc[a] - vp_hi + MIN_VISIBLE_PX) / s;
+            let hi = (vc[a] - vp_lo - MIN_VISIBLE_PX) / s + grid[a];
+            self.view_center[a] = if lo <= hi {
+                self.view_center[a].clamp(lo, hi)
+            } else {
+                // Viewport narrower than 2*MIN_VISIBLE_PX: pin to centre.
+                (lo + hi) * 0.5
+            };
+        }
+        ViewportMapping {
+            vp_origin: fit.vp_origin,
+            vp_size: fit.vp_size,
+            lb_origin: [
+                vc[0] - self.view_center[0] * s,
+                vc[1] - self.view_center[1] * s,
+            ],
+            px_per_cell: s,
+        }
+    }
+
+    /// Persistent scale bar, bottom-left: a round physical length (1-2-5
+    /// progression) whose on-screen width lands near 100 pt, with end
+    /// ticks and a centred label. Updates live with the zoom.
+    fn scale_bar(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        mapping: ViewportMapping,
+        ppp: f32,
+    ) {
+        const TARGET_PT: f32 = 100.0; // nearest 1-2-5 lands in ~63–158 pt
+        const MARGIN_PT: f32 = 14.0;
+        const TICK_PT: f32 = 5.0;
+        let ps = self.phys_cache;
+        let pt_per_m = mapping.px_per_cell / (ppp * ps.dx.max(1e-12));
+        if !pt_per_m.is_finite() || pt_per_m <= 0.0 {
+            return;
+        }
+        // Nearest 1-2-5 length in log space to the target width.
+        let target_m = TARGET_PT / pt_per_m;
+        let decade = 10f32.powf(target_m.log10().floor());
+        let mut len_m = decade;
+        let mut best = f32::INFINITY;
+        for m in [1.0, 2.0, 5.0, 10.0] {
+            let err = ((m * decade) / target_m).ln().abs();
+            if err < best {
+                best = err;
+                len_m = m * decade;
+            }
+        }
+        let w_pt = len_m * pt_per_m;
+        let a = rect.left_bottom() + egui::vec2(MARGIN_PT, -MARGIN_PT);
+        let b = a + egui::vec2(w_pt, 0.0);
+        let stroke = egui::Stroke::new(1.5, super::theme::SCALE_BAR);
+        let painter = ui.painter();
+        painter.line_segment([a, b], stroke);
+        painter.line_segment([a + egui::vec2(0.0, -TICK_PT), a], stroke);
+        painter.line_segment([b + egui::vec2(0.0, -TICK_PT), b], stroke);
+        painter.text(
+            egui::pos2((a.x + b.x) * 0.5, a.y - TICK_PT - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            fmt_len(ps.len_m(len_m / ps.dx.max(1e-12))),
+            egui::TextStyle::Monospace.resolve(ui.style()),
+            super::theme::SCALE_BAR,
+        );
     }
 
     pub(in crate::app) fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -94,6 +305,7 @@ impl FlowPaintApp {
         response: &egui::Response,
         mapping: ViewportMapping,
         ppp: f32,
+        pan_mode: bool,
     ) {
         let to_cell = |pos: egui::Pos2| -> [f32; 2] {
             mapping.px_to_cell([pos.x * ppp, pos.y * ppp])
@@ -101,10 +313,12 @@ impl FlowPaintApp {
         self.hover_cell = response.hover_pos().map(to_cell);
 
         let px_per_cell = mapping.px_per_cell.max(1e-3);
-        // Pick thresholds in screen space so they feel the same at every
-        // zoom, with a floor in cells for very zoomed-in grids.
-        let handle_r = (8.0 * ppp / px_per_cell).max(2.0);
-        let click_slop = (4.0 * ppp / px_per_cell).max(2.0);
+        // Pick thresholds purely in screen space (converted to cells for
+        // the model's hit tests): a constant pick radius in screen pt at
+        // every zoom. A floor in cells would balloon into a huge grab
+        // radius at high zoom (2 cells at 64 px/cell is 128 px).
+        let handle_r = 8.0 * ppp / px_per_cell;
+        let click_slop = 4.0 * ppp / px_per_cell;
         let (shift, alt) =
             response.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
         let pointer = response.interact_pointer_pos();
@@ -155,7 +369,9 @@ impl FlowPaintApp {
             }
         }
 
-        if response.drag_started_by(egui::PointerButton::Primary) {
+        // While Space is held the primary button pans (view_nav); it must
+        // not also draw or select.
+        if !pan_mode && response.drag_started_by(egui::PointerButton::Primary) {
             if let Some(pos) = pointer {
                 let raw = to_cell(pos);
                 match self.tool {
@@ -219,7 +435,7 @@ impl FlowPaintApp {
 
         // --- Drag updates ---------------------------------------------
 
-        if response.dragged_by(egui::PointerButton::Primary) {
+        if !pan_mode && response.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = pointer {
                 let raw = to_cell(pos);
                 if let Gesture::DrawShape { id, anchor } = &self.gesture {
@@ -449,18 +665,34 @@ impl FlowPaintApp {
                     1.0,
                     super::theme::GRID_HINT,
                 );
-                let mut x = 0.0f32;
-                while x <= vw as f32 + 0.1 {
+                // Clip the loops to the visible cell range: at high zoom
+                // the grid extends far off-screen, and painting thousands
+                // of clipped-away segments is pure waste.
+                let clip = ui.clip_rect();
+                let cell_lo = mapping.px_to_cell([
+                    clip.min.x * ppp,
+                    clip.min.y * ppp,
+                ]);
+                let cell_hi = mapping.px_to_cell([
+                    clip.max.x * ppp,
+                    clip.max.y * ppp,
+                ]);
+                let x_lo = cell_lo[0].max(0.0);
+                let x_hi = cell_hi[0].min(vw as f32);
+                let y_lo = cell_lo[1].max(0.0);
+                let y_hi = cell_hi[1].min(vh as f32);
+                let mut x = (x_lo / s).ceil() * s;
+                while x <= x_hi + 0.1 {
                     painter.line_segment(
-                        [to_screen([x, 0.0]), to_screen([x, vh as f32])],
+                        [to_screen([x, y_lo]), to_screen([x, y_hi])],
                         stroke,
                     );
                     x += s;
                 }
-                let mut y = 0.0f32;
-                while y <= vh as f32 + 0.1 {
+                let mut y = (y_lo / s).ceil() * s;
+                while y <= y_hi + 0.1 {
                     painter.line_segment(
-                        [to_screen([0.0, y]), to_screen([vw as f32, y])],
+                        [to_screen([x_lo, y]), to_screen([x_hi, y])],
                         stroke,
                     );
                     y += s;

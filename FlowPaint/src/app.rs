@@ -386,6 +386,21 @@ pub struct FlowPaintApp {
     /// Set by ribbon buttons / shortcuts, consumed by the canvas next
     /// frame (the canvas knows the viewport geometry).
     view_request: Option<ViewRequest>,
+    // Free view transform — a pure remap of px_per_cell/lb_origin. It
+    // must never touch the grid, the margin, domain_width_m or
+    // phys_cache; the simulation itself is zoom-agnostic.
+    /// Zoom multiplier over the letterbox fit scale (1.0 = fit).
+    view_zoom: f32,
+    /// Grid-cell coordinate under the viewport centre.
+    view_center: [f32; 2],
+    /// While true the view re-fits on window resize; any manual zoom or
+    /// pan clears it.
+    view_fit: bool,
+    /// px_per_cell of the mapping last pushed (status zoom readout).
+    view_px_per_cell: f32,
+    /// A space-held pan happened during the current Space hold, so the
+    /// key release must not toggle pause.
+    space_pan_suppress: bool,
     // Stats.
     stats_grid: (usize, usize),
     stats_full: (usize, usize),
@@ -480,6 +495,11 @@ impl FlowPaintApp {
             ),
             hover_cell: None,
             view_request: None,
+            view_zoom: 1.0,
+            view_center: [vw as f32 * 0.5, vh as f32 * 0.5],
+            view_fit: true,
+            view_px_per_cell: 1.0,
+            space_pan_suppress: false,
             stats_grid: (vw, vh),
             stats_full: (0, 0),
             stats_margin: 0,
@@ -689,7 +709,13 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             sim.set_resolution(i);
             let new_w = sim.grid_size().0;
             if new_w != old_w && old_w > 0 {
-                app.model.rescale_all(new_w as f32 / old_w as f32);
+                let f = new_w as f32 / old_w as f32;
+                app.model.rescale_all(f);
+                // The view centre is a grid-cell coordinate; rescale it
+                // with the model so a non-fit view keeps looking at the
+                // same world region (view_fit handles the rest).
+                app.view_center[0] *= f;
+                app.view_center[1] *= f;
             }
             app.model.mark_all_dirty();
             app.stats_grid = sim.grid_size();
@@ -717,9 +743,18 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             };
         }
         Cmd::SetMapping(m) => {
-            let (vw, vh) = sim.grid_size();
-            sim.mapping = ViewportMapping::fit(m.vp_origin, m.vp_size, vw, vh);
-            sim.write_render_uniform();
+            // Passthrough: the canvas owns the view transform (free zoom
+            // and pan). Only a finite-value guard here — a NaN mapping
+            // must never reach the render uniform.
+            let finite = m.px_per_cell.is_finite()
+                && m.px_per_cell > 0.0
+                && m.vp_origin.iter().all(|v| v.is_finite())
+                && m.vp_size.iter().all(|v| v.is_finite())
+                && m.lb_origin.iter().all(|v| v.is_finite());
+            if finite {
+                sim.mapping = m;
+                sim.write_render_uniform();
+            }
         }
     }
 }
@@ -885,8 +920,25 @@ impl FlowPaintApp {
                 self.model.remove(id);
             }
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-            cmds.push(Cmd::TogglePause);
+        // Space pauses on RELEASE, not press: while held it is the pan
+        // modifier on the canvas, and a hold that panned must not also
+        // toggle the sim (the canvas sets space_pan_suppress).
+        if ctx.input(|i| i.key_released(egui::Key::Space)) {
+            if !self.space_pan_suppress {
+                cmds.push(Cmd::TogglePause);
+            }
+            self.space_pan_suppress = false;
+        }
+        // View navigation; consumed by the canvas, which knows the
+        // viewport geometry.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Num0)) {
+            self.view_request = Some(ViewRequest::Fit);
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Num1)) {
+            self.view_request = Some(ViewRequest::OneToOne);
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Num2)) {
+            self.view_request = Some(ViewRequest::Selection);
         }
         // Duplicate.
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
