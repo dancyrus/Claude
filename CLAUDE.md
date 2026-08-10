@@ -29,6 +29,8 @@ Per-unit decisions later units must not re-derive live in
   `claude/t2a-color-range-opuijy` (off `34d57aa`, no U1); write-up in
   `docs/t2a-color-range.md`. Asymmetric manual min/max deliberately
   unimplemented (needs a per-mode offset in `render.wgsl`).
+- **T2-B (probes + Re input): done**, branch
+  `claude/flowpaint-v4.1-t2b-probes` (off the U1 tip).
 - Scene format: **v6** current, loads v3+ (v3 lacks solver fields;
   v4/v5 share a layout; v6 appends per-object `locked`/`hidden`, so
   pre-v6 objects decode via the `SketchObjectV5` mirror — see

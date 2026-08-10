@@ -246,6 +246,7 @@ impl FlowPaintApp {
                         format!("u = M · a = {}", fmt_speed(mach * self.fluid_a)),
                     );
                     theme::derived(ui, format!("(a∞ = {})", fmt_speed(self.fluid_a)));
+                    theme::derived(ui, "Re = ∞ (inviscid)".to_string());
                 } else {
                     let ps = self.phys_cache;
                     let mut flow = snap.flow;
@@ -266,8 +267,59 @@ impl FlowPaintApp {
                         }
                     });
                     theme::derived(ui, format!("= {}", fmt_speed(ps.u_phys(flow))));
-                    row(ui, "viscosity", |ui| {
-                        if ui
+                    // T2-B: viscosity in either direction — set ν and
+                    // read Re, or set Re and let ν follow. The label
+                    // cell holds the direction toggle; the dependent
+                    // value moves to the derived line below.
+                    let re_id = ui.id().with("re_input_mode");
+                    let mut re_mode: bool = ui
+                        .data_mut(|d| *d.get_persisted_mut_or_insert_with(re_id, || false));
+                    let l_ref = 0.16 * self.stats_grid.1.max(1) as f32;
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(66.0, 18.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if theme::toggle(ui, re_mode, "Re")
+                                    .on_hover_text(
+                                        "Set the Reynolds number; viscosity follows",
+                                    )
+                                    .clicked()
+                                {
+                                    re_mode = true;
+                                }
+                                if theme::toggle(ui, !re_mode, "ν")
+                                    .on_hover_text("Set the viscosity; Reynolds follows")
+                                    .clicked()
+                                {
+                                    re_mode = false;
+                                }
+                            },
+                        );
+                        if re_mode {
+                            let mut re = flow * l_ref / visc.max(1e-5);
+                            let (re_min, re_max) =
+                                (flow * l_ref / 0.08, flow * l_ref / 0.005);
+                            let drag_speed = (re * 0.01).max(1.0);
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut re)
+                                        .range(re_min..=re_max)
+                                        .speed(drag_speed)
+                                        .fixed_decimals(0),
+                                )
+                                .on_hover_text(
+                                    "Reynolds number at the reference length \
+                                     (0.16 × domain height)",
+                                )
+                                .changed()
+                            {
+                                let v =
+                                    (flow * l_ref / re.max(1.0)).clamp(0.005, 0.08);
+                                self.fluid_preset_idx = None;
+                                cmds.push(Cmd::SetViscosity(v));
+                            }
+                        } else if ui
                             .add(
                                 egui::DragValue::new(&mut visc)
                                     .range(0.005..=0.08)
@@ -280,7 +332,15 @@ impl FlowPaintApp {
                             cmds.push(Cmd::SetViscosity(visc));
                         }
                     });
-                    theme::derived(ui, format!("Δt = {}", fmt_time(ps.dt)));
+                    ui.data_mut(|d| d.insert_persisted(re_id, re_mode));
+                    theme::derived(
+                        ui,
+                        if re_mode {
+                            format!("ν = {:.4} · Δt = {}", visc, fmt_time(ps.dt))
+                        } else {
+                            format!("Re ≈ {} · Δt = {}", self.stats_re, fmt_time(ps.dt))
+                        },
+                    );
                 }
             });
         });

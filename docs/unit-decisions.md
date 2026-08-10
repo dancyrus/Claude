@@ -75,3 +75,20 @@ Full write-up: `docs/t2a-color-range.md`.
   `sim::color_ranges()` (a `Mutex` in `sim.rs`) only because `app.rs`
   was frozen for Track 1 — the merge folds it into `Settings` + `Cmd`
   and persists it in the scene format.
+
+## T2-B (persistent probes + Reynolds input)
+
+- Probe storage follows the T2-A precedent: `sim::probes()` (a `Mutex`
+  in `sim.rs`) holds positions, ring-capped histories (2048 frames,
+  stated in the plot panel) and plot preferences; not scene-persisted.
+  Fold into app state at the merge.
+- Sampling is a per-frame GPU copy of single cells into a 3-deep
+  mapped staging ring (copy → map next frame → read when done; never
+  blocks a frame). Field buffers gained `COPY_SRC` for it.
+- The sim publishes the canvas view transform through the probe store
+  so `ui/status.rs` can draw probe markers without touching Track 1's
+  `ui/canvas.rs`; probe placement is an armed raw click (tree button →
+  next canvas click, Esc cancels).
+- Probe plot conversions duplicate the legend's shader-inversion
+  factors (T2-A keeps its own copy in `ui/legend.rs`) — unify both
+  into `ui/units.rs` at the merge.
