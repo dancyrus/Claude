@@ -247,51 +247,6 @@ impl PhysScale {
     }
 }
 
-fn fmt_len(m: f32) -> String {
-    let a = m.abs();
-    if a < 0.01 {
-        format!("{:.1} mm", m * 1e3)
-    } else if a < 1.0 {
-        format!("{:.1} cm", m * 1e2)
-    } else if a < 1000.0 {
-        format!("{:.2} m", m)
-    } else {
-        format!("{:.2} km", m * 1e-3)
-    }
-}
-
-fn fmt_time(s: f32) -> String {
-    let a = s.abs();
-    if a < 1e-3 {
-        format!("{:.1} µs", s * 1e6)
-    } else if a < 1.0 {
-        format!("{:.2} ms", s * 1e3)
-    } else if a < 120.0 {
-        format!("{:.2} s", s)
-    } else {
-        format!("{:.1} min", s / 60.0)
-    }
-}
-
-fn fmt_speed(v: f32) -> String {
-    if v.abs() < 0.1 {
-        format!("{:.1} cm/s", v * 100.0)
-    } else {
-        format!("{:.2} m/s", v)
-    }
-}
-
-fn fmt_pressure(p: f32) -> String {
-    let a = p.abs();
-    if a < 0.1 {
-        format!("{:.1} mPa", p * 1e3)
-    } else if a < 1000.0 {
-        format!("{:.2} Pa", p)
-    } else {
-        format!("{:.2} kPa", p * 1e-3)
-    }
-}
-
 // CPU mirrors of the shader colormaps, for the legend bars.
 fn inferno_color(t: f32) -> egui::Color32 {
     let t = t.clamp(0.0, 1.0) * 4.0;
@@ -317,7 +272,6 @@ fn coolwarm_color(t: f32) -> egui::Color32 {
     let c = |k: usize| a[k] + (b[k] - a[k]) * f;
     egui::Color32::from_rgb((c(0) * 255.0) as u8, (c(1) * 255.0) as u8, (c(2) * 255.0) as u8)
 }
-
 
 /// Settings snapshot read from the sim before building the UI, so panels
 /// can show live values without holding the renderer lock.

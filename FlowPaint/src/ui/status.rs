@@ -4,8 +4,10 @@
 //! than clipping text mid-word; the fields are ordered so the physics
 //! numbers survive longest.
 
-use crate::app::{fmt_len, fmt_speed, fmt_time, FlowPaintApp};
+use crate::app::{FlowPaintApp};
 use eframe::egui;
+
+use super::units::{fmt_cfl, fmt_len, fmt_speed, fmt_time};
 
 impl FlowPaintApp {
     pub(in crate::app) fn status_bar(&mut self, ctx: &egui::Context) {
@@ -36,7 +38,7 @@ impl FlowPaintApp {
                     format!("dt {}", fmt_time(ps.dt)),
                     format!("t {}", fmt_time(self.sim_time_s as f32)),
                     format!("u∞ {}", fmt_speed(self.stats_u_inf)),
-                    format!("CFL (inlet) {:.2}", self.stats_cfl),
+                    format!("CFL (inlet) {}", fmt_cfl(self.stats_cfl)),
                     format!("{} obj", self.model.objects.len()),
                     format!("{:.0} MLUPS", self.stats_mlups),
                     re,

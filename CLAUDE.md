@@ -37,7 +37,10 @@ and panel arrangement — not for widget construction or numeric values.
   bincode, version peek on first 4 LE bytes), `--bench` harness.
 - `src/ui/` — one file per panel; child of `app` via `#[path]` so panel
   code reads app state without visibility widening. `ui/mod.rs` owns
-  draw order; `ui/theme.rs` owns all style.
+  draw order; `ui/theme.rs` owns all style; `ui/units.rs` owns every
+  physical-quantity formatter (no inline `{:.N}` on physical values).
+  Convention: canonical value in the box, unit in the label, derived
+  value on a `theme::derived` secondary line.
 - `src/sim.rs` — wgpu engine. `src/model.rs` — object model + undo
   (index-based ops; panel edits coalesce via `record_modify_coalesced`).
 

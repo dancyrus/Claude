@@ -214,6 +214,18 @@ pub(crate) fn heading(text: impl Into<String>) -> egui::RichText {
     egui::RichText::new(text.into()).heading().color(INK)
 }
 
+/// A derived-value secondary line (the mockup's `.der` row): small
+/// monospace in tertiary ink, under the control whose canonical value
+/// it re-expresses.
+pub(crate) fn derived(ui: &mut egui::Ui, text: String) -> egui::Response {
+    ui.label(
+        egui::RichText::new(text)
+            .monospace()
+            .size(10.0)
+            .color(INK_3),
+    )
+}
+
 /// A small monospace readout (numeric captions like the legend's
 /// colorbar labels): numbers stay tabular even at caption size.
 pub(crate) fn mono_small(ui: &mut egui::Ui, text: String) -> egui::Response {

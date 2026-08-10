@@ -1,12 +1,14 @@
 //! The right-hand legend: flow numbers in physical units and the
 //! color-scale bar for the current view.
 
-use crate::app::{
-    coolwarm_color, fmt_len, fmt_pressure, fmt_speed, fmt_time, inferno_color,
-    FlowPaintApp, UiSnapshot,
-};
+use crate::app::{coolwarm_color, inferno_color, FlowPaintApp, UiSnapshot};
 use crate::sim::{RenderMode, SolverMode};
 use eframe::egui;
+
+use super::units::{
+    fmt_density, fmt_kvisc, fmt_len, fmt_mach, fmt_omega, fmt_pressure,
+    fmt_sim_rate, fmt_speed, fmt_time,
+};
 
 impl FlowPaintApp {
     /// The right-hand legend: the important flow numbers in physical
@@ -43,11 +45,11 @@ impl FlowPaintApp {
                     row("Fluid", self.fluid_name.to_string());
                     if euler {
                         row("a∞", fmt_speed(self.fluid_a));
-                        row("Mach M∞", format!("{:.2}", snap.mach));
+                        row("Mach M∞", fmt_mach(snap.mach));
                     } else {
-                        row("ν", format!("{:.2e} m²/s", self.fluid_nu));
+                        row("ν", fmt_kvisc(self.fluid_nu));
                     }
-                    row("ρ", format!("{:.0} kg/m³", self.fluid_rho));
+                    row("ρ", fmt_density(self.fluid_rho));
                     row(
                         "Domain",
                         format!(
@@ -74,7 +76,7 @@ impl FlowPaintApp {
                     );
                     row(
                         "Sim rate",
-                        format!("{:.2}× real", self.stats_steps_per_s * ps.dt),
+                        fmt_sim_rate(self.stats_steps_per_s * ps.dt),
                     );
                     row("Sim time", fmt_time(self.sim_time_s as f32));
                 });
@@ -123,10 +125,10 @@ impl FlowPaintApp {
                     let w_sat = inlet_render.max(0.02) / (4.0 * gain) / ps.dt;
                     Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
                     ui.horizontal(|ui| {
-                        super::theme::mono_small(ui, format!("-{:.1} 1/s", w_sat));
+                        super::theme::mono_small(ui, format!("-{}", fmt_omega(w_sat)));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| super::theme::mono_small(ui, format!("+{:.1} 1/s", w_sat)),
+                            |ui| super::theme::mono_small(ui, format!("+{}", fmt_omega(w_sat))),
                         );
                     });
                     ui.small("red: clockwise · blue: counter-clockwise");

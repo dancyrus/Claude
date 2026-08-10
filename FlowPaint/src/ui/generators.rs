@@ -1,8 +1,10 @@
 //! The airfoil and rocket-nozzle generator dialog windows.
 
-use crate::app::{fmt_speed, FlowPaintApp, UiSnapshot};
+use crate::app::{FlowPaintApp, UiSnapshot};
 use crate::sim::SolverMode;
 use eframe::egui;
+
+use super::units::{fmt_angle, fmt_factor, fmt_len, fmt_speed};
 
 impl FlowPaintApp {
     pub(in crate::app) fn generator_windows(&mut self, ctx: &egui::Context, snap: UiSnapshot) {
@@ -26,16 +28,14 @@ impl FlowPaintApp {
                             }
                         }
                     });
-                ui.add(egui::Slider::new(&mut p.camber, 0.0..=9.0).text("camber %"));
-                ui.add(
-                    egui::Slider::new(&mut p.camber_pos, 15.0..=70.0)
-                        .text("camber position %"),
-                );
-                ui.add(egui::Slider::new(&mut p.thickness, 4.0..=24.0).text("thickness %"));
-                ui.add(egui::Slider::new(&mut p.aoa_deg, -15.0..=20.0).text("angle of attack °"));
-                ui.add(
-                    egui::Slider::new(&mut p.chord_cells, 60.0..=600.0)
-                        .text("chord (cells)"),
+                dv_row(ui, "camber", egui::DragValue::new(&mut p.camber).range(0.0..=9.0).speed(0.1).suffix(" %"));
+                dv_row(ui, "camber position", egui::DragValue::new(&mut p.camber_pos).range(15.0..=70.0).speed(0.5).suffix(" %"));
+                dv_row(ui, "thickness", egui::DragValue::new(&mut p.thickness).range(4.0..=24.0).speed(0.1).suffix(" %"));
+                dv_row(ui, "angle of attack", egui::DragValue::new(&mut p.aoa_deg).range(-15.0..=20.0).speed(0.1).suffix("°"));
+                dv_row(ui, "chord", egui::DragValue::new(&mut p.chord_cells).range(60.0..=600.0).speed(1.0).suffix(" cells"));
+                super::theme::derived(
+                    ui,
+                    format!("chord = {}", fmt_len(self.phys_cache.len_m(p.chord_cells))),
                 );
                 let pos_digit = if p.camber > 0.0 {
                     (p.camber_pos / 10.0).round()
@@ -43,8 +43,11 @@ impl FlowPaintApp {
                     0.0 // symmetric airfoils are NACA 00xx
                 };
                 ui.monospace(format!(
-                    "≈ NACA {:.0}{:.0}{:02.0} at {:.1}°",
-                    p.camber, pos_digit, p.thickness, p.aoa_deg
+                    "≈ NACA {:.0}{:.0}{:02.0} at {}",
+                    p.camber,
+                    pos_digit,
+                    p.thickness,
+                    fmt_angle(p.aoa_deg)
                 ));
                 if ui.button("Insert into scene").clicked() {
                     let stamp = gen::generate_airfoil(p);
@@ -79,27 +82,16 @@ impl FlowPaintApp {
                             }
                         }
                     });
-                ui.add(
-                    egui::Slider::new(&mut p.throat_cells, 12.0..=100.0)
-                        .text("throat width (cells)"),
+                dv_row(ui, "throat width", egui::DragValue::new(&mut p.throat_cells).range(12.0..=100.0).speed(0.5).suffix(" cells"));
+                super::theme::derived(
+                    ui,
+                    format!("throat = {}", fmt_len(self.phys_cache.len_m(p.throat_cells))),
                 );
-                ui.add(
-                    egui::Slider::new(&mut p.exit_ratio, 1.2..=20.0)
-                        .text("exit / throat width"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut p.chamber_ratio, 1.5..=4.0)
-                        .text("chamber / throat width"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut p.conv_ratio, 1.0..=4.0)
-                        .text("converging length / throat"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut p.div_ratio, 2.0..=16.0)
-                        .text("bell length / throat"),
-                );
-                ui.add(egui::Slider::new(&mut p.wall_cells, 3.0..=12.0).text("wall (cells)"));
+                dv_row(ui, "exit / throat width", egui::DragValue::new(&mut p.exit_ratio).range(1.2..=20.0).speed(0.05));
+                dv_row(ui, "chamber / throat width", egui::DragValue::new(&mut p.chamber_ratio).range(1.5..=4.0).speed(0.02));
+                dv_row(ui, "converging length / throat", egui::DragValue::new(&mut p.conv_ratio).range(1.0..=4.0).speed(0.02));
+                dv_row(ui, "bell length / throat", egui::DragValue::new(&mut p.div_ratio).range(2.0..=16.0).speed(0.05));
+                dv_row(ui, "wall", egui::DragValue::new(&mut p.wall_cells).range(3.0..=12.0).speed(0.1).suffix(" cells"));
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut p.contour, gen::NozzleContour::Bell, "Bell");
                     ui.radio_value(&mut p.contour, gen::NozzleContour::Conical, "Conical (15°-style)");
@@ -111,13 +103,24 @@ impl FlowPaintApp {
                 if self.nozzle_fan_auto {
                     p.fan_mult = nozzle_auto_fan_mult(&snap, p.chamber_ratio);
                 }
-                if ui
-                    .add(
-                        egui::Slider::new(&mut p.fan_mult, 0.2..=2.0)
-                            .text("chamber fan ×"),
-                    )
-                    .changed()
-                {
+                let fan_resp = ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut p.fan_mult)
+                            .range(0.2..=2.0)
+                            .speed(0.01)
+                            .suffix(" ×"),
+                    );
+                    ui.label("chamber fan");
+                    if self.nozzle_fan_auto {
+                        ui.label(
+                            egui::RichText::new("(auto)")
+                                .small()
+                                .color(super::theme::INK_3),
+                        );
+                    }
+                    resp
+                });
+                if fan_resp.inner.changed() {
                     self.nozzle_fan_auto = false;
                 }
                 // Expected jet speeds in real units, next to the engine's
@@ -147,7 +150,7 @@ impl FlowPaintApp {
                     if euler_mode {
                         super::theme::mono_small(
                             ui,
-                            format!("real engine exhaust ≈ {:.0} m/s", ve),
+                            format!("real engine exhaust ≈ {}", fmt_speed(ve)),
                         );
                         ui.label(
                             egui::RichText::new(
@@ -162,8 +165,9 @@ impl FlowPaintApp {
                         super::theme::mono_small(
                             ui,
                             format!(
-                                "real engine exhaust ≈ {:.0} m/s (~{:.0}× faster)",
-                                ve, factor
+                                "real engine exhaust ≈ {} (~{} faster)",
+                                fmt_speed(ve),
+                                fmt_factor(factor)
                             ),
                         );
                         ui.label(
@@ -205,4 +209,15 @@ fn nozzle_auto_fan_mult(snap: &UiSnapshot, chamber_ratio: f32) -> f32 {
         // the converging-diverging geometry does the accelerating.
         SolverMode::Euler => (0.3 / snap.mach.max(0.1)).clamp(0.2, 2.0),
     }
+}
+
+/// A dialog control row: DragValue box first, label after (canonical
+/// value in the box, unit in the suffix).
+fn dv_row(ui: &mut egui::Ui, label: &str, dv: egui::DragValue<'_>) -> egui::Response {
+    ui.horizontal(|ui| {
+        let resp = ui.add(dv);
+        ui.label(label);
+        resp
+    })
+    .inner
 }

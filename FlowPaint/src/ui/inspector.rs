@@ -1,10 +1,12 @@
 //! The object inspector (selected-object properties) and the defaults
 //! panel for newly drawn objects.
 
-use crate::app::{fmt_len, Cmd, FlowPaintApp, Gesture};
+use crate::app::{Cmd, FlowPaintApp, Gesture};
 use crate::model::{ObjMaterial, Shape};
 use crate::sim::RenderMode;
 use eframe::egui;
+
+use super::units::{fmt_len};
 
 use super::theme;
 
@@ -92,11 +94,21 @@ impl FlowPaintApp {
                 changed = true;
             }
             if !(can_fill && obj.filled) {
-                let thick_label =
-                    format!("thickness ({})", fmt_len(ps.len_m(obj.thickness)));
-                changed |= ui
-                    .add(egui::Slider::new(&mut obj.thickness, 1.0..=24.0).text(thick_label))
-                    .changed();
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut obj.thickness)
+                                .range(1.0..=24.0)
+                                .speed(0.1)
+                                .suffix(" cells"),
+                        )
+                        .changed();
+                    ui.label("thickness");
+                });
+                super::theme::derived(
+                    ui,
+                    format!("= {}", fmt_len(ps.len_m(obj.thickness))),
+                );
             }
         }
 
@@ -232,12 +244,17 @@ impl FlowPaintApp {
             }
         });
         let ps = self.phys_cache;
-        let thick_label = format!(
-            "thickness ({})",
-            fmt_len(ps.len_m(self.def_thickness))
-        );
-        ui.add(egui::Slider::new(&mut self.def_thickness, 1.0..=24.0).text(thick_label))
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut self.def_thickness)
+                    .range(1.0..=24.0)
+                    .speed(0.1)
+                    .suffix(" cells"),
+            )
             .on_hover_text("Lines, polylines and shape outlines draw at this thickness");
+            ui.label("thickness");
+        });
+        super::theme::derived(ui, format!("= {}", fmt_len(ps.len_m(self.def_thickness))));
         ui.checkbox(&mut self.def_filled, "Filled rect / ellipse")
             .on_hover_text("Off = SolidWorks-style outlines at the set thickness");
         if self.def_material == ObjMaterial::Fan {

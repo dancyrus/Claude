@@ -11,6 +11,7 @@ mod ribbon;
 mod status;
 pub(super) mod theme;
 mod tree;
+pub(super) mod units;
 mod windows;
 
 use super::{Cmd, FlowPaintApp, UiSnapshot};

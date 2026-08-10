@@ -3,12 +3,11 @@
 //! Every button is a phosphor icon over a text label; value controls
 //! use compact label + widget rows, mockup-style.
 
-use crate::app::{
-    build_preset, fmt_len, fmt_speed, fmt_time, Cmd, FlowPaintApp, RibbonTab,
-    ScenePreset, Tool, UiSnapshot, FLUID_PRESETS,
-};
+use crate::app::{build_preset, Cmd, FlowPaintApp, RibbonTab, ScenePreset, Tool, UiSnapshot, FLUID_PRESETS};
 use crate::sim::{RenderMode, SolverMode, PARTICLE_CHOICES};
 use eframe::egui;
+
+use super::units::{fmt_density, fmt_len, fmt_speed, fmt_time};
 use egui_phosphor::regular as ph;
 
 use super::theme;
@@ -176,89 +175,106 @@ impl FlowPaintApp {
                 }
             }
         });
+        group(ui, "Fluid", |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(150.0);
+                let combo_label = match self.fluid_preset_idx {
+                    Some(i) => FLUID_PRESETS[i].name,
+                    None => "Custom",
+                };
+                egui::ComboBox::from_id_salt("ribbon_fluid")
+                    .width(146.0)
+                    .selected_text(combo_label)
+                    .show_ui(ui, |ui| {
+                        for (i, p) in FLUID_PRESETS.iter().enumerate() {
+                            let sel = self.fluid_preset_idx == Some(i);
+                            if theme::toggle(ui, sel, p.name)
+                                .on_hover_text(p.desc)
+                                .clicked()
+                            {
+                                self.fluid_preset_idx = Some(i);
+                                self.fluid_name = p.name;
+                                self.fluid_nu = p.nu;
+                                self.fluid_rho = p.rho;
+                                self.fluid_a = p.a;
+                                if p.tunnel != snap.tunnel {
+                                    cmds.push(Cmd::SetWindTunnel(p.tunnel));
+                                }
+                                cmds.push(Cmd::SetFlowSpeed(p.flow));
+                                cmds.push(Cmd::SetViscosity(p.visc));
+                                // Presets own the sub-step count too, so
+                                // e.g. Supersonic's 16 steps don't leak
+                                // into the next regime.
+                                cmds.push(Cmd::SetSteps(p.steps.unwrap_or(8)));
+                                self.status = format!("Fluid preset: {}", p.name);
+                            }
+                        }
+                    });
+                theme::derived(ui, format!("a∞ = {}", fmt_speed(self.fluid_a)));
+                theme::derived(ui, format!("ρ  = {}", fmt_density(self.fluid_rho)));
+            });
+        });
         group(ui, "Inlet condition", |ui| {
             ui.vertical(|ui| {
                 // Fixed width so the LBM/Euler swap can't change the
                 // group's footprint.
-                ui.set_width(196.0);
-                row(ui, "fluid", |ui| {
-                    let combo_label = match self.fluid_preset_idx {
-                        Some(i) => FLUID_PRESETS[i].name,
-                        None => "Custom",
-                    };
-                    egui::ComboBox::from_id_salt("ribbon_fluid")
-                        .width(120.0)
-                        .selected_text(combo_label)
-                        .show_ui(ui, |ui| {
-                            for (i, p) in FLUID_PRESETS.iter().enumerate() {
-                                let sel = self.fluid_preset_idx == Some(i);
-                                if theme::toggle(ui, sel, p.name)
-                                    .on_hover_text(p.desc)
-                                    .clicked()
-                                {
-                                    self.fluid_preset_idx = Some(i);
-                                    self.fluid_name = p.name;
-                                    self.fluid_nu = p.nu;
-                                    self.fluid_rho = p.rho;
-                                    self.fluid_a = p.a;
-                                    if p.tunnel != snap.tunnel {
-                                        cmds.push(Cmd::SetWindTunnel(p.tunnel));
-                                    }
-                                    cmds.push(Cmd::SetFlowSpeed(p.flow));
-                                    cmds.push(Cmd::SetViscosity(p.visc));
-                                    // Presets own the sub-step count too,
-                                    // so e.g. Supersonic's 16 steps don't
-                                    // leak into the next regime.
-                                    cmds.push(Cmd::SetSteps(p.steps.unwrap_or(8)));
-                                    self.status =
-                                        format!("Fluid preset: {}", p.name);
-                                }
-                            }
-                        });
-                });
+                ui.set_width(180.0);
                 if snap.solver == SolverMode::Euler {
                     let mut mach = snap.mach;
                     row(ui, "inlet Mach", |ui| {
                         if ui
-                            .add(egui::Slider::new(&mut mach, 0.3..=3.0))
-                            .on_hover_text(format!(
-                                "u = M · a = {} (a∞ = {}) — inviscid gas \
-                                 dynamics, γ = 1.4",
-                                fmt_speed(mach * self.fluid_a),
-                                fmt_speed(self.fluid_a)
-                            ))
+                            .add(
+                                egui::DragValue::new(&mut mach)
+                                    .range(0.3..=3.0)
+                                    .speed(0.01)
+                                    .fixed_decimals(3)
+                                    .suffix(" M"),
+                            )
                             .changed()
                         {
                             cmds.push(Cmd::SetMach(mach));
                         }
                     });
+                    theme::derived(
+                        ui,
+                        format!("u = M · a = {}", fmt_speed(mach * self.fluid_a)),
+                    );
+                    theme::derived(ui, format!("(a∞ = {})", fmt_speed(self.fluid_a)));
                 } else {
                     let ps = self.phys_cache;
                     let mut flow = snap.flow;
                     let mut visc = snap.visc;
                     row(ui, "flow speed", |ui| {
                         if ui
-                            .add(egui::Slider::new(&mut flow, 0.02..=0.14))
-                            .on_hover_text(format!("{}", fmt_speed(ps.u_phys(flow))))
+                            .add(
+                                egui::DragValue::new(&mut flow)
+                                    .range(0.02..=0.14)
+                                    .speed(0.001)
+                                    .fixed_decimals(3),
+                            )
+                            .on_hover_text("Inlet speed, lattice units")
                             .changed()
                         {
                             self.fluid_preset_idx = None;
                             cmds.push(Cmd::SetFlowSpeed(flow));
                         }
                     });
+                    theme::derived(ui, format!("= {}", fmt_speed(ps.u_phys(flow))));
                     row(ui, "viscosity", |ui| {
                         if ui
                             .add(
-                                egui::Slider::new(&mut visc, 0.005..=0.08)
-                                    .logarithmic(true),
+                                egui::DragValue::new(&mut visc)
+                                    .range(0.005..=0.08)
+                                    .speed(0.0005),
                             )
-                            .on_hover_text(format!("Δt {}", fmt_time(ps.dt)))
+                            .on_hover_text("Lattice kinematic viscosity")
                             .changed()
                         {
                             self.fluid_preset_idx = None;
                             cmds.push(Cmd::SetViscosity(visc));
                         }
                     });
+                    theme::derived(ui, format!("Δt = {}", fmt_time(ps.dt)));
                 }
             });
         });
@@ -268,7 +284,10 @@ impl FlowPaintApp {
                 let mut fade = snap.fade;
                 let mut tunnel = snap.tunnel;
                 row(ui, "steps / frame", |ui| {
-                    if ui.add(egui::Slider::new(&mut steps, 1..=32)).changed() {
+                    if ui
+                        .add(egui::DragValue::new(&mut steps).range(1..=32))
+                        .changed()
+                    {
                         self.fluid_preset_idx = None;
                         cmds.push(Cmd::SetSteps(steps));
                     }
@@ -296,8 +315,9 @@ impl FlowPaintApp {
             ui.vertical(|ui| {
                 row(ui, "width", |ui| {
                     ui.add(
-                        egui::Slider::new(&mut self.domain_width_m, 0.05..=100.0)
-                            .logarithmic(true)
+                        egui::DragValue::new(&mut self.domain_width_m)
+                            .range(0.05..=100.0)
+                            .speed(0.01)
                             .suffix(" m"),
                     )
                     .on_hover_text(
@@ -305,10 +325,7 @@ impl FlowPaintApp {
                          unit readout (cell size, time step, speeds, pressures)",
                     );
                 });
-                super::theme::mono_small(
-                    ui,
-                    format!("cell = {}", fmt_len(self.phys_cache.dx)),
-                );
+                theme::derived(ui, format!("cell = {}", fmt_len(self.phys_cache.dx)));
             });
         });
     }
@@ -428,7 +445,11 @@ impl FlowPaintApp {
                 let mut sponge = snap.sponge_strength;
                 row(ui, "edge damping", |ui| {
                     if ui
-                        .add(egui::Slider::new(&mut sponge, 0.0..=0.3))
+                        .add(
+                            egui::DragValue::new(&mut sponge)
+                                .range(0.0..=0.3)
+                                .speed(0.002),
+                        )
                         .on_hover_text(
                             "Absorbing sponge at the domain edge (needs a \
                              margin); kills reflections of pressure waves",
@@ -450,7 +471,7 @@ impl FlowPaintApp {
 fn group(ui: &mut egui::Ui, caption: &str, content: impl FnOnce(&mut egui::Ui)) {
     ui.vertical(|ui| {
         let inner = ui.horizontal(|ui| {
-            ui.set_height(58.0);
+            ui.set_height(64.0);
             content(ui);
         });
         let w = inner.response.rect.width().max(52.0);

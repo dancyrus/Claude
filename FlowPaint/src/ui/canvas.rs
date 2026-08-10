@@ -1,10 +1,12 @@
 //! The graphics window: the wgpu paint callback, the pointer gesture
 //! state machine, and the selection/snap overlays.
 
-use crate::app::{fmt_len, Cmd, FlowPaintApp, Gesture, Tool};
+use crate::app::{Cmd, FlowPaintApp, Gesture, Tool};
 use crate::model::Shape;
 use crate::sim::{GpuSim, ViewportMapping};
 use eframe::egui;
+
+use super::units::{fmt_angle, fmt_len};
 
 impl FlowPaintApp {
     pub(in crate::app) fn canvas(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
@@ -547,7 +549,7 @@ impl FlowPaintApp {
             Shape::Line { a, b } => {
                 let l = Self::dist(*a, *b);
                 let ang = -(b[1] - a[1]).atan2(b[0] - a[0]).to_degrees();
-                format!("L {}   ∠ {:.1}°", fmt_len(ps.len_m(l)), ang)
+                format!("L {}   ∠ {}", fmt_len(ps.len_m(l)), fmt_angle(ang))
             }
             Shape::Poly { pts, closed } => {
                 let n = pts.len();

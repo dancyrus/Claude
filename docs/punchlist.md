@@ -8,12 +8,13 @@ here instead of being fixed inline.
   Remaining nit: at the 900 px minimum width the strip's rightmost
   segments (MLUPS, Re) clip at the edge instead of eliding — revisit
   when 3b finalizes the strip's contents.
-- **Legend `ρ` row rounds 1.2 → "1 kg/m³"** (`{:.0}` in
-  `ui/legend.rs`). Phase 4 (units consolidation) owns formatter decimal
-  counts.
-- **Legend "Sim rate 0.00× real"** on slow (software-GL) machines —
-  formatter floors small rates to 0.00; phase 4 should switch to an
-  adaptive precision.
+- ~~**Legend `ρ` row rounds 1.2 → "1 kg/m³"**~~ Fixed in phase 4:
+  `units::fmt_density` keeps one decimal below 10 kg/m³.
+- ~~**Legend "Sim rate 0.00× real"**~~ Fixed in phase 4:
+  `units::fmt_sim_rate` uses three decimals below 0.1×.
+- **Physics ribbon tab exactly fills 900 px** — the Domain group's
+  derived "cell = …" line touches the right edge at the minimum window
+  width. Cosmetic; revisit if a sixth Physics group ever appears.
 - **Idle value boxes don't show the mockup's `.dv` treatment**
   (`FIELD_BG` fill + `LINE_2` border). egui 0.29 renders at-rest
   DragValues/slider readouts as buttons (`PANEL_2`, borderless);
