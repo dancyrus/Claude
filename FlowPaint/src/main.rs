@@ -6,6 +6,7 @@
 mod app;
 mod generators;
 mod geometry;
+mod model;
 mod sim;
 
 fn main() -> eframe::Result<()> {

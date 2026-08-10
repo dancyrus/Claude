@@ -3,7 +3,7 @@
 //! `CallbackResources`; the app mutates it during `update`, and the paint
 //! callback encodes the compute + render work each frame.
 
-use crate::geometry::{Geometry, GridRect, UndoStack};
+use crate::geometry::{Geometry, GridRect};
 use std::sync::{mpsc, Arc};
 
 /// Visible-canvas resolutions; the simulated grid is larger by the margin.
@@ -244,7 +244,6 @@ pub struct GpuSim {
     vis_h: usize,
     margin: usize,
     margin_frac: f32,
-    pub undo: UndoStack,
     pub settings: Settings,
     pub mapping: ViewportMapping,
 
@@ -276,18 +275,6 @@ fn margin_cells(device: &wgpu::Device, vis_w: usize, vis_h: usize, frac: f32) ->
         margin = margin.saturating_sub(32);
     }
     margin
-}
-
-fn geometry_from_region(r: &crate::geometry::GeoRegion) -> Geometry {
-    let (x0, y0, x1, y1) = r.rect;
-    Geometry {
-        w: (x1 - x0).max(0) as usize,
-        h: (y1 - y0).max(0) as usize,
-        cell: r.cell.clone(),
-        fan: r.fan.clone(),
-        dye_src: r.dye_src.clone(),
-        dirty: None,
-    }
 }
 
 fn storage_entry(binding: u32, read_only: bool, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -556,7 +543,7 @@ impl GpuSim {
             &particles,
         );
 
-        let mut sim = Self {
+        let sim = Self {
             device,
             queue,
             lbm_layout,
@@ -582,7 +569,6 @@ impl GpuSim {
             vis_h,
             margin,
             margin_frac: MARGIN_CHOICES[DEFAULT_MARGIN_INDEX].1,
-            undo: UndoStack::default(),
             settings: Settings::default(),
             mapping: ViewportMapping::default(),
             frame_counter: 0,
@@ -592,9 +578,8 @@ impl GpuSim {
             pending_clear_dye: true,
             steps_last_frame: 0,
         };
-        sim.geo.apply_wind_tunnel(true);
-        let vis = sim.vis_rect();
-        sim.geo.stamp_preset(crate::geometry::Preset::Cylinder, vis);
+        // Content (including tunnel bands) is projected from the sketch
+        // model on the first frame.
         sim
     }
 
@@ -731,16 +716,6 @@ impl GpuSim {
         self.margin
     }
 
-    /// The visible window inside the full grid.
-    pub fn vis_rect(&self) -> GridRect {
-        GridRect {
-            x0: self.margin as i32,
-            y0: self.margin as i32,
-            x1: (self.margin + self.vis_w) as i32,
-            y1: (self.margin + self.vis_h) as i32,
-        }
-    }
-
     /// Queue a full flow reset (populations to the freestream, dye
     /// cleared, sim clock zeroed).
     pub fn reset_flow(&mut self) {
@@ -749,29 +724,12 @@ impl GpuSim {
         self.total_steps = 0.0;
     }
 
-    pub fn clear_all(&mut self) {
-        self.geo.clear();
-        if self.settings.wind_tunnel {
-            self.geo.apply_wind_tunnel(true);
-        }
-        self.undo.clear();
-        self.reset_flow();
-    }
 
     pub fn set_wind_tunnel(&mut self, on: bool) {
         self.settings.wind_tunnel = on;
-        self.geo.apply_wind_tunnel(on);
+        // The model rasterizer paints or clears the tunnel bands.
     }
 
-    pub fn apply_preset(&mut self, preset: crate::geometry::Preset) {
-        let vis = self.vis_rect();
-        self.geo.clear();
-        self.settings.wind_tunnel = true;
-        self.geo.apply_wind_tunnel(true);
-        self.geo.stamp_preset(preset, vis);
-        self.undo.clear();
-        self.reset_flow();
-    }
 
     /// Switch grid resolution, resampling the current visible scene.
     pub fn set_resolution(&mut self, res_index: usize) {
@@ -793,42 +751,17 @@ impl GpuSim {
         self.rebuild_grid(self.vis_w, self.vis_h, margin);
     }
 
-    /// Rebuild the full grid at a new visible size and/or margin, carrying
-    /// the visible content across (nearest-neighbour when scaling).
+    /// Rebuild the full grid at a new visible size and/or margin. The
+    /// sketch model re-rasterizes the content afterwards, so no raster
+    /// transfer happens here.
     fn rebuild_grid(&mut self, vis_w: usize, vis_h: usize, margin: usize) {
-        // Strip tunnel edges first so they aren't captured or smeared into
-        // ghost columns; the tunnel is re-applied on the new grid.
-        if self.settings.wind_tunnel {
-            self.geo.apply_wind_tunnel(false);
-        }
-        let old_vis = self.geo.extract(self.vis_rect());
-        let old_vis_geo = geometry_from_region(&old_vis);
-
         self.vis_w = vis_w;
         self.vis_h = vis_h;
         self.margin = margin;
         let (w, h) = (vis_w + 2 * margin, vis_h + 2 * margin);
-
-        let mut tmp = Geometry::new(vis_w, vis_h);
-        tmp.resample_from(&old_vis_geo);
         let mut geo = Geometry::new(w, h);
-        geo.restore(&crate::geometry::GeoRegion {
-            rect: (
-                margin as i32,
-                margin as i32,
-                (margin + vis_w) as i32,
-                (margin + vis_h) as i32,
-            ),
-            cell: tmp.cell,
-            fan: tmp.fan,
-            dye_src: tmp.dye_src,
-        });
-        if self.settings.wind_tunnel {
-            geo.apply_wind_tunnel(true);
-        }
         geo.dirty = Some(GridRect::full(w, h));
         self.geo = geo;
-
         self.bufs = Self::create_grid_buffers(
             &self.device,
             w,
@@ -842,7 +775,6 @@ impl GpuSim {
             &self.render_uniform,
             &self.particles,
         );
-        self.undo.clear();
         self.clear_particles();
         self.reset_flow();
     }
@@ -854,29 +786,8 @@ impl GpuSim {
             .write_buffer(&self.particles, 0, &vec![0u8; (MAX_PARTICLES * 16) as usize]);
     }
 
-    pub fn undo_action(&mut self) {
-        if let Some(e) = self.undo.pop_undo() {
-            self.geo.restore(&e.before);
-            self.reassert_tunnel();
-            self.undo.push_redo(e);
-        }
-    }
 
-    pub fn redo_action(&mut self) {
-        if let Some(e) = self.undo.pop_redo() {
-            self.geo.restore(&e.after);
-            self.reassert_tunnel();
-            self.undo.push_undo_back(e);
-        }
-    }
 
-    /// Stroke snapshots can capture tunnel edge cells; after restoring one,
-    /// re-assert the tunnel so the boundary matches the toggle.
-    pub fn reassert_tunnel(&mut self) {
-        if self.settings.wind_tunnel {
-            self.geo.apply_wind_tunnel(true);
-        }
-    }
 
     /// Upload any dirty geometry region to the GPU. Called after all edits
     /// for the frame have been applied.
@@ -1167,103 +1078,7 @@ impl GpuSim {
 
     // --- Scene files --------------------------------------------------
 
-    /// Scene files store the VISIBLE window's content only, so they are
-    /// portable across margin settings.
-    pub fn save_scene(&self, path: &std::path::Path) -> Result<(), String> {
-        // Don't bake tunnel edges into the file when the margin is zero
-        // (they'd sit inside the visible window); reconstruct on load.
-        let vis = if self.margin == 0 && self.settings.wind_tunnel {
-            let mut g = geometry_from_region(&self.geo.extract(self.vis_rect()));
-            g.apply_wind_tunnel(false);
-            crate::geometry::GeoRegion {
-                rect: (0, 0, g.w as i32, g.h as i32),
-                cell: g.cell,
-                fan: g.fan,
-                dye_src: g.dye_src,
-            }
-        } else {
-            self.geo.extract(self.vis_rect())
-        };
-        let scene = crate::geometry::SceneFile {
-            version: crate::geometry::SCENE_VERSION,
-            w: self.vis_w as u32,
-            h: self.vis_h as u32,
-            cell: vis.cell,
-            fan: vis.fan,
-            dye_src: vis.dye_src,
-            wind_tunnel: self.settings.wind_tunnel,
-            flow_speed: self.settings.flow_speed,
-            viscosity: self.settings.viscosity,
-        };
-        let bytes = bincode::serialize(&scene).map_err(|e| e.to_string())?;
-        std::fs::write(path, bytes).map_err(|e| e.to_string())
-    }
 
-    pub fn load_scene(&mut self, path: &std::path::Path) -> Result<(), String> {
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        // Peek the version first: an old-layout file usually fails full
-        // deserialization with an unhelpful I/O error otherwise (bincode
-        // fixint LE stores the leading u32 verbatim).
-        if bytes.len() < 4 {
-            return Err("corrupt scene file".into());
-        }
-        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if version != crate::geometry::SCENE_VERSION {
-            return Err(format!("unsupported scene version {version}"));
-        }
-        let scene: crate::geometry::SceneFile =
-            bincode::deserialize(&bytes).map_err(|e| e.to_string())?;
-        if scene.version != crate::geometry::SCENE_VERSION {
-            return Err(format!("unsupported scene version {}", scene.version));
-        }
-        let (sw, sh) = (scene.w as usize, scene.h as usize);
-        if sw == 0
-            || sh == 0
-            || sw * sh != scene.cell.len()
-            || scene.fan.len() != scene.cell.len()
-            || scene.dye_src.len() != scene.cell.len()
-        {
-            return Err("corrupt scene file".into());
-        }
-        // Scene files never contain tunnel cells (save_scene stores the
-        // visible window and strips edges in the margin-zero case), so
-        // the content is used as-is; the tunnel is re-applied below.
-        let loaded = Geometry {
-            w: sw,
-            h: sh,
-            cell: scene.cell,
-            fan: scene.fan,
-            dye_src: scene.dye_src,
-            dirty: None,
-        };
-        // Resample into the visible window of the current grid.
-        let mut tmp = Geometry::new(self.vis_w, self.vis_h);
-        tmp.resample_from(&loaded);
-        let mut geo = Geometry::new(self.geo.w, self.geo.h);
-        geo.restore(&crate::geometry::GeoRegion {
-            rect: (
-                self.margin as i32,
-                self.margin as i32,
-                (self.margin + self.vis_w) as i32,
-                (self.margin + self.vis_h) as i32,
-            ),
-            cell: tmp.cell,
-            fan: tmp.fan,
-            dye_src: tmp.dye_src,
-        });
-        geo.dirty = Some(GridRect::full(self.geo.w, self.geo.h));
-        self.geo = geo;
-        self.settings.wind_tunnel = scene.wind_tunnel;
-        self.settings.flow_speed = scene.flow_speed;
-        self.settings.viscosity = scene.viscosity;
-        if self.settings.wind_tunnel {
-            self.geo.apply_wind_tunnel(true);
-        }
-        self.undo.clear();
-        self.clear_particles();
-        self.reset_flow();
-        Ok(())
-    }
 
     /// Rough Reynolds number using a cylinder-preset-sized obstacle.
     pub fn reynolds_estimate(&self) -> u32 {
