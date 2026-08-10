@@ -435,6 +435,9 @@ impl FlowPaintApp {
     }
 
     fn ribbon_results(&mut self, ui: &mut egui::Ui, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
+        // Results is the widest tab once the tracks merged; slightly
+        // narrower sliders keep the full control set inside 900 px.
+        ui.spacing_mut().slider_width = 56.0;
         group(ui, "Field", |ui| {
             for m in RenderMode::ALL {
                 let icon = match m {
@@ -552,27 +555,35 @@ impl FlowPaintApp {
             });
         });
         // Requests only — the canvas consumes them, where the viewport
-        // geometry is known (Half B of U1).
+        // geometry is known (Half B of U1). A vertical stack of compact
+        // buttons, not ribbon_buttons: with T2-A and T2-B merged in, the
+        // Results tab has no horizontal room left at the 900 px minimum,
+        // and the wide three-button row clipped 1:1 and Selection.
         group(ui, "View", |ui| {
-            if theme::ribbon_button(ui, false, false, ph::FRAME_CORNERS, "Fit")
-                .on_hover_text("Fit the domain in the window. Shortcut: Ctrl+0.")
-                .clicked()
-            {
-                self.view_request = Some(ViewRequest::Fit);
-            }
-            if theme::ribbon_button(ui, false, false, ph::NUMBER_SQUARE_ONE, "1:1")
-                .on_hover_text("Show one grid cell per pixel. Shortcut: Ctrl+1.")
-                .clicked()
-            {
-                self.view_request = Some(ViewRequest::OneToOne);
-            }
-            ui.add_enabled_ui(!self.selected.is_empty(), |ui| {
-                if theme::ribbon_button(ui, false, false, ph::SELECTION, "Selection")
-                    .on_hover_text("Zoom to the selection. Shortcut: Ctrl+2.")
+            ui.vertical(|ui| {
+                if ui
+                    .small_button(format!("{} Fit", ph::FRAME_CORNERS))
+                    .on_hover_text("Fit the domain in the window. Shortcut: Ctrl+0.")
                     .clicked()
                 {
-                    self.view_request = Some(ViewRequest::Selection);
+                    self.view_request = Some(ViewRequest::Fit);
                 }
+                if ui
+                    .small_button(format!("{} 1:1", ph::NUMBER_SQUARE_ONE))
+                    .on_hover_text("Show one grid cell per pixel. Shortcut: Ctrl+1.")
+                    .clicked()
+                {
+                    self.view_request = Some(ViewRequest::OneToOne);
+                }
+                ui.add_enabled_ui(!self.selected.is_empty(), |ui| {
+                    if ui
+                        .small_button(format!("{} Selection", ph::SELECTION))
+                        .on_hover_text("Zoom to the selection. Shortcut: Ctrl+2.")
+                        .clicked()
+                    {
+                        self.view_request = Some(ViewRequest::Selection);
+                    }
+                });
             });
         });
     }
