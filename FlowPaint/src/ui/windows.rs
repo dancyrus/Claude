@@ -36,7 +36,12 @@ impl FlowPaintApp {
             .show(ctx, |ui| {
                 egui::Grid::new("shortcuts").striped(true).show(ui, |ui| {
                     for (k, v) in [
-                        ("Space", "pause / resume"),
+                        ("Space (release)", "pause / resume"),
+                        ("Scroll / pinch", "zoom at the cursor"),
+                        ("Middle-drag / Space+drag", "pan the view"),
+                        ("Ctrl+0", "fit the domain to the window"),
+                        ("Ctrl+1", "1:1 — one cell per pixel"),
+                        ("Ctrl+2", "zoom to the selected object"),
                         ("Ctrl+Z / Ctrl+Y", "undo / redo"),
                         (
                             "S / L / R / E / P / B",

@@ -105,3 +105,15 @@ pub(crate) fn fmt_sim_rate(r: f32) -> String {
         format!("{r:.2}× real")
     }
 }
+
+/// Zoom level as a percentage: 100 % = one grid cell per framebuffer
+/// pixel (px_per_cell × 100). One decimal below 10 % so extreme
+/// zoom-out doesn't floor to "0 %".
+pub(crate) fn fmt_zoom(px_per_cell: f32) -> String {
+    let pct = px_per_cell * 100.0;
+    if pct < 9.95 {
+        format!("{pct:.1} %")
+    } else {
+        format!("{pct:.0} %")
+    }
+}
