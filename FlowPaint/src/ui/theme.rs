@@ -65,6 +65,18 @@ pub(crate) const HANDLE_OUTLINE: Color32 = VIEW_BG;
 pub(crate) const GRID_HINT: Color32 = Color32::from_rgba_premultiplied(52, 54, 55, 12);
 /// Scale bar and its length label (drawn over the field view).
 pub(crate) const SCALE_BAR: Color32 = INK;
+/// Probe marker and plot-series colors (T2-B), indexed by probe slot:
+/// distinct hues that read on both the dark canvas and the plot panel.
+pub(crate) const PROBE_COLORS: [Color32; 8] = [
+    SEL,                              // teal
+    Color32::from_rgb(209, 162, 74),  // amber (WARN)
+    Color32::from_rgb(96, 165, 250),  // sky
+    Color32::from_rgb(232, 121, 180), // pink
+    Color32::from_rgb(134, 197, 116), // green
+    Color32::from_rgb(167, 139, 250), // violet
+    Color32::from_rgb(207, 111, 98),  // coral (BAD)
+    INK,                              // near-white
+];
 
 // --- Geometry ---------------------------------------------------------
 

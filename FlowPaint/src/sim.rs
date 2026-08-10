@@ -4,7 +4,8 @@
 //! callback encodes the compute + render work each frame.
 
 use crate::geometry::{Geometry, GridRect};
-use std::sync::{mpsc, Arc};
+use std::collections::VecDeque;
+use std::sync::{mpsc, Arc, Mutex};
 
 /// Visible-canvas resolutions; the simulated grid is larger by the margin.
 pub const RESOLUTIONS: [(&str, usize, usize); 4] = [
@@ -32,6 +33,136 @@ pub const PARTICLE_CHOICES: [(&str, u32); 4] = [
     ("2 M", 2_000_000),
 ];
 pub const MAX_PARTICLES: u64 = 2_000_000;
+
+// --- Probes (plan v4.1, T2-B) -----------------------------------------
+//
+// Persistent point probes: positions, sample history and the plot-panel
+// preferences live behind a process-wide handle for the same reason the
+// T2-A color-range state does — the UI panels never hold `&mut GpuSim`
+// (it lives in egui-wgpu's `CallbackResources`) and app.rs
+// (`Cmd`/`UiSnapshot`) is frozen while Track 1 runs. Fold into app
+// state at the track merge. The sampling itself is sim machinery: a
+// tiny per-frame GPU copy into a mapped-ring staging buffer, drained a
+// couple of frames later without ever blocking a frame.
+
+pub const MAX_PROBES: usize = 8;
+/// Sample history cap per probe, in sampled frames; the oldest samples
+/// drop. The plot panel states this cap, per the plan.
+pub const PROBE_HISTORY_CAP: usize = 2048;
+
+#[derive(Clone, Copy)]
+pub struct ProbeSample {
+    /// Lattice steps since the last flow reset (the x axis; the UI
+    /// converts to seconds with the current Δt).
+    pub steps: f32,
+    /// Velocity-buffer value at the probe cell (render units: LBM
+    /// cells/step, Euler u·dt).
+    pub vel: [f32; 2],
+    /// Central-difference curl of the velocity buffer, the same stencil
+    /// as render.wgsl's vorticity view (render units).
+    pub curl: f32,
+    /// Density-buffer deviation from the reference 1.0.
+    pub drho: f32,
+    /// Smoke luminance at the probe, arbitrary units.
+    pub dye: f32,
+}
+
+pub struct Probe {
+    pub id: u32,
+    /// Position in visible-canvas cells (margin-independent; rescaled
+    /// with the grid on resolution changes, like sketch objects).
+    pub pos: [f32; 2],
+    pub samples: VecDeque<ProbeSample>,
+}
+
+/// Which quantity the plot panel draws (a UI preference).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProbeQuantity {
+    Speed,
+    Vorticity,
+    Pressure,
+    Smoke,
+}
+
+impl ProbeQuantity {
+    pub const ALL: [ProbeQuantity; 4] = [
+        ProbeQuantity::Speed,
+        ProbeQuantity::Vorticity,
+        ProbeQuantity::Pressure,
+        ProbeQuantity::Smoke,
+    ];
+    pub fn label(&self) -> &'static str {
+        match self {
+            ProbeQuantity::Speed => "Speed",
+            ProbeQuantity::Vorticity => "Vorticity",
+            ProbeQuantity::Pressure => "Pressure",
+            ProbeQuantity::Smoke => "Smoke",
+        }
+    }
+}
+
+/// The canvas view transform, published by the sim every frame so the
+/// UI can draw probe markers over the canvas without owning the canvas
+/// (framebuffer px, same convention as `ViewportMapping`).
+#[derive(Clone, Copy)]
+pub struct ProbeView {
+    pub vp_origin: [f32; 2],
+    pub vp_size: [f32; 2],
+    pub lb_origin: [f32; 2],
+    pub px_per_cell: f32,
+}
+
+pub struct ProbeSet {
+    pub probes: Vec<Probe>,
+    pub next_id: u32,
+    /// UI: the next canvas click places a probe while this is set.
+    pub arming: bool,
+    pub show_plot: bool,
+    pub quantity: ProbeQuantity,
+    pub view: Option<ProbeView>,
+}
+
+static PROBES: Mutex<ProbeSet> = Mutex::new(ProbeSet {
+    probes: Vec::new(),
+    next_id: 1,
+    arming: false,
+    show_plot: false,
+    quantity: ProbeQuantity::Speed,
+    view: None,
+});
+
+/// Shared probe state (see the module note above `MAX_PROBES`).
+pub fn probes() -> &'static Mutex<ProbeSet> {
+    &PROBES
+}
+
+/// One probe-readback staging buffer and where it is in the copy → map
+/// → read round trip. Copies encode in frame N (submitted right after
+/// `encode_compute` returns), the map request goes out in frame N+1,
+/// and the data drains on whichever later frame the map completes.
+struct ProbeStage {
+    buf: wgpu::Buffer,
+    state: ProbeStageState,
+    /// Probe ids in slot order at copy time (the set can change before
+    /// the data comes back).
+    ids: Vec<u32>,
+    /// `total_steps` when the copy was encoded.
+    stamp: f32,
+    /// Flow-reset generation at copy time; stale data is dropped.
+    generation: u32,
+}
+
+enum ProbeStageState {
+    Free,
+    Copied,
+    /// The map callback fills the slot (an mpsc receiver would make
+    /// `GpuSim: !Sync`, which `CallbackResources` requires).
+    Mapping(Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>>),
+}
+
+/// Per-probe slot layout in a staging buffer: vel at c, c+1, c-1, c+W,
+/// c-W (5 × 8 B), rho (4 B at +40), dye rgba (16 B at +48).
+const PROBE_SLOT_BYTES: u64 = 64;
 
 /// Which solver advances the flow.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -311,6 +442,11 @@ pub struct GpuSim {
     pub step_once: bool,
     /// Steps actually encoded last frame (for stats/particle dt).
     pub steps_last_frame: u32,
+    /// Probe-readback staging ring (T2-B).
+    probe_stages: Vec<ProbeStage>,
+    /// Bumped on every flow reset so in-flight probe readbacks from the
+    /// old flow are dropped instead of appended.
+    probe_generation: u32,
 }
 
 /// Margin size in cells for a visible size and margin fraction, clamped so
@@ -630,6 +766,21 @@ impl GpuSim {
             &particles,
         );
 
+        let probe_stages = (0..3)
+            .map(|i| ProbeStage {
+                buf: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("probe staging {i}")),
+                    size: MAX_PROBES as u64 * PROBE_SLOT_BYTES,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                state: ProbeStageState::Free,
+                ids: Vec::new(),
+                stamp: 0.0,
+                generation: 0,
+            })
+            .collect();
+
         let sim = Self {
             device,
             queue,
@@ -671,6 +822,8 @@ impl GpuSim {
             pending_clear_dye: true,
             step_once: false,
             steps_last_frame: 0,
+            probe_stages,
+            probe_generation: 0,
         };
         // Content (including tunnel bands) is projected from the sketch
         // model on the first frame.
@@ -695,11 +848,15 @@ impl GpuSim {
         particles: &wgpu::Buffer,
     ) -> GridBuffers {
         let n = (w * h) as u64;
+        // COPY_SRC so the probe sampler (T2-B) can copy single cells out
+        // of the field buffers; a usage flag costs nothing at rest.
         let mk = |label: &str, size: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             })
         };
@@ -853,11 +1010,17 @@ impl GpuSim {
     }
 
     /// Queue a full flow reset (populations to the freestream, dye
-    /// cleared, sim clock zeroed).
+    /// cleared, sim clock zeroed). Probe histories describe the old flow
+    /// and the sim clock they are stamped with restarts, so they clear
+    /// too (the probes themselves stay).
     pub fn reset_flow(&mut self) {
         self.pending_reset = true;
         self.pending_clear_dye = true;
         self.total_steps = 0.0;
+        self.probe_generation = self.probe_generation.wrapping_add(1);
+        for p in probes().lock().unwrap().probes.iter_mut() {
+            p.samples.clear();
+        }
     }
 
     /// CFL-limited time step for the Euler solver (nondimensional).
@@ -926,6 +1089,15 @@ impl GpuSim {
     /// sketch model re-rasterizes the content afterwards, so no raster
     /// transfer happens here.
     fn rebuild_grid(&mut self, vis_w: usize, vis_h: usize, margin: usize) {
+        // Probe positions are visible-canvas cells; scale them with the
+        // grid the same way the sketch model rescales its objects.
+        let scale = vis_w as f32 / self.vis_w.max(1) as f32;
+        if (scale - 1.0).abs() > 1e-6 {
+            for p in probes().lock().unwrap().probes.iter_mut() {
+                p.pos[0] *= scale;
+                p.pos[1] *= scale;
+            }
+        }
         self.vis_w = vis_w;
         self.vis_h = vis_h;
         self.margin = margin;
@@ -1162,6 +1334,134 @@ impl GpuSim {
             pass.set_bind_group(0, &self.bufs.part_bind, &[]);
             pass.dispatch_workgroups(self.settings.particle_count.div_ceil(256), 1, 1);
         }
+
+        // Probe sampling encodes buffer copies, which cannot live inside
+        // a compute pass.
+        drop(pass);
+        self.encode_probe_copies(encoder, steps);
+    }
+
+    /// Probe sampling (T2-B): drain any staging whose map completed,
+    /// advance last frame's copies to a map request, and encode this
+    /// frame's per-probe copies into a free staging. The round trip is
+    /// copy (frame N) → map request (N+1) → read (N+2 or later); a busy
+    /// GPU only stalls the ring, never the frame.
+    fn encode_probe_copies(&mut self, encoder: &mut wgpu::CommandEncoder, steps: u32) {
+        if self.probe_stages.iter().all(|s| matches!(s.state, ProbeStageState::Free))
+            && (steps == 0 || probes().lock().unwrap().probes.is_empty())
+        {
+            return;
+        }
+        // Pump map callbacks without waiting.
+        let _ = self.device.poll(wgpu::Maintain::Poll);
+        for st in &mut self.probe_stages {
+            match &st.state {
+                ProbeStageState::Mapping(slot) => {
+                    let taken = slot.lock().unwrap().take();
+                    match taken {
+                        Some(Ok(())) => {
+                            if st.generation == self.probe_generation {
+                                let data = st.buf.slice(..).get_mapped_range();
+                                let mut pr = probes().lock().unwrap();
+                                for (slot, id) in st.ids.iter().enumerate() {
+                                    let base = slot * PROBE_SLOT_BYTES as usize;
+                                    let f = |off: usize| -> f32 {
+                                        f32::from_le_bytes(
+                                            data[base + off..base + off + 4]
+                                                .try_into()
+                                                .unwrap(),
+                                        )
+                                    };
+                                    // Same stencil as render.wgsl's vorticity
+                                    // view (slot layout: see PROBE_SLOT_BYTES).
+                                    let curl =
+                                        0.5 * ((f(12) - f(20)) - (f(24) - f(32)));
+                                    let sample = ProbeSample {
+                                        steps: st.stamp,
+                                        vel: [f(0), f(4)],
+                                        curl,
+                                        drho: f(40) - 1.0,
+                                        dye: 0.2126 * f(48)
+                                            + 0.7152 * f(52)
+                                            + 0.0722 * f(56),
+                                    };
+                                    if let Some(p) =
+                                        pr.probes.iter_mut().find(|p| p.id == *id)
+                                    {
+                                        p.samples.push_back(sample);
+                                        if p.samples.len() > PROBE_HISTORY_CAP {
+                                            p.samples.pop_front();
+                                        }
+                                    }
+                                }
+                                drop(data);
+                            }
+                            st.buf.unmap();
+                            st.state = ProbeStageState::Free;
+                        }
+                        Some(Err(_)) => {
+                            st.state = ProbeStageState::Free;
+                        }
+                        None => {}
+                    }
+                }
+                ProbeStageState::Copied => {
+                    // The copies encoded last frame are submitted by now;
+                    // the map may be requested.
+                    let slot = Arc::new(Mutex::new(None));
+                    let cb = Arc::clone(&slot);
+                    st.buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                        *cb.lock().unwrap() = Some(r);
+                    });
+                    st.state = ProbeStageState::Mapping(slot);
+                }
+                ProbeStageState::Free => {}
+            }
+        }
+        if steps == 0 {
+            return; // paused: time does not advance, so no new sample
+        }
+        let pr = probes().lock().unwrap();
+        if pr.probes.is_empty() {
+            return;
+        }
+        let Some(stage_idx) = self
+            .probe_stages
+            .iter()
+            .position(|s| matches!(s.state, ProbeStageState::Free))
+        else {
+            return; // ring full; skip this frame's sample
+        };
+        let w = self.geo.w as u64;
+        let dye_buf =
+            if self.bufs.dye_side == 0 { &self.bufs.dye_a } else { &self.bufs.dye_b };
+        let mut ids = Vec::new();
+        for (slot, p) in pr.probes.iter().take(MAX_PROBES).enumerate() {
+            // Clamp one cell in from the visible edge so the curl
+            // stencil stays in bounds even with no margin.
+            let x = (p.pos[0].floor() as i64).clamp(1, self.vis_w as i64 - 2)
+                + self.margin as i64;
+            let y = (p.pos[1].floor() as i64).clamp(1, self.vis_h as i64 - 2)
+                + self.margin as i64;
+            let c = y as u64 * w + x as u64;
+            let st = &self.probe_stages[stage_idx];
+            let dst = slot as u64 * PROBE_SLOT_BYTES;
+            let vel = &self.bufs.vel;
+            encoder.copy_buffer_to_buffer(vel, c * 8, &st.buf, dst, 8);
+            encoder.copy_buffer_to_buffer(vel, (c + 1) * 8, &st.buf, dst + 8, 8);
+            encoder.copy_buffer_to_buffer(vel, (c - 1) * 8, &st.buf, dst + 16, 8);
+            encoder.copy_buffer_to_buffer(vel, (c + w) * 8, &st.buf, dst + 24, 8);
+            encoder.copy_buffer_to_buffer(vel, (c - w) * 8, &st.buf, dst + 32, 8);
+            encoder.copy_buffer_to_buffer(&self.bufs.rho, c * 4, &st.buf, dst + 40, 4);
+            encoder.copy_buffer_to_buffer(dye_buf, c * 16, &st.buf, dst + 48, 16);
+            ids.push(p.id);
+        }
+        drop(pr);
+        let st = &mut self.probe_stages[stage_idx];
+        st.ids = ids;
+        st.stamp = self.total_steps as f32;
+        st.generation = self.probe_generation;
+        st.state = ProbeStageState::Copied;
     }
 
     /// Write the render uniform for the current viewport mapping.
@@ -1184,6 +1484,14 @@ impl GpuSim {
             particle_brightness: self.settings.particle_brightness,
         };
         self.queue.write_buffer(&self.render_uniform, 0, bytemuck::bytes_of(&p));
+        // Publish the canvas view so the UI can draw probe markers over
+        // the field without owning the canvas (T2-B).
+        probes().lock().unwrap().view = Some(ProbeView {
+            vp_origin: self.mapping.vp_origin,
+            vp_size: self.mapping.vp_size,
+            lb_origin: self.mapping.lb_origin,
+            px_per_cell: self.mapping.px_per_cell,
+        });
     }
 
     /// Draw the field (and particles) into the current render pass. The

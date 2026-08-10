@@ -3,11 +3,13 @@
 //! Clicking writes the existing `FlowPaintApp::selected`; the tree is a
 //! new reader and writer of existing selection state, not new state.
 
-use crate::app::FlowPaintApp;
+use crate::app::{FlowPaintApp, Tool};
 use crate::model::Shape;
+use crate::sim::{probes, MAX_PROBES};
 use eframe::egui;
 
 use super::theme;
+use super::units::fmt_len;
 
 impl FlowPaintApp {
     pub(in crate::app) fn tree_panel(&mut self, ctx: &egui::Context) {
@@ -108,5 +110,82 @@ impl FlowPaintApp {
                 });
             }
         });
+
+        self.tree_probes(ui);
+    }
+
+    /// The probe section (plan v4.1, T2-B): persistent point probes as
+    /// tree entries with a delete action, plus the place-probe arming
+    /// button. Probes are not sketch objects — they live in the shared
+    /// probe store, not the model — so this section reads and writes
+    /// that store directly.
+    fn tree_probes(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("Probes")
+                .small()
+                .color(theme::INK_3),
+        );
+        // Snapshot rows first: the delete action mutates the store, so
+        // the row loop must not hold its lock.
+        let (rows, count, arming) = {
+            let pr = probes().lock().unwrap();
+            let ps = self.phys_cache;
+            let rows: Vec<(u32, String, String)> = pr
+                .probes
+                .iter()
+                .map(|p| {
+                    (
+                        p.id,
+                        format!("Probe P{} ({:.0}, {:.0})", p.id, p.pos[0], p.pos[1]),
+                        format!(
+                            "at {} , {} from the top-left corner",
+                            fmt_len(ps.len_m(p.pos[0])),
+                            fmt_len(ps.len_m(p.pos[1]))
+                        ),
+                    )
+                })
+                .collect();
+            (rows, pr.probes.len(), pr.arming)
+        };
+        let mut remove: Option<u32> = None;
+        ui.indent("tree_probes", |ui| {
+            for (id, label, hover) in &rows {
+                let resp = ui.selectable_label(false, label).on_hover_text(hover);
+                resp.context_menu(|ui| {
+                    if ui.button("Delete").clicked() {
+                        remove = Some(*id);
+                        ui.close_menu();
+                    }
+                });
+            }
+            let full = count >= MAX_PROBES;
+            let resp = ui.add_enabled(
+                !full && !arming,
+                egui::Button::new(if arming { "Click the canvas…" } else { "+ Add probe" })
+                    .small(),
+            );
+            let resp = resp
+                .on_hover_text("Place a probe with one canvas click (Esc cancels)")
+                .on_disabled_hover_text(if full {
+                    "8 probes maximum"
+                } else {
+                    "Click the canvas to place the probe (Esc cancels)"
+                });
+            if resp.clicked() {
+                probes().lock().unwrap().arming = true;
+                // Placing a probe must not also draw a shape.
+                self.finish_gesture();
+                self.tool = Tool::Select;
+                self.status =
+                    "Click the canvas to place the probe (Esc cancels).".into();
+            }
+        });
+        if let Some(id) = remove {
+            let mut pr = probes().lock().unwrap();
+            pr.probes.retain(|p| p.id != id);
+            if pr.probes.is_empty() {
+                pr.show_plot = false;
+            }
+        }
     }
 }

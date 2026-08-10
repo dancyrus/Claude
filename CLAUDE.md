@@ -17,9 +17,42 @@ panel arrangement — not for widget construction or numeric values.
 
 ## Unit status (plan v4.1)
 
-- **U1 (cleanup + navigation): done**, branch `ui/u1-navigation`.
-  Next: U2 (one author, no delegation) and T2-A may run concurrently;
-  T2-B waits for U1 to merge (`ui/status.rs`).
+- **Branch names** (real git branches; `ui/u1-navigation` in older notes
+  is wrong — that branch does not exist):
+  - U1: `claude/flowpaint-v4.1-u1-nav-o8c1im`
+  - T2-A: `claude/t2a-color-range-opuijy` (off `34d57aa`, like U1)
+  - T2-B: `claude/flowpaint-v4.1-t2b-probes` (off the U1 tip)
+- **U1 (cleanup + navigation): done.** Next: U2 (one author, no
+  delegation) may run concurrently with Track 2.
+- **T2-A (color range + colormap): done** on its branch. Nothing is
+  merged yet; the default branch has neither track. Its decisions, which
+  T2-B and later units must not re-derive or "fix" into app.rs:
+  - Color-range + colormap state lives behind `sim::color_ranges()` (a
+    `Mutex` in `sim.rs`) ONLY because `app.rs` (`Cmd`/`UiSnapshot`) is
+    frozen for Track 1 and panels never hold `&mut GpuSim`. Fold into
+    `Settings` + `Cmd` at the track merge.
+  - Locked ranges and colormap picks are **not scene-persisted** (scene
+    IO is app.rs); U5 needs them persisted — add with the format bump at
+    the merge.
+  - `render.wgsl` has ONE approved edit: flags bit 1 = swap the view's
+    colormap (no uniform added or reordered). Not a violation of the
+    no-shader rule.
+- **T2-B (probes + Re input): done** on its branch (needs U1's
+  `ui/status.rs`; independent of T2-A). Decisions:
+  - Probe storage follows the T2-A precedent: `sim::probes()` (a `Mutex`
+    in `sim.rs`) holds positions, ring-capped histories (2048 frames,
+    stated in the plot panel) and plot preferences; not scene-persisted.
+    Fold into app state at the merge.
+  - Sampling is a per-frame GPU copy of single cells into a 3-deep
+    mapped staging ring (copy → map next frame → read when done; never
+    blocks a frame). Field buffers gained `COPY_SRC` for it.
+  - The sim publishes the canvas view transform through the probe store
+    so `ui/status.rs` can draw probe markers without touching Track 1's
+    `ui/canvas.rs`; probe placement is an armed raw click (tree button →
+    next canvas click, Esc cancels).
+  - Probe plot conversions duplicate the legend's shader-inversion
+    factors (T2-A keeps its own copy in `ui/legend.rs`) — unify both
+    into `ui/units.rs` at the merge.
 - Scene format: **v5** current, loads v3+ (v3 lacks solver fields; v4/v5
   share a layout — see `SceneV3`/`SceneV4` in `app.rs`).
 - U1 decisions a later unit must not re-derive:
