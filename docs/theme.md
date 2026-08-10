@@ -108,3 +108,18 @@ the delta is the ribbon/tree/settings chrome being software-rendered.
 On real GPU hardware egui's few hundred triangles are sub-millisecond;
 re-run `FlowPaint-V2 --bench` on target hardware with the CI artifacts
 of 1f00ef2 vs phase 3b for a hardware-true verdict.
+
+## Post-U1 measurement (plan v4.1, free zoom/pan + control cleanup)
+
+Paired back-to-back A/B on a fresh container (new lavapipe/Mesa install,
+so absolute numbers are not comparable to the tables above):
+
+```
+A = pre-U1 856cca4   bench: 300 frames  mean 1045.28 ms  p99 1253.02 ms
+B = U1 merged        bench: 300 frames  mean 1055.65 ms  p99 1230.71 ms
+```
+
+Mean +1.0 %, p99 −1.8 % — inside this host's run-to-run noise. Expected:
+the bench never zooms, and fit mode is algebraically identical to the
+old letterbox mapping; the only additions on the hot path are the scale
+bar (a few egui shapes) and one status segment.
