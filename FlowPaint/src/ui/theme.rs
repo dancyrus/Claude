@@ -219,3 +219,58 @@ pub(crate) fn heading(text: impl Into<String>) -> egui::RichText {
 pub(crate) fn mono_small(ui: &mut egui::Ui, text: String) -> egui::Response {
     ui.label(egui::RichText::new(text).monospace().size(10.0))
 }
+
+/// A ribbon button: phosphor icon over a text label (never icon-only),
+/// with the mockup's `.bt` styling — flat at rest, hairline on hover,
+/// teal selected state, coral tint for destructive actions. Painted
+/// manually so the two type sizes stay centered as a unit.
+pub(crate) fn ribbon_button(
+    ui: &mut egui::Ui,
+    on: bool,
+    destructive: bool,
+    icon: &str,
+    label: &str,
+) -> egui::Response {
+    let label_w = ui.fonts(|f| {
+        f.layout_no_wrap(label.to_owned(), FontId::proportional(10.0), Color32::WHITE)
+            .size()
+            .x
+    });
+    let size = egui::vec2((label_w + 14.0).max(52.0), 46.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let base_ink = if !ui.is_enabled() {
+        INK_3
+    } else if destructive {
+        BAD
+    } else {
+        INK_2
+    };
+    let (fill, stroke, ink) = if on {
+        (SEL_BG, Stroke::new(1.0, SEL), SEL_INK)
+    } else if resp.hovered() {
+        (
+            PANEL_2,
+            Stroke::new(1.0, if destructive { BAD } else { LINE_2 }),
+            if destructive { BAD } else { INK },
+        )
+    } else {
+        (Color32::TRANSPARENT, Stroke::NONE, base_ink)
+    };
+    let p = ui.painter();
+    p.rect(rect, Rounding::same(RADIUS), fill, stroke);
+    p.text(
+        rect.center_top() + egui::vec2(0.0, 15.0),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        FontId::proportional(16.0),
+        ink,
+    );
+    p.text(
+        rect.center_bottom() - egui::vec2(0.0, 10.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(10.0),
+        ink,
+    );
+    resp
+}

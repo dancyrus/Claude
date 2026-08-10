@@ -1,7 +1,7 @@
 //! The object inspector (selected-object properties) and the defaults
 //! panel for newly drawn objects.
 
-use crate::app::{fmt_len, Cmd, FlowPaintApp, Gesture, UiSnapshot};
+use crate::app::{fmt_len, Cmd, FlowPaintApp, Gesture};
 use crate::model::{ObjMaterial, Shape};
 use crate::sim::RenderMode;
 use eframe::egui;
@@ -14,12 +14,7 @@ impl FlowPaintApp {
     /// inspector, defaults) moved here unchanged from the old control
     /// column — the mid-gesture guard exists because the inspector
     /// fights an active drag.
-    pub(in crate::app) fn settings_panel(
-        &mut self,
-        ctx: &egui::Context,
-        snap: UiSnapshot,
-        cmds: &mut Vec<Cmd>,
-    ) {
+    pub(in crate::app) fn settings_panel(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
         egui::SidePanel::left("settings")
             .resizable(true)
             .default_width(theme::dim::SETTINGS_WIDTH)
@@ -43,13 +38,6 @@ impl FlowPaintApp {
                         } else {
                             self.defaults_panel(ui, cmds);
                         }
-                        ui.separator();
-                        // Phase 3a holding pen: every remaining control,
-                        // reachable and scrollable until 3b moves them
-                        // into the ribbon.
-                        egui::CollapsingHeader::new("All controls (ribbon pending, 3b)")
-                            .default_open(true)
-                            .show(ui, |ui| self.legacy_controls(ui, snap, cmds));
                     });
             });
     }

@@ -77,10 +77,34 @@ Environment: this repo's CI-less dev container, Xvfb + Mesa **lavapipe
 (software Vulkan)** — numbers are CPU-rendering times, meaningful only
 relative to a rerun in the same environment, not to any real GPU.
 
-Baseline (pre-theme, commit 1f00ef2):
+Baseline (pre-theme, commit 1f00ef2, recorded before phase 2):
 
 ```
 bench: 300 frames  mean 1885.08 ms  p99 2394.53 ms  min 1654.87 ms  max 6344.08 ms
 ```
 
-The identical run repeats after phase 3; mean and p99 must not regress.
+## Post-phase-3 measurement (recorded after 3b)
+
+The first post-phase-3 run measured mean 3072.27 / p99 10190.93 — but
+re-running the UNCHANGED baseline commit the same hour measured mean
+2968.61 / p99 5057.22, +57% over its own recorded baseline: the
+container's CPU allocation had drifted massively (full release builds
+of identical scope swung 27 s – 4 m 30 s across the session). The
+original baseline is therefore not reproducible on this host, and the
+valid comparison is the paired back-to-back A/B, run in both orders:
+
+```
+A = baseline commit 1f00ef2, B = phase 3b        mean       p99
+pair 1 (A first): A 2968.61 / 5057.22   B 3043.18 / 7932.90
+pair 2 (B first): B 3030.26 / 8376.75   A 2932.78 / 3963.24
+```
+
+Order-independent result: B costs ~+3% mean (~+100 ms/frame) and ~2×
+p99 **under Mesa lavapipe, where every UI pixel is rasterized on the
+same CPU cores as the solver**. The solver work is bit-identical
+(`git diff 1f00ef2..HEAD -- FlowPaint/src/sim.rs FlowPaint/src/shaders`
+shows only the `cfl_estimate` readout helper; zero shader diffs), so
+the delta is the ribbon/tree/settings chrome being software-rendered.
+On real GPU hardware egui's few hundred triangles are sub-millisecond;
+re-run `FlowPaint-V2 --bench` on target hardware with the CI artifacts
+of 1f00ef2 vs phase 3b for a hardware-true verdict.

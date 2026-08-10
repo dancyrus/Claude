@@ -7,7 +7,6 @@ mod generators;
 mod inspector;
 mod legend;
 mod menu;
-mod panels;
 mod ribbon;
 mod status;
 pub(super) mod theme;
@@ -27,10 +26,10 @@ pub(super) fn draw(
     cmds: &mut Vec<Cmd>,
 ) {
     app.menu_bar(ctx, snapshot, cmds);
-    app.ribbon(ctx);
+    app.ribbon(ctx, snapshot, cmds);
     app.status_bar(ctx);
     app.tree_panel(ctx);
-    app.settings_panel(ctx, snapshot, cmds);
+    app.settings_panel(ctx, cmds);
     app.legend_panel(ctx, snapshot);
     app.canvas(ctx, cmds);
     app.windows(ctx, snapshot);

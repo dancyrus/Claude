@@ -1,7 +1,8 @@
 //! The bottom of the window: a message line (hover-cell readout plus
 //! the status message), then the status strip — live solver numbers in
-//! monospace: grid, cell size, time step, elapsed sim time, inlet
-//! speed, CFL, MLUPS and Reynolds.
+//! monospace. At narrow widths whole trailing fields are dropped rather
+//! than clipping text mid-word; the fields are ordered so the physics
+//! numbers survive longest.
 
 use crate::app::{fmt_len, fmt_speed, fmt_time, FlowPaintApp};
 use eframe::egui;
@@ -17,7 +18,8 @@ impl FlowPaintApp {
                 }
                 ui.label(&self.status);
             });
-            // Status strip.
+            // Status strip. "CFL (inlet)" because sim.rs computes the
+            // inlet-state Courant estimate, not the field maximum.
             ui.horizontal(|ui| {
                 let ps = self.phys_cache;
                 let re = if self.stats_euler {
@@ -25,20 +27,36 @@ impl FlowPaintApp {
                 } else {
                     format!("Re ≈ {}", self.stats_re)
                 };
-                ui.monospace(format!(
-                    "grid {}×{} (+{})  |  cell {}  |  dt {}  |  t {}  |  u∞ {}  |  CFL {:.2}  |  {} obj  |  {:.0} MLUPS  |  {}",
-                    self.stats_grid.0,
-                    self.stats_grid.1,
-                    self.stats_margin,
-                    fmt_len(ps.dx),
-                    fmt_time(ps.dt),
-                    fmt_time(self.sim_time_s as f32),
-                    fmt_speed(self.stats_u_inf),
-                    self.stats_cfl,
-                    self.model.objects.len(),
-                    self.stats_mlups,
-                    re
-                ));
+                let segments: Vec<String> = vec![
+                    format!(
+                        "grid {}×{} (+{})",
+                        self.stats_grid.0, self.stats_grid.1, self.stats_margin
+                    ),
+                    format!("cell {}", fmt_len(ps.dx)),
+                    format!("dt {}", fmt_time(ps.dt)),
+                    format!("t {}", fmt_time(self.sim_time_s as f32)),
+                    format!("u∞ {}", fmt_speed(self.stats_u_inf)),
+                    format!("CFL (inlet) {:.2}", self.stats_cfl),
+                    format!("{} obj", self.model.objects.len()),
+                    format!("{:.0} MLUPS", self.stats_mlups),
+                    re,
+                ];
+                let sep = "  |  ";
+                let font = egui::TextStyle::Monospace.resolve(ui.style());
+                let avail = ui.available_width();
+                let fits = |n: usize, ui: &egui::Ui| {
+                    let text = segments[..n].join(sep);
+                    ui.fonts(|f| {
+                        f.layout_no_wrap(text, font.clone(), egui::Color32::WHITE)
+                            .size()
+                            .x
+                    }) <= avail
+                };
+                let mut n = segments.len();
+                while n > 1 && !fits(n, ui) {
+                    n -= 1;
+                }
+                ui.monospace(segments[..n].join(sep));
             });
         });
     }
