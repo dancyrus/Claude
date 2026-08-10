@@ -8,10 +8,34 @@ object model (`model.rs`): objects stay live and editable, the grid is a
 damage-region re-projection, **nothing is ever flattened** — any eraser
 must be a per-object, undoable operation (see plan phase 6a).
 
-The UI overhaul spec is `docs/flowpaint-ui-overhaul-plan-v3.md` (v3
-supersedes v2; corrected against `docs/ui-inventory.md`). The layout
-mockup `docs/ui-target.html` is authoritative for spacing, color, type
-and panel arrangement — not for widget construction or numeric values.
+The working plan is `docs/flowpaint-plan-v4.1.md` (six units on two
+tracks; supersedes v4's phase numbering — the v4 reasoning doc was never
+checked in). Standing constraints carry from
+`docs/flowpaint-ui-overhaul-plan-v3.md`; the layout mockup
+`docs/ui-target.html` is authoritative for spacing, color, type and
+panel arrangement — not for widget construction or numeric values.
+
+## Unit status (plan v4.1)
+
+- **U1 (cleanup + navigation): done**, branch `ui/u1-navigation`.
+  Next: U2 (one author, no delegation) and T2-A may run concurrently;
+  T2-B waits for U1 to merge (`ui/status.rs`).
+- Scene format: **v5** current, loads v3+ (v3 lacks solver fields; v4/v5
+  share a layout — see `SceneV3`/`SceneV4` in `app.rs`).
+- U1 decisions a later unit must not re-derive:
+  - Inspector Rotate/Scale DragValues are **staged deltas per selection**
+    (`inspector_stage`), not absolute properties — a selection has no
+    single angle, so this is the form U3 extends to a common pivot.
+  - Zoom/pan is a view transform on `px_per_cell`/`lb_origin` only:
+    canvas owns `view_zoom`/`view_center`/`view_fit`; `Cmd::SetMapping`
+    is a passthrough (no re-fit); ribbon/Ctrl+0/1/2 talk to the canvas
+    via `ViewRequest`. Grid, margin, `domain_width_m`, readouts:
+    untouched by design — treat any coupling as a bug.
+  - Space pauses on **release** (held Space + drag pans); pick
+    thresholds are screen-space (no cell floors).
+  - `MARGIN_CHOICES`/`PARTICLE_CHOICES` have no off entry; off is a
+    checkbox (`margin_on`/`particles_on`) and the index remembers the
+    last value. Single-step = `Cmd::StepOnce` → `GpuSim::step_once`.
 
 ## Hard rules
 
@@ -33,16 +57,27 @@ and panel arrangement — not for widget construction or numeric values.
 
 ## Structure
 
-- `src/app.rs` — state, `Cmd` dispatch, keyboard, scene IO (v3/v4
-  bincode, version peek on first 4 LE bytes), `--bench` harness.
+- `src/app.rs` — state, `Cmd` dispatch, keyboard, scene IO (v3–v5
+  bincode, version peek on first 4 LE bytes), `--bench` harness,
+  `ViewRequest` + view state fields.
 - `src/ui/` — one file per panel; child of `app` via `#[path]` so panel
   code reads app state without visibility widening. `ui/mod.rs` owns
   draw order; `ui/theme.rs` owns all style; `ui/units.rs` owns every
   physical-quantity formatter (no inline `{:.N}` on physical values).
   Convention: canonical value in the box, unit in the label, derived
   value on a `theme::derived` secondary line.
-- `src/sim.rs` — wgpu engine. `src/model.rs` — object model + undo
-  (index-based ops; panel edits coalesce via `record_modify_coalesced`).
+  - `ui/canvas.rs` — gestures, overlays, scale bar, and the free view
+    transform (wheel/pinch zoom at cursor, middle/space drag pan,
+    `ViewRequest` consumption, pan clamp).
+  - `ui/ribbon.rs` — tabs Home/Geometry/Physics/Study/Results (Run/Step,
+    tools, solver+fluid, generators/presets, field/particles/View).
+  - `ui/menu.rs` — rare ops: file IO, resolution, margin checkbox.
+  - `ui/inspector.rs` — object panel (staged Rotate/Scale), defaults.
+  - `ui/status.rs` — status strip incl. zoom %; `ui/tree.rs` — model
+    tree; `ui/legend.rs`, `ui/windows.rs`, `ui/generators.rs`.
+- `src/sim.rs` — wgpu engine (`Settings`, `step_once`, choice tables,
+  `ViewportMapping`). `src/model.rs` — object model + undo (index-based
+  ops; panel edits coalesce via `record_modify_coalesced`).
 
 ## Nozzle chamber-fan speed: six clamps, three layers
 
