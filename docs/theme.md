@@ -123,3 +123,22 @@ Mean +1.0 %, p99 −1.8 % — inside this host's run-to-run noise. Expected:
 the bench never zooms, and fit mode is algebraically identical to the
 old letterbox mapping; the only additions on the hot path are the scale
 bar (a few egui shapes) and one status segment.
+
+## Post-track-merge measurement (U2 + T2-A + T2-B integrated)
+
+Paired back-to-back A/B in one session (same container/session as no
+other load; lavapipe, so relative comparison only), run in both orders:
+
+```
+A = U2 tip e6071d8, B = merged (T2-A + T2-B + fold/v7/900px)   mean       p99
+pair 1 (A first): A 1059.41 / 1228.81   B 1058.69 / 1225.03
+pair 2 (B first): B 1060.85 / 1207.71   A 1075.35 / 1224.56
+```
+
+Order-independent result: mean −0.1 % / +0.1 %, p99 −0.3 % / −1.4 % —
+no regression; the merged build sits inside run-to-run noise in both
+orders. Expected: the bench draws the Home tab and the Dye view, so
+T2-A's range sync (a 3-entry loop of scalar math per frame) and T2-B's
+probe sampling (no probes placed → no GPU copies) add nothing
+measurable; the solver path is untouched by the merge except T2-A's
+render.wgsl flags-bit branch, which is uniform per frame.
