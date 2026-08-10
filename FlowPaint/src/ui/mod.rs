@@ -31,7 +31,7 @@ pub(super) fn draw(
     app.status_bar(ctx);
     app.tree_panel(ctx);
     app.settings_panel(ctx, snapshot, cmds);
-    app.legend_panel(ctx, snapshot);
+    app.legend_panel(ctx, snapshot, cmds);
     app.canvas(ctx, cmds);
     app.windows(ctx, snapshot);
 }

@@ -6,8 +6,8 @@
 
 use crate::model::{ObjMaterial, Shape, SketchModel, SketchObject};
 use crate::sim::{
-    GpuSim, RenderMode, SolverMode, ViewportMapping, DEFAULT_MARGIN_INDEX,
-    RESOLUTIONS,
+    ColorMap, FieldRange, GpuSim, RangeMode, RenderMode, SolverMode,
+    ViewportMapping, DEFAULT_MARGIN_INDEX, RESOLUTIONS,
 };
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -380,6 +380,10 @@ struct UiSnapshot {
     particle_size: f32,
     particle_brightness: f32,
     sponge_strength: f32,
+    /// Color range + colormap per render mode, synced to this frame's
+    /// physical scaling by `sync_color_ranges` before the panels draw
+    /// and written back to `Settings` when commands apply (T2-A fold).
+    ranges: [FieldRange; 4],
 }
 
 /// Commands for the sim (settings and file ops); the sketch model is
@@ -406,6 +410,10 @@ enum Cmd {
     SetParticleSize(f32),
     SetParticleBrightness(f32),
     SetSpongeStrength(f32),
+    /// Color-range edits from the legend (T2-A), per render mode.
+    SetRangeMode(RenderMode, RangeMode),
+    SetRangeMax(RenderMode, f32),
+    SetColorMap(RenderMode, ColorMap),
     ExportPng(std::path::PathBuf),
     SetMapping(ViewportMapping),
 }
@@ -928,7 +936,7 @@ impl eframe::App for FlowPaintApp {
             self.bench_tick(ctx, &mut cmds);
         }
 
-        let snapshot = {
+        let mut snapshot = {
             let Some(rs) = frame.wgpu_render_state() else { return };
             let renderer = rs.renderer.read();
             let Some(sim) = renderer.callback_resources.get::<GpuSim>() else { return };
@@ -950,9 +958,14 @@ impl eframe::App for FlowPaintApp {
                 particle_size: sim.settings.particle_size,
                 particle_brightness: sim.settings.particle_brightness,
                 sponge_strength: sim.settings.sponge_strength,
+                ranges: sim.settings.ranges,
             }
         };
         self.phys_cache = self.phys_scale(&snapshot);
+        // Reconcile the color ranges with this frame's physical scaling
+        // before any panel reads them; the synced twins go back into
+        // `Settings` below, right before the frame's commands apply.
+        self.sync_color_ranges(&mut snapshot);
         self.stats_euler = snapshot.solver == SolverMode::Euler;
         self.stats_u_inf = if self.stats_euler {
             snapshot.mach * self.fluid_a
@@ -970,6 +983,9 @@ impl eframe::App for FlowPaintApp {
         let mut renderer = rs.renderer.write();
         let Some(sim) = renderer.callback_resources.get_mut::<GpuSim>() else { return };
 
+        // The synced range twins first, so a `SetRangeMode(_, Locked)`
+        // arriving this frame pins exactly the value that was on screen.
+        sim.settings.ranges = snapshot.ranges;
         for cmd in cmds {
             apply_cmd(sim, cmd, self);
         }
@@ -1053,6 +1069,9 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::SetParticleSize(v) => sim.settings.particle_size = v,
         Cmd::SetParticleBrightness(v) => sim.settings.particle_brightness = v,
         Cmd::SetSpongeStrength(v) => sim.settings.sponge_strength = v,
+        Cmd::SetRangeMode(m, v) => sim.settings.ranges[m as usize].mode = v,
+        Cmd::SetRangeMax(m, v) => sim.settings.ranges[m as usize].sat_phys = v.max(1e-6),
+        Cmd::SetColorMap(m, v) => sim.settings.ranges[m as usize].map = v,
         Cmd::ExportPng(p) => {
             app.status = match sim.export_png(&p) {
                 Ok(()) => format!("Exported {}", p.display()),

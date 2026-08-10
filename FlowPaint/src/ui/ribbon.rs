@@ -4,7 +4,7 @@
 //! use compact label + widget rows, mockup-style.
 
 use crate::app::{build_preset, Cmd, FlowPaintApp, RibbonTab, ScenePreset, Tool, UiSnapshot, ViewRequest, FLUID_PRESETS};
-use crate::sim::{color_ranges, RangeMode, RenderMode, SolverMode, PARTICLE_CHOICES};
+use crate::sim::{RangeMode, RenderMode, SolverMode, PARTICLE_CHOICES};
 use eframe::egui;
 
 use super::units::{fmt_density, fmt_len, fmt_speed, fmt_time};
@@ -508,8 +508,7 @@ impl FlowPaintApp {
         });
         group(ui, "Mapping", |ui| {
             ui.vertical(|ui| {
-                let range_auto =
-                    color_ranges().lock().unwrap()[snap.mode as usize].mode == RangeMode::Auto;
+                let range_auto = snap.ranges[snap.mode as usize].mode == RangeMode::Auto;
                 let mut gain = snap.display_gain;
                 row(ui, "display gain", |ui| {
                     if ui

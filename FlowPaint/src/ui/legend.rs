@@ -1,8 +1,8 @@
 //! The right-hand legend: flow numbers in physical units and the
 //! color-scale bar for the current view.
 
-use crate::app::{coolwarm_color, inferno_color, FlowPaintApp, UiSnapshot};
-use crate::sim::{color_ranges, ColorMap, FieldRange, RangeMode, RenderMode, SolverMode};
+use crate::app::{coolwarm_color, inferno_color, Cmd, FlowPaintApp, UiSnapshot};
+use crate::sim::{ColorMap, FieldRange, RangeMode, RenderMode, SolverMode};
 use eframe::egui;
 
 use super::units::{
@@ -60,23 +60,24 @@ impl FlowPaintApp {
         }
     }
 
-    /// Reconcile the shared color-range state with this frame's physical
+    /// Reconcile the snapshot's color ranges with this frame's physical
     /// scaling: a pinned (Locked/Manual) range holds its physical value
     /// and gets its render-unit twin rewritten, while Auto tracks the
     /// current settings in both — so switching to Locked or Manual starts
     /// from exactly what is on screen, with no separate capture step.
-    /// Runs every frame (called before the legend's early-out).
-    fn sync_color_ranges(&self, snap: &UiSnapshot) {
-        let mut cr = color_ranges().lock().unwrap();
+    /// Runs every frame from `update`, before any panel draws; the
+    /// synced twins are written back to `Settings` when commands apply.
+    pub(in crate::app) fn sync_color_ranges(&self, snap: &mut UiSnapshot) {
         for mode in [RenderMode::Speed, RenderMode::Vorticity, RenderMode::Pressure] {
             let k = self.range_phys_per_render(mode, snap).max(1e-12);
-            let fr = &mut cr[mode as usize];
+            let auto = Self::auto_sat_render(mode, snap);
+            let fr = &mut snap.ranges[mode as usize];
             match fr.mode {
                 RangeMode::Locked | RangeMode::Manual => {
                     fr.sat_render = (fr.sat_phys / k).max(1e-9)
                 }
                 RangeMode::Auto => {
-                    fr.sat_render = Self::auto_sat_render(mode, snap);
+                    fr.sat_render = auto;
                     fr.sat_phys = fr.sat_render * k;
                 }
             }
@@ -85,8 +86,12 @@ impl FlowPaintApp {
 
     /// The right-hand legend: the important flow numbers in physical
     /// units, plus a color-scale bar for the current view.
-    pub(in crate::app) fn legend_panel(&mut self, ctx: &egui::Context, snap: UiSnapshot) {
-        self.sync_color_ranges(&snap);
+    pub(in crate::app) fn legend_panel(
+        &mut self,
+        ctx: &egui::Context,
+        snap: UiSnapshot,
+        cmds: &mut Vec<Cmd>,
+    ) {
         if !self.show_legend {
             return;
         }
@@ -159,10 +164,11 @@ impl FlowPaintApp {
             ui.separator();
 
             // Color-scale legend for the current view. `sync_color_ranges`
-            // above wrote the saturation point in physical units for every
-            // range mode — Auto still inverts the shader's normalization,
-            // Locked and Manual read the pinned value (T2-A).
-            let fr: FieldRange = color_ranges().lock().unwrap()[snap.mode as usize];
+            // (run in `update` before the panels) wrote the saturation
+            // point in physical units for every range mode — Auto still
+            // inverts the shader's normalization, Locked and Manual read
+            // the pinned value (T2-A).
+            let fr: FieldRange = snap.ranges[snap.mode as usize];
             match snap.mode {
                 RenderMode::Dye => {
                     ui.label("Smoke view: dye brightness");
@@ -186,7 +192,7 @@ impl FlowPaintApp {
                             },
                         );
                     });
-                    self.range_controls(ui, snap.mode, fr);
+                    self.range_controls(ui, snap.mode, fr, cmds);
                 }
                 RenderMode::Vorticity => {
                     ui.label("Vorticity ω (curl)");
@@ -201,7 +207,7 @@ impl FlowPaintApp {
                         );
                     });
                     ui.small("red: clockwise · blue: counter-clockwise");
-                    self.range_controls(ui, snap.mode, fr);
+                    self.range_controls(ui, snap.mode, fr, cmds);
                 }
                 RenderMode::Pressure => {
                     ui.label("Pressure Δp (gauge)");
@@ -219,7 +225,7 @@ impl FlowPaintApp {
                         );
                     });
                     ui.small("relative to ambient (0 = undisturbed)");
-                    self.range_controls(ui, snap.mode, fr);
+                    self.range_controls(ui, snap.mode, fr, cmds);
                 }
             }
             });
@@ -232,11 +238,17 @@ impl FlowPaintApp {
     /// units) and the colormap picker — per render mode. They live here,
     /// next to the scale they govern, because the Results ribbon has no
     /// width left at the 900 px minimum.
-    fn range_controls(&self, ui: &mut egui::Ui, mode: RenderMode, fr: FieldRange) {
-        // Collect edits, write back afterwards — holding the lock across
-        // the combo closure invites a deadlock. Picking Locked needs no
-        // capture step: `sync_color_ranges` already left the on-screen
-        // value in `sat_phys` this frame, and the mode switch pins it.
+    fn range_controls(
+        &self,
+        ui: &mut egui::Ui,
+        mode: RenderMode,
+        fr: FieldRange,
+        cmds: &mut Vec<Cmd>,
+    ) {
+        // Edits go out as commands like every other setting. Picking
+        // Locked needs no capture step: `sync_color_ranges` already left
+        // the on-screen value in `sat_phys`, and `Settings` receives the
+        // synced twins right before this frame's commands apply.
         let mut set_mode: Option<RangeMode> = None;
         let mut set_phys: Option<f32> = None;
         let mut set_map: Option<ColorMap> = None;
@@ -331,17 +343,14 @@ impl FlowPaintApp {
                     }
                 });
         });
-        if set_mode.is_some() || set_phys.is_some() || set_map.is_some() {
-            let mut cr = color_ranges().lock().unwrap();
-            if let Some(m) = set_mode {
-                cr[mode as usize].mode = m;
-            }
-            if let Some(v) = set_phys {
-                cr[mode as usize].sat_phys = v.max(1e-6);
-            }
-            if let Some(m) = set_map {
-                cr[mode as usize].map = m;
-            }
+        if let Some(m) = set_mode {
+            cmds.push(Cmd::SetRangeMode(mode, m));
+        }
+        if let Some(v) = set_phys {
+            cmds.push(Cmd::SetRangeMax(mode, v));
+        }
+        if let Some(m) = set_map {
+            cmds.push(Cmd::SetColorMap(mode, m));
         }
     }
 

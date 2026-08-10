@@ -197,12 +197,10 @@ impl RenderMode {
 
 // --- Color range (plan v4.1, T2-A) -----------------------------------
 //
-// The saturation point of the field color mapping, per render mode. This
-// lives behind a process-wide handle rather than in `Settings` because
-// the UI panels never hold `&mut GpuSim` (it lives in egui-wgpu's
-// `CallbackResources`) and the app's `Cmd` plumbing belongs to Track 1
-// while the tracks run concurrently. Fold into `Settings` + `Cmd` after
-// the merge.
+// The saturation point of the field color mapping, per render mode.
+// Track-era note: this sat behind a process-wide Mutex while app.rs was
+// frozen for Track 1; the track merge folded it into `Settings.ranges`
+// with edits arriving through `Cmd` like every other setting.
 
 /// How the color-mapping range for one render mode is chosen.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -260,18 +258,14 @@ const fn field_range_default(map: ColorMap) -> FieldRange {
     FieldRange { mode: RangeMode::Auto, sat_render: 1.0, sat_phys: 0.0, map }
 }
 
-/// Shared color-range state, indexed by `RenderMode as usize`. The Dye
+/// The color-range defaults, indexed by `RenderMode as usize`. The Dye
 /// entry is unused — smoke is a passive tracer with no scale to lock.
-static COLOR_RANGES: Mutex<[FieldRange; 4]> = Mutex::new([
+pub const FIELD_RANGE_DEFAULTS: [FieldRange; 4] = [
     field_range_default(ColorMap::Inferno),  // Dye (unused)
     field_range_default(ColorMap::Inferno),  // Speed
     field_range_default(ColorMap::Coolwarm), // Vorticity
     field_range_default(ColorMap::Coolwarm), // Pressure
-]);
-
-pub fn color_ranges() -> &'static Mutex<[FieldRange; 4]> {
-    &COLOR_RANGES
-}
+];
 
 /// Simulation settings mirrored by the UI.
 pub struct Settings {
@@ -297,6 +291,10 @@ pub struct Settings {
     pub particle_brightness: f32,
     /// Absorbing-layer blend strength at the domain edge.
     pub sponge_strength: f32,
+    /// Per-render-mode color range and colormap pick (T2-A), indexed by
+    /// `RenderMode as usize`. The UI keeps the render/physical twins in
+    /// sync every frame; edits arrive through `Cmd` like any setting.
+    pub ranges: [FieldRange; 4],
 }
 
 impl Default for Settings {
@@ -318,6 +316,7 @@ impl Default for Settings {
             particle_size: 1.6,
             particle_brightness: 0.3,
             sponge_strength: 0.08,
+            ranges: FIELD_RANGE_DEFAULTS,
         }
     }
 }
@@ -1142,7 +1141,7 @@ impl GpuSim {
     fn render_flags(&self) -> u32 {
         let mut flags = if self.settings.boundary_tints { 1 } else { 0 };
         let mode = self.settings.render_mode;
-        if color_ranges().lock().unwrap()[mode as usize].map != ColorMap::default_for(mode) {
+        if self.settings.ranges[mode as usize].map != ColorMap::default_for(mode) {
             flags |= 2;
         }
         flags
@@ -1156,7 +1155,7 @@ impl GpuSim {
     /// corresponding normalization. Auto passes the user's gain through.
     fn range_display_gain(&self) -> f32 {
         let mode = self.settings.render_mode;
-        let fr = color_ranges().lock().unwrap()[mode as usize];
+        let fr = self.settings.ranges[mode as usize];
         if fr.mode == RangeMode::Auto {
             return self.settings.display_gain;
         }
