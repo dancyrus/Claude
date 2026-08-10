@@ -65,6 +65,11 @@ pub(crate) const HANDLE_OUTLINE: Color32 = VIEW_BG;
 pub(crate) const GRID_HINT: Color32 = Color32::from_rgba_premultiplied(52, 54, 55, 12);
 /// Scale bar and its length label (drawn over the field view).
 pub(crate) const SCALE_BAR: Color32 = INK;
+/// Rubber-band selection rectangle fill: the selection accent at low
+/// opacity (a function because gamma_multiply is not const).
+pub(crate) fn rubber_fill() -> Color32 {
+    SEL.gamma_multiply(0.12)
+}
 
 // --- Geometry ---------------------------------------------------------
 

@@ -17,11 +17,23 @@ panel arrangement — not for widget construction or numeric values.
 
 ## Unit status (plan v4.1)
 
-- **U1 (cleanup + navigation): done**, branch `ui/u1-navigation`.
+- **U1 (cleanup + navigation): done**, branch `claude/flowpaint-v4.1-u1-nav-o8c1im`.
   Next: U2 (one author, no delegation) and T2-A may run concurrently;
   T2-B waits for U1 to merge (`ui/status.rs`).
-- Scene format: **v5** current, loads v3+ (v3 lacks solver fields; v4/v5
-  share a layout — see `SceneV3`/`SceneV4` in `app.rs`).
+- **U2 (multi-select + tier): done**, branch
+  `claude/flowpaint-u2-multi-select-kvfbsi` (off the U1 branch).
+  Next: U3 and U4 are unblocked (both need U2's selection set).
+- Scene format: **v6** current, loads v3+ (v3 lacks solver fields;
+  v4/v5 share a layout; v6 appends per-object `locked`/`hidden`, so
+  pre-v6 objects decode via the `SketchObjectV5` mirror — see
+  `SceneV3`/`SceneV4`/`SceneV6` in `app.rs`). **Version-number
+  correction**: plan v4.1's U2 text says "scene format to v5", but v5
+  was already current before U2 — U2 went to **v6**. U3 and T2-C: the
+  next bump is **v7**; do not repeat the plan's off-by-one.
+- T2-A's locked color ranges and colormap picks live behind a Mutex in
+  `sim.rs` on the T2-A branch (app.rs is frozen while both tracks run)
+  and are NOT in scene v6. Persisting them is a track-merge task; U5
+  depends on it.
 - U1 decisions a later unit must not re-derive:
   - Inspector Rotate/Scale DragValues are **staged deltas per selection**
     (`inspector_stage`), not absolute properties — a selection has no
@@ -36,6 +48,38 @@ panel arrangement — not for widget construction or numeric values.
   - `MARGIN_CHOICES`/`PARTICLE_CHOICES` have no off entry; off is a
     checkbox (`margin_on`/`particles_on`) and the index remembers the
     last value. Single-step = `Cmd::StepOnce` → `GpuSim::step_once`.
+- U2 decisions a later unit must not re-derive:
+  - Selection is `selected: Vec<u64>` — an ordered set: insertion
+    order, no duplicates, last = primary. ALL writes go through the
+    helpers in `app.rs` (`select_only`/`select_add`/`select_toggle`/
+    `deselect`/`deselect_all`); `prune_selection` runs once per frame.
+    Locked objects can enter the selection only via the tree and are
+    filtered by `editable_selection()` at every mutating operation.
+  - **Rubber-band = INTERSECT**, not fully-contain
+    (`SketchObject::intersects_rect`): FlowPaint scenes are dominated
+    by thin open geometry (lines, polylines, outline shapes), where
+    fully-contain would force lassoing an object's whole extent to
+    grab it. Touching the band selects.
+  - Modifiers: canvas Shift-click toggles membership; tree Ctrl-click
+    toggles, Shift-click ranges from `tree_anchor`. Tree lists objects
+    TOP-FIRST (reverse model order); `model.objects` order IS z-order
+    (later = rasterized later = wins overlaps), reordered undoably via
+    `SketchModel::reorder`.
+  - One undo entry per user action across a selection:
+    `ModelOp::Group` (+ `add_many`/`remove_many`/`record_modify_many`
+    (`_coalesced`)); group undo applies members in reverse.
+  - Ctrl+C/V NEVER arrive as key events — egui swallows them into
+    `Event::Copy`/`Event::Paste`, and Paste only fires when the system
+    clipboard holds text, so `copy_selected` writes the
+    `CLIPBOARD_MARKER` breadcrumb text and paste matches it. The
+    object clipboard itself is app-internal (`clipboard`/`paste_gen`).
+  - Nudge is 1 cell, Shift = 8 (plan v4.1 flipped U1's Shift-for-fine).
+  - Hidden objects are skipped by `rasterize_region` and `hit_test`;
+    locked ones by `hit_test` only. Engaging either drops the object
+    from the selection; both persist in scene v6.
+  - Multi-selection inspector shows mixed-value indicators; an edit
+    applies to the whole editable selection (never silently seeded
+    from the first object). Rotate/scale of a set is deferred to U3.
 
 ## Hard rules
 
@@ -57,9 +101,9 @@ panel arrangement — not for widget construction or numeric values.
 
 ## Structure
 
-- `src/app.rs` — state, `Cmd` dispatch, keyboard, scene IO (v3–v5
+- `src/app.rs` — state, `Cmd` dispatch, keyboard, scene IO (v3–v6
   bincode, version peek on first 4 LE bytes), `--bench` harness,
-  `ViewRequest` + view state fields.
+  `ViewRequest` + view state fields, selection set + clipboard.
 - `src/ui/` — one file per panel; child of `app` via `#[path]` so panel
   code reads app state without visibility widening. `ui/mod.rs` owns
   draw order; `ui/theme.rs` owns all style; `ui/units.rs` owns every

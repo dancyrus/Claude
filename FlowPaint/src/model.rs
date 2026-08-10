@@ -65,6 +65,10 @@ pub struct SketchObject {
     pub fan_angle: f32,
     /// Smoke color (used when material == Smoke, and for fan smoke).
     pub smoke_rgb: [f32; 3],
+    /// Not click-selectable and not editable (tree-managed; persists).
+    pub locked: bool,
+    /// Not rasterized and not click-selectable (tree-managed; persists).
+    pub hidden: bool,
 }
 
 impl SketchObject {
@@ -374,6 +378,92 @@ impl SketchObject {
             Shape::Stamp { .. } => {}
         }
     }
+
+    /// Rubber-band test, INTERSECT semantics (see CLAUDE.md): true when
+    /// the object's outline crosses the axis-aligned band `[min, max]`
+    /// (visible cells) or either wholly contains the other. Thin open
+    /// geometry dominates FlowPaint scenes, so touching the band selects.
+    pub fn intersects_rect(&self, min: [f32; 2], max: [f32; 2]) -> bool {
+        let seg_hits = |a: [f32; 2], b: [f32; 2]| seg_intersects_aabb(a, b, min, max);
+        let outline_hits = match &self.shape {
+            Shape::Line { a, b } => seg_hits(*a, *b),
+            Shape::Poly { pts, closed } => {
+                let n = pts.len();
+                if n == 1 {
+                    return point_in_aabb(pts[0], min, max);
+                }
+                let segs = if *closed { n } else { n.saturating_sub(1) };
+                (0..segs).any(|i| seg_hits(pts[i], pts[(i + 1) % n]))
+            }
+            Shape::Rect { .. } | Shape::Stamp { .. } => {
+                let cs = self.corners();
+                (0..4).any(|i| seg_hits(cs[i], cs[(i + 1) % 4]))
+            }
+            Shape::Ellipse { c, r, angle } => {
+                let (s, co) = angle.sin_cos();
+                let n = 24usize;
+                let pt = |i: usize| -> [f32; 2] {
+                    let t = i as f32 / n as f32 * std::f32::consts::TAU;
+                    let lx = r[0] * t.cos();
+                    let ly = r[1] * t.sin();
+                    [c[0] + lx * co - ly * s, c[1] + lx * s + ly * co]
+                };
+                (0..n).any(|i| seg_hits(pt(i), pt((i + 1) % n)))
+            }
+        };
+        // Containment fallbacks: band inside a filled shape, or shape
+        // centre inside a band larger than the outline sampling caught.
+        outline_hits
+            || point_in_aabb(self.center(), min, max)
+            || self.hit([(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5], 0.0)
+    }
+
+    /// The four oriented-box corners of a Rect or Stamp (its outline for
+    /// band tests); degenerate for other shapes.
+    fn corners(&self) -> [[f32; 2]; 4] {
+        let (c, half, angle) = match &self.shape {
+            Shape::Rect { c, half, angle } => (*c, *half, *angle),
+            Shape::Stamp { raster, c, scale, angle } => {
+                let (w, h) = raster_dims(raster);
+                (*c, [w as f32 * 0.5 * scale, h as f32 * 0.5 * scale], *angle)
+            }
+            _ => return [self.center(); 4],
+        };
+        let (s, co) = angle.sin_cos();
+        [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(kx, ky)| {
+            let lx = kx * half[0];
+            let ly = ky * half[1];
+            [c[0] + lx * co - ly * s, c[1] + lx * s + ly * co]
+        })
+    }
+}
+
+fn point_in_aabb(p: [f32; 2], min: [f32; 2], max: [f32; 2]) -> bool {
+    p[0] >= min[0] && p[0] <= max[0] && p[1] >= min[1] && p[1] <= max[1]
+}
+
+/// Segment-vs-AABB via the slab method (endpoints inside count as hits).
+fn seg_intersects_aabb(a: [f32; 2], b: [f32; 2], min: [f32; 2], max: [f32; 2]) -> bool {
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for k in 0..2 {
+        let d = b[k] - a[k];
+        if d.abs() < 1e-9 {
+            if a[k] < min[k] || a[k] > max[k] {
+                return false;
+            }
+        } else {
+            let (mut lo, mut hi) = ((min[k] - a[k]) / d, (max[k] - a[k]) / d);
+            if lo > hi {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            t0 = t0.max(lo);
+            t1 = t1.min(hi);
+            if t0 > t1 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn raster_dims(r: &GeoRegion) -> (usize, usize) {
@@ -420,6 +510,13 @@ pub enum ModelOp {
         coalesce: bool,
     },
     Replace(Vec<SketchObject>, Vec<SketchObject>), // whole-list ops (clear, presets)
+    /// Z-order permutation: (id order before, id order after).
+    Reorder(Vec<u64>, Vec<u64>),
+    /// One user action across a whole selection: undo/redo as a unit
+    /// (members applied in reverse for undo). `coalesce` follows the
+    /// Modify convention — consecutive panel edits to the same id set
+    /// merge into the open group.
+    Group { ops: Vec<ModelOp>, coalesce: bool },
 }
 
 // --- The model -------------------------------------------------------
@@ -467,12 +564,13 @@ impl SketchModel {
         self.objects.iter().position(|o| o.id == id)
     }
 
-    /// Topmost object hit at `p`.
+    /// Topmost click-selectable object hit at `p` (locked and hidden
+    /// objects are skipped — they are tree-managed).
     pub fn hit_test(&self, p: [f32; 2], slop: f32) -> Option<u64> {
         self.objects
             .iter()
             .rev()
-            .find(|o| o.hit(p, slop))
+            .find(|o| !o.locked && !o.hidden && o.hit(p, slop))
             .map(|o| o.id)
     }
 
@@ -483,11 +581,35 @@ impl SketchModel {
         self.objects.push(obj);
     }
 
-    pub fn remove(&mut self, id: u64) {
-        if let Some(i) = self.find(id) {
-            let obj = self.objects.remove(i);
+    /// Add a whole set as ONE undo entry (paste, multi-duplicate).
+    pub fn add_many(&mut self, objs: Vec<SketchObject>) {
+        if objs.is_empty() {
+            return;
+        }
+        let mut ops = Vec::with_capacity(objs.len());
+        for obj in objs {
             self.mark_dirty(obj.bounds());
-            self.undo.push(ModelOp::Remove(i, obj));
+            ops.push(ModelOp::Add(obj.clone()));
+            self.objects.push(obj);
+        }
+        self.undo.push(ModelOp::Group { ops, coalesce: false });
+        self.redo.clear();
+    }
+
+    /// Remove a whole set as ONE undo entry. Member Remove indices are
+    /// captured sequentially, so the group's reverse-order undo restores
+    /// each object at a valid slot.
+    pub fn remove_many(&mut self, ids: &[u64]) {
+        let mut ops = Vec::new();
+        for &id in ids {
+            if let Some(i) = self.find(id) {
+                let obj = self.objects.remove(i);
+                self.mark_dirty(obj.bounds());
+                ops.push(ModelOp::Remove(i, obj));
+            }
+        }
+        if !ops.is_empty() {
+            self.undo.push(ModelOp::Group { ops, coalesce: false });
             self.redo.clear();
         }
     }
@@ -529,6 +651,125 @@ impl SketchModel {
             }
         }
         self.undo.push(ModelOp::Modify { i, before, after, coalesce: true });
+    }
+
+    /// Record one finished edit across a set — ONE undo entry (gesture
+    /// end for a multi-object move). `pairs` are (id, before) captured at
+    /// gesture start; unchanged members are dropped.
+    pub fn record_modify_many(&mut self, pairs: &[(u64, SketchObject)]) {
+        let ops = self.build_modify_ops(pairs, false);
+        if !ops.is_empty() {
+            self.undo.push(ModelOp::Group { ops, coalesce: false });
+            self.redo.clear();
+        }
+    }
+
+    /// Like `record_modify_many`, but consecutive PANEL edits to the same
+    /// id set merge into one undo step (the record_modify_coalesced
+    /// convention, lifted to sets — one undo reverts the whole slider
+    /// session across the whole selection).
+    pub fn record_modify_many_coalesced(&mut self, pairs: &[(u64, SketchObject)]) {
+        let ops = self.build_modify_ops(pairs, true);
+        if ops.is_empty() {
+            return;
+        }
+        self.redo.clear();
+        let ids: Vec<u64> = ops
+            .iter()
+            .map(|op| match op {
+                ModelOp::Modify { after, .. } => after.id,
+                _ => unreachable!("build_modify_ops emits Modify only"),
+            })
+            .collect();
+        if let Some(ModelOp::Group { ops: top, coalesce: true }) = self.undo.last_mut() {
+            let top_ids: Vec<u64> = top
+                .iter()
+                .filter_map(|op| match op {
+                    ModelOp::Modify { after, coalesce: true, .. } => Some(after.id),
+                    _ => None,
+                })
+                .collect();
+            if top_ids == ids {
+                for (slot, op) in top.iter_mut().zip(ops) {
+                    if let (
+                        ModelOp::Modify { after: dst, .. },
+                        ModelOp::Modify { after: src, .. },
+                    ) = (slot, op)
+                    {
+                        *dst = src;
+                    }
+                }
+                return;
+            }
+        }
+        self.undo.push(ModelOp::Group { ops, coalesce: true });
+    }
+
+    fn build_modify_ops(
+        &mut self,
+        pairs: &[(u64, SketchObject)],
+        coalesce: bool,
+    ) -> Vec<ModelOp> {
+        let mut ops = Vec::new();
+        for (id, before) in pairs {
+            if let Some(i) = self.find(*id) {
+                if self.objects[i] == *before {
+                    continue;
+                }
+                let after = self.objects[i].clone();
+                self.mark_dirty(before.bounds().union(after.bounds()));
+                ops.push(ModelOp::Modify {
+                    i,
+                    before: before.clone(),
+                    after,
+                    coalesce,
+                });
+            }
+        }
+        ops
+    }
+
+    /// Reorder the object list to the given id order (z-order: later =
+    /// painted later = wins overlaps), undoably. Ids must be a
+    /// permutation of the current set; anything else is a no-op.
+    pub fn reorder(&mut self, new_ids: Vec<u64>) {
+        let old_ids: Vec<u64> = self.objects.iter().map(|o| o.id).collect();
+        if new_ids == old_ids || new_ids.len() != old_ids.len() {
+            return;
+        }
+        if !self.apply_order(&new_ids) {
+            return;
+        }
+        self.undo.push(ModelOp::Reorder(old_ids, new_ids));
+        self.redo.clear();
+    }
+
+    /// Permute `objects` into the given id order, damage-marking every
+    /// object whose index changed (overlap winners can flip).
+    fn apply_order(&mut self, ids: &[u64]) -> bool {
+        // A true permutation only: every id resolves, and no id twice
+        // (a duplicate would clone one object and drop another).
+        let mut seen = Vec::with_capacity(ids.len());
+        let mut new = Vec::with_capacity(self.objects.len());
+        for &id in ids {
+            match self.find(id) {
+                Some(i) if !seen.contains(&i) => {
+                    seen.push(i);
+                    new.push(self.objects[i].clone());
+                }
+                _ => return false, // not a permutation; leave untouched
+            }
+        }
+        if new.len() != self.objects.len() {
+            return false;
+        }
+        for (i, o) in new.iter().enumerate() {
+            if self.objects[i].id != o.id {
+                self.mark_dirty(o.bounds());
+            }
+        }
+        self.objects = new;
+        true
     }
 
     /// Remove an object added by the in-flight gesture along with its
@@ -581,59 +822,85 @@ impl SketchModel {
 
     pub fn undo(&mut self) {
         if let Some(op) = self.undo.pop() {
-            match &op {
-                ModelOp::Add(o) => {
-                    if let Some(i) = self.find(o.id) {
-                        self.mark_dirty(self.objects[i].bounds());
-                        self.objects.remove(i);
-                    }
-                }
-                ModelOp::Remove(i, o) => {
-                    self.mark_dirty(o.bounds());
-                    self.objects.insert((*i).min(self.objects.len()), o.clone());
-                }
-                ModelOp::Modify { i, before, after, .. } => {
-                    if let Some(slot) = self.objects.get_mut(*i) {
-                        *slot = before.clone();
-                    }
-                    self.mark_dirty(before.bounds().union(after.bounds()));
-                }
-                ModelOp::Replace(old, _new) => {
-                    self.objects = old.clone();
-                    self.mark_all_dirty();
-                }
-            }
+            self.apply_undo(&op);
             self.redo.push(op);
         }
     }
 
     pub fn redo(&mut self) {
         if let Some(op) = self.redo.pop() {
-            match &op {
-                ModelOp::Add(o) => {
-                    self.mark_dirty(o.bounds());
-                    self.objects.push(o.clone());
-                }
-                ModelOp::Remove(i, o) => {
-                    self.mark_dirty(o.bounds());
-                    if *i < self.objects.len() {
-                        self.objects.remove(*i);
-                    } else {
-                        self.objects.pop();
-                    }
-                }
-                ModelOp::Modify { i, before, after, .. } => {
-                    if let Some(slot) = self.objects.get_mut(*i) {
-                        *slot = after.clone();
-                    }
-                    self.mark_dirty(before.bounds().union(after.bounds()));
-                }
-                ModelOp::Replace(_old, new) => {
-                    self.objects = new.clone();
-                    self.mark_all_dirty();
+            self.apply_redo(&op);
+            self.undo.push(op);
+        }
+    }
+
+    fn apply_undo(&mut self, op: &ModelOp) {
+        match op {
+            ModelOp::Add(o) => {
+                if let Some(i) = self.find(o.id) {
+                    self.mark_dirty(self.objects[i].bounds());
+                    self.objects.remove(i);
                 }
             }
-            self.undo.push(op);
+            ModelOp::Remove(i, o) => {
+                self.mark_dirty(o.bounds());
+                self.objects.insert((*i).min(self.objects.len()), o.clone());
+            }
+            ModelOp::Modify { i, before, after, .. } => {
+                if let Some(slot) = self.objects.get_mut(*i) {
+                    *slot = before.clone();
+                }
+                self.mark_dirty(before.bounds().union(after.bounds()));
+            }
+            ModelOp::Replace(old, _new) => {
+                self.objects = old.clone();
+                self.mark_all_dirty();
+            }
+            ModelOp::Reorder(old_ids, _new_ids) => {
+                self.apply_order(old_ids);
+            }
+            // Members undo in reverse so sequential Remove indices (and
+            // any future dependent members) unwind correctly.
+            ModelOp::Group { ops, .. } => {
+                for member in ops.iter().rev() {
+                    self.apply_undo(member);
+                }
+            }
+        }
+    }
+
+    fn apply_redo(&mut self, op: &ModelOp) {
+        match op {
+            ModelOp::Add(o) => {
+                self.mark_dirty(o.bounds());
+                self.objects.push(o.clone());
+            }
+            ModelOp::Remove(i, o) => {
+                self.mark_dirty(o.bounds());
+                if *i < self.objects.len() {
+                    self.objects.remove(*i);
+                } else {
+                    self.objects.pop();
+                }
+            }
+            ModelOp::Modify { i, before, after, .. } => {
+                if let Some(slot) = self.objects.get_mut(*i) {
+                    *slot = after.clone();
+                }
+                self.mark_dirty(before.bounds().union(after.bounds()));
+            }
+            ModelOp::Replace(_old, new) => {
+                self.objects = new.clone();
+                self.mark_all_dirty();
+            }
+            ModelOp::Reorder(_old_ids, new_ids) => {
+                self.apply_order(new_ids);
+            }
+            ModelOp::Group { ops, .. } => {
+                for member in ops {
+                    self.apply_redo(member);
+                }
+            }
         }
     }
 
@@ -713,7 +980,7 @@ impl SketchModel {
             y1: clip.y1 - m,
         };
         for o in &self.objects {
-            if o.bounds().intersect(region_for_test).is_empty() {
+            if o.hidden || o.bounds().intersect(region_for_test).is_empty() {
                 continue;
             }
             rasterize_object(geo, o, clip, m);
@@ -999,5 +1266,150 @@ fn rasterize_object(geo: &mut Geometry, obj: &SketchObject, clip: GridRect, m: i
                 }
             }
         }
+    }
+}
+
+// --- Tests -----------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(model: &mut SketchModel, c: [f32; 2]) -> u64 {
+        let id = model.fresh_id();
+        model.add(SketchObject {
+            id,
+            shape: Shape::Rect { c, half: [10.0, 10.0], angle: 0.0 },
+            material: ObjMaterial::Wall,
+            thickness: 4.0,
+            filled: true,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+        });
+        id
+    }
+
+    fn ids(m: &SketchModel) -> Vec<u64> {
+        m.objects.iter().map(|o| o.id).collect()
+    }
+
+    #[test]
+    fn remove_many_is_one_undo_entry_and_restores_order() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        let b = obj(&mut m, [50.0, 0.0]);
+        let c = obj(&mut m, [100.0, 0.0]);
+        let order0 = ids(&m);
+        m.remove_many(&[a, c]);
+        assert_eq!(ids(&m), vec![b]);
+        m.undo(); // ONE undo restores both, at their original slots
+        assert_eq!(ids(&m), order0);
+        m.redo();
+        assert_eq!(ids(&m), vec![b]);
+    }
+
+    #[test]
+    fn add_many_is_one_undo_entry() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        let mut o1 = m.objects[0].clone();
+        o1.id = m.fresh_id();
+        let mut o2 = m.objects[0].clone();
+        o2.id = m.fresh_id();
+        let (i1, i2) = (o1.id, o2.id);
+        m.add_many(vec![o1, o2]);
+        assert_eq!(ids(&m), vec![a, i1, i2]);
+        m.undo();
+        assert_eq!(ids(&m), vec![a]);
+        m.redo();
+        assert_eq!(ids(&m), vec![a, i1, i2]);
+    }
+
+    #[test]
+    fn modify_many_records_one_entry_and_coalesces_by_id_set() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        let b = obj(&mut m, [50.0, 0.0]);
+        // A "panel edit" across the set, twice (slider frames): the
+        // second merges into the first, one undo reverts to the start.
+        for step in [1.0f32, 2.0] {
+            let pairs: Vec<(u64, SketchObject)> = [a, b]
+                .iter()
+                .map(|&id| {
+                    let i = m.find(id).unwrap();
+                    let before = m.objects[i].clone();
+                    m.objects[i].thickness = 4.0 + step;
+                    (id, before)
+                })
+                .collect();
+            m.record_modify_many_coalesced(&pairs);
+        }
+        assert_eq!(m.objects[0].thickness, 6.0);
+        m.undo();
+        assert_eq!(m.objects[0].thickness, 4.0);
+        assert_eq!(m.objects[1].thickness, 4.0);
+        assert!(!m.can_undo() || {
+            m.undo();
+            m.objects[0].thickness == 4.0
+        });
+    }
+
+    #[test]
+    fn reorder_round_trips_and_rejects_non_permutations() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        let b = obj(&mut m, [50.0, 0.0]);
+        let c = obj(&mut m, [100.0, 0.0]);
+        m.reorder(vec![c, a, b]);
+        assert_eq!(ids(&m), vec![c, a, b]);
+        m.undo();
+        assert_eq!(ids(&m), vec![a, b, c]);
+        m.redo();
+        assert_eq!(ids(&m), vec![c, a, b]);
+        // Not a permutation: ignored.
+        m.reorder(vec![a, a, b]);
+        assert_eq!(ids(&m), vec![c, a, b]);
+    }
+
+    #[test]
+    fn hit_test_skips_locked_and_hidden() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        assert_eq!(m.hit_test([0.0, 0.0], 1.0), Some(a));
+        m.objects[0].locked = true;
+        assert_eq!(m.hit_test([0.0, 0.0], 1.0), None);
+        m.objects[0].locked = false;
+        m.objects[0].hidden = true;
+        assert_eq!(m.hit_test([0.0, 0.0], 1.0), None);
+    }
+
+    #[test]
+    fn rubber_band_intersect_semantics() {
+        let line = SketchObject {
+            id: 1,
+            shape: Shape::Line { a: [0.0, 0.0], b: [100.0, 100.0] },
+            material: ObjMaterial::Wall,
+            thickness: 2.0,
+            filled: false,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+        };
+        // Band crossing the segment: selected (INTERSECT, not contain).
+        assert!(line.intersects_rect([40.0, 40.0], [60.0, 60.0]));
+        // Band inside the line's bounding box but off the geometry
+        // (the empty corner of the diagonal): NOT selected.
+        assert!(!line.intersects_rect([70.0, 10.0], [90.0, 30.0]));
+        // Band containing the whole object: selected.
+        assert!(line.intersects_rect([-10.0, -10.0], [110.0, 110.0]));
     }
 }

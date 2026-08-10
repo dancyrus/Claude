@@ -2,7 +2,7 @@
 //! state machine, and the selection/snap overlays.
 
 use crate::app::{Cmd, FlowPaintApp, Gesture, Tool, ViewRequest};
-use crate::model::Shape;
+use crate::model::{Shape, SketchObject};
 use crate::sim::{GpuSim, ViewportMapping};
 use eframe::egui;
 
@@ -89,9 +89,18 @@ impl FlowPaintApp {
                 self.view_fit = false;
             }
             ViewRequest::Selection => {
-                let Some(id) = self.selected else { return };
-                let Some(i) = self.model.find(id) else { return };
-                let b = self.model.objects[i].bounds();
+                // Union of the whole selection's bounds.
+                let mut b: Option<crate::geometry::GridRect> = None;
+                for &id in &self.selected {
+                    if let Some(i) = self.model.find(id) {
+                        let ob = self.model.objects[i].bounds();
+                        b = Some(match b {
+                            Some(u) => u.union(ob),
+                            None => ob,
+                        });
+                    }
+                }
+                let Some(b) = b else { return };
                 let bw = (b.x1 - b.x0).max(1) as f32;
                 let bh = (b.y1 - b.y0).max(1) as f32;
                 // ~10% padding on each side of the object's bounds.
@@ -362,7 +371,7 @@ impl FlowPaintApp {
                 Tool::Polyline => self.finish_gesture(),
                 Tool::Select => {
                     if matches!(self.gesture, Gesture::None) {
-                        self.selected = None;
+                        self.deselect_all();
                     }
                 }
                 _ => {}
@@ -375,7 +384,7 @@ impl FlowPaintApp {
             if let Some(pos) = pointer {
                 let raw = to_cell(pos);
                 match self.tool {
-                    Tool::Select => self.select_press(raw, handle_r, click_slop),
+                    Tool::Select => self.select_press(raw, handle_r, click_slop, shift),
                     Tool::Line => {
                         self.finish_gesture();
                         let a = self.snap_point(raw);
@@ -383,7 +392,7 @@ impl FlowPaintApp {
                         let id = obj.id;
                         self.model.add(obj);
                         self.gesture = Gesture::DrawShape { id, anchor: a };
-                        self.selected = Some(id);
+                        self.select_only(id);
                     }
                     Tool::Rect | Tool::Ellipse => {
                         self.finish_gesture();
@@ -397,7 +406,7 @@ impl FlowPaintApp {
                         let id = obj.id;
                         self.model.add(obj);
                         self.gesture = Gesture::DrawShape { id, anchor: a };
-                        self.selected = Some(id);
+                        self.select_only(id);
                     }
                     Tool::Polyline => {
                         if let Gesture::DrawPoly { id } = &self.gesture {
@@ -413,7 +422,7 @@ impl FlowPaintApp {
                             let id = obj.id;
                             self.model.add(obj);
                             self.gesture = Gesture::DrawPoly { id };
-                            self.selected = Some(id);
+                            self.select_only(id);
                             self.status =
                                 "Polyline: click to add vertices, Enter/right-click to \
                                  finish, click the first vertex to close."
@@ -427,7 +436,7 @@ impl FlowPaintApp {
                         let id = obj.id;
                         self.model.add(obj);
                         self.gesture = Gesture::DrawPencil { id };
-                        self.selected = Some(id);
+                        self.select_only(id);
                     }
                 }
             }
@@ -454,16 +463,21 @@ impl FlowPaintApp {
                             }
                         }
                     });
-                } else if let Gesture::MoveObj { id, last, .. } = &self.gesture {
-                    let (id, last) = (*id, *last);
+                } else if let Gesture::MoveSel { before, last } = &self.gesture {
+                    let ids: Vec<u64> = before.iter().map(|(id, _)| *id).collect();
+                    let last = *last;
                     let eff = if self.snap_enabled { self.snap_point(raw) } else { raw };
                     let d = [eff[0] - last[0], eff[1] - last[1]];
                     if d != [0.0; 2] {
-                        self.mutate_live(id, |o| o.translate(d));
-                        if let Gesture::MoveObj { last, .. } = &mut self.gesture {
+                        for id in ids {
+                            self.mutate_live(id, |o| o.translate(d));
+                        }
+                        if let Gesture::MoveSel { last, .. } = &mut self.gesture {
                             *last = eff;
                         }
                     }
+                } else if matches!(self.gesture, Gesture::RubberBand { .. }) {
+                    self.rubber_band_update(raw);
                 } else if let Gesture::HandleDrag { id, idx, .. } = &self.gesture {
                     let (id, idx) = (*id, *idx);
                     let p = if shift {
@@ -499,47 +513,106 @@ impl FlowPaintApp {
         if !primary_down
             && matches!(
                 &self.gesture,
-                Gesture::MoveObj { .. }
+                Gesture::MoveSel { .. }
                     | Gesture::HandleDrag { .. }
                     | Gesture::DrawShape { .. }
                     | Gesture::DrawPencil { .. }
+                    | Gesture::RubberBand { .. }
             )
         {
             self.finish_gesture();
         }
     }
 
-    /// A press with the Select tool: grab a handle of the selected object,
-    /// else pick (and start moving) the topmost object under the cursor,
-    /// else clear the selection.
-    fn select_press(&mut self, p: [f32; 2], handle_r: f32, click_slop: f32) {
+    /// A press with the Select tool. In order: grab a handle of the
+    /// single selected object; Shift-click toggles set membership;
+    /// plain click picks (and starts moving the whole selection, or
+    /// just the hit object after reselecting); empty space starts a
+    /// rubber band — additive with Shift, replacing without.
+    fn select_press(&mut self, p: [f32; 2], handle_r: f32, click_slop: f32, shift: bool) {
         self.finish_gesture();
-        if let Some(id) = self.selected {
+        // Handle grab: single selection only (handles aren't drawn for
+        // multi-selections), and never on a locked object.
+        if let Some(id) = self.single_sel() {
             if let Some(i) = self.model.find(id) {
-                let handles = self.model.objects[i].handles();
-                let mut best: Option<(usize, f32)> = None;
-                for (idx, h) in handles.iter().enumerate() {
-                    let d = Self::dist(p, *h);
-                    if d <= handle_r && best.map(|(_, bd)| d < bd).unwrap_or(true) {
-                        best = Some((idx, d));
+                if !self.model.objects[i].locked {
+                    let handles = self.model.objects[i].handles();
+                    let mut best: Option<(usize, f32)> = None;
+                    for (idx, h) in handles.iter().enumerate() {
+                        let d = Self::dist(p, *h);
+                        if d <= handle_r && best.map(|(_, bd)| d < bd).unwrap_or(true)
+                        {
+                            best = Some((idx, d));
+                        }
                     }
-                }
-                if let Some((idx, _)) = best {
-                    let before = self.model.objects[i].clone();
-                    self.gesture = Gesture::HandleDrag { id, idx, before };
-                    return;
+                    if let Some((idx, _)) = best {
+                        let before = self.model.objects[i].clone();
+                        self.gesture = Gesture::HandleDrag { id, idx, before };
+                        return;
+                    }
                 }
             }
         }
-        if let Some(id) = self.model.hit_test(p, click_slop) {
-            self.selected = Some(id);
-            if let Some(i) = self.model.find(id) {
-                let before = self.model.objects[i].clone();
-                let start = if self.snap_enabled { self.snap_point(p) } else { p };
-                self.gesture = Gesture::MoveObj { id, before, last: start };
+        match self.model.hit_test(p, click_slop) {
+            Some(id) if shift => {
+                // Shift-click adds/removes; no move gesture either way.
+                self.select_toggle(id);
             }
-        } else {
-            self.selected = None;
+            Some(id) => {
+                if !self.sel_contains(id) {
+                    self.select_only(id);
+                }
+                // Move every editable member of the selection as a unit.
+                let before: Vec<(u64, SketchObject)> = self
+                    .editable_selection()
+                    .iter()
+                    .filter_map(|&sid| {
+                        self.model.find(sid).map(|i| (sid, self.model.objects[i].clone()))
+                    })
+                    .collect();
+                if !before.is_empty() {
+                    let start =
+                        if self.snap_enabled { self.snap_point(p) } else { p };
+                    self.gesture = Gesture::MoveSel { before, last: start };
+                }
+            }
+            None => {
+                let base = if shift {
+                    self.selected.clone()
+                } else {
+                    self.deselect_all();
+                    Vec::new()
+                };
+                self.gesture = Gesture::RubberBand {
+                    anchor: p,
+                    corner: p,
+                    base,
+                };
+            }
+        }
+    }
+
+    /// Live rubber-band update: selection = base ∪ (band hits), INTERSECT
+    /// semantics (see CLAUDE.md), skipping locked and hidden objects.
+    fn rubber_band_update(&mut self, corner: [f32; 2]) {
+        let Gesture::RubberBand { anchor, corner: c, base, .. } = &mut self.gesture
+        else {
+            return;
+        };
+        *c = corner;
+        let (anchor, base) = (*anchor, base.clone());
+        let min = [anchor[0].min(corner[0]), anchor[1].min(corner[1])];
+        let max = [anchor[0].max(corner[0]), anchor[1].max(corner[1])];
+        self.selected = base;
+        let hits: Vec<u64> = self
+            .model
+            .objects
+            .iter()
+            .filter(|o| !o.locked && !o.hidden && o.intersects_rect(min, max))
+            .map(|o| o.id)
+            .collect();
+        for id in hits {
+            self.select_add(id);
         }
     }
 
@@ -572,7 +645,7 @@ impl FlowPaintApp {
                 }
             });
             self.model.finalize_last_add(id);
-            self.selected = Some(id);
+            self.select_only(id);
             self.status = "Closed the polygon.".into();
             return;
         }
@@ -700,22 +773,107 @@ impl FlowPaintApp {
             }
         }
 
-        // The active object: the one being drawn/edited, else the selection.
-        let active = match &self.gesture {
+        // The rubber band, while one is being dragged.
+        if let Gesture::RubberBand { anchor, corner, .. } = &self.gesture {
+            let r = egui::Rect::from_two_pos(to_screen(*anchor), to_screen(*corner));
+            painter.rect(
+                r,
+                0.0,
+                super::theme::rubber_fill(),
+                egui::Stroke::new(1.0, super::theme::SEL),
+            );
+        }
+
+        // The active objects: the one being drawn/edited, else the whole
+        // selection. Handles and dimensions draw only for a single one.
+        let ids: Vec<u64> = match &self.gesture {
             Gesture::DrawShape { id, .. }
             | Gesture::DrawPoly { id }
             | Gesture::DrawPencil { id }
-            | Gesture::MoveObj { id, .. }
-            | Gesture::HandleDrag { id, .. } => Some(*id),
-            Gesture::None => self.selected,
+            | Gesture::HandleDrag { id, .. } => vec![*id],
+            Gesture::MoveSel { .. } | Gesture::RubberBand { .. } | Gesture::None => {
+                self.selected.clone()
+            }
         };
-        let Some(id) = active else { return };
-        let Some(i) = self.model.find(id) else { return };
-        let obj = &self.model.objects[i];
-
         let accent = super::theme::SEL;
         let stroke = egui::Stroke::new(1.5, accent);
+        for &id in &ids {
+            let Some(i) = self.model.find(id) else { continue };
+            self.draw_outline(painter, &self.model.objects[i], stroke, &to_screen);
+        }
+        if ids.len() != 1 {
+            return;
+        }
+        let Some(i) = self.model.find(ids[0]) else { return };
+        let obj = &self.model.objects[i];
 
+        // Vertex handles (not on locked objects — they aren't editable).
+        if !obj.locked {
+            for h in obj.handles() {
+                let pos = to_screen(h);
+                let r = egui::Rect::from_center_size(pos, egui::vec2(7.0, 7.0));
+                painter.rect_filled(r, 1.0, super::theme::HANDLE_FILL);
+                painter.rect_stroke(
+                    r,
+                    1.0,
+                    egui::Stroke::new(1.0, super::theme::HANDLE_OUTLINE),
+                );
+            }
+        }
+
+        // Dimensions in physical units.
+        let ps = self.phys_cache;
+        let dims = match &obj.shape {
+            Shape::Line { a, b } => {
+                let l = Self::dist(*a, *b);
+                let ang = -(b[1] - a[1]).atan2(b[0] - a[0]).to_degrees();
+                format!("L {}   ∠ {}", fmt_len(ps.len_m(l)), fmt_angle(ang))
+            }
+            Shape::Poly { pts, closed } => {
+                let n = pts.len();
+                let segs = if *closed { n } else { n.saturating_sub(1) };
+                let mut l = 0.0;
+                for k in 0..segs {
+                    l += Self::dist(pts[k], pts[(k + 1) % n]);
+                }
+                format!("{n} pts   L {}", fmt_len(ps.len_m(l)))
+            }
+            Shape::Rect { half, .. } => format!(
+                "{} × {}",
+                fmt_len(ps.len_m(half[0] * 2.0)),
+                fmt_len(ps.len_m(half[1] * 2.0))
+            ),
+            Shape::Ellipse { r, .. } => format!(
+                "⌀ {} × {}",
+                fmt_len(ps.len_m(r[0] * 2.0)),
+                fmt_len(ps.len_m(r[1] * 2.0))
+            ),
+            Shape::Stamp { raster, scale, .. } => format!(
+                "{} × {}",
+                fmt_len(ps.len_m((raster.rect.2 - raster.rect.0) as f32 * scale)),
+                fmt_len(ps.len_m((raster.rect.3 - raster.rect.1) as f32 * scale))
+            ),
+        };
+        let b = obj.bounds();
+        let pos = to_screen([b.x0 as f32, b.y0 as f32]) - egui::vec2(0.0, 4.0);
+        painter.text(
+            pos,
+            egui::Align2::LEFT_BOTTOM,
+            dims,
+            egui::TextStyle::Monospace.resolve(ui.style()),
+            accent,
+        );
+    }
+
+    /// One object's selection outline (shared by the single- and
+    /// multi-selection overlay paths).
+    fn draw_outline(
+        &self,
+        painter: &egui::Painter,
+        obj: &SketchObject,
+        stroke: egui::Stroke,
+        to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
+    ) {
         match &obj.shape {
             Shape::Line { a, b } => {
                 painter.line_segment([to_screen(*a), to_screen(*b)], stroke);
@@ -766,57 +924,6 @@ impl FlowPaintApp {
                 painter.add(egui::Shape::closed_line(path, stroke));
             }
         }
-
-        // Vertex handles.
-        for h in obj.handles() {
-            let pos = to_screen(h);
-            let r = egui::Rect::from_center_size(pos, egui::vec2(7.0, 7.0));
-            painter.rect_filled(r, 1.0, super::theme::HANDLE_FILL);
-            painter.rect_stroke(r, 1.0, egui::Stroke::new(1.0, super::theme::HANDLE_OUTLINE));
-        }
-
-        // Dimensions in physical units.
-        let ps = self.phys_cache;
-        let dims = match &obj.shape {
-            Shape::Line { a, b } => {
-                let l = Self::dist(*a, *b);
-                let ang = -(b[1] - a[1]).atan2(b[0] - a[0]).to_degrees();
-                format!("L {}   ∠ {}", fmt_len(ps.len_m(l)), fmt_angle(ang))
-            }
-            Shape::Poly { pts, closed } => {
-                let n = pts.len();
-                let segs = if *closed { n } else { n.saturating_sub(1) };
-                let mut l = 0.0;
-                for k in 0..segs {
-                    l += Self::dist(pts[k], pts[(k + 1) % n]);
-                }
-                format!("{n} pts   L {}", fmt_len(ps.len_m(l)))
-            }
-            Shape::Rect { half, .. } => format!(
-                "{} × {}",
-                fmt_len(ps.len_m(half[0] * 2.0)),
-                fmt_len(ps.len_m(half[1] * 2.0))
-            ),
-            Shape::Ellipse { r, .. } => format!(
-                "⌀ {} × {}",
-                fmt_len(ps.len_m(r[0] * 2.0)),
-                fmt_len(ps.len_m(r[1] * 2.0))
-            ),
-            Shape::Stamp { raster, scale, .. } => format!(
-                "{} × {}",
-                fmt_len(ps.len_m((raster.rect.2 - raster.rect.0) as f32 * scale)),
-                fmt_len(ps.len_m((raster.rect.3 - raster.rect.1) as f32 * scale))
-            ),
-        };
-        let b = obj.bounds();
-        let pos = to_screen([b.x0 as f32, b.y0 as f32]) - egui::vec2(0.0, 4.0);
-        painter.text(
-            pos,
-            egui::Align2::LEFT_BOTTOM,
-            dims,
-            egui::TextStyle::Monospace.resolve(ui.style()),
-            accent,
-        );
     }
 }
 struct FlowPaintCallback;

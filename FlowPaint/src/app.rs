@@ -81,11 +81,58 @@ enum Gesture {
     DrawPoly { id: u64 },
     /// Freehand pencil stroke collecting points.
     DrawPencil { id: u64 },
-    /// Moving a whole object. `before` is the object at gesture start (for
-    /// the undo record); `last` is the previous effective pointer position.
-    MoveObj { id: u64, before: SketchObject, last: [f32; 2] },
-    /// Dragging one vertex/corner handle.
+    /// Moving the whole selection. `before` pairs (id, object at gesture
+    /// start) for the one-group undo record; `last` is the previous
+    /// effective pointer position.
+    MoveSel { before: Vec<(u64, SketchObject)>, last: [f32; 2] },
+    /// Dragging one vertex/corner handle (single selection only).
     HandleDrag { id: u64, idx: usize, before: SketchObject },
+    /// Rubber-band selection: `base` is the selection at press (the
+    /// prior selection when Shift was held — additive — else empty);
+    /// `corner` trails the pointer. The selection is applied live each
+    /// drag frame; Esc restores `base`.
+    RubberBand {
+        anchor: [f32; 2],
+        corner: [f32; 2],
+        base: Vec<u64>,
+    },
+}
+
+/// Object layout of scene files v3–v5, BEFORE lock/hide existed. bincode
+/// is positional, so the live `SketchObject` (which appends `locked` and
+/// `hidden`) cannot decode old files directly; old payloads decode into
+/// this mirror and convert.
+#[derive(Serialize, Deserialize)]
+struct SketchObjectV5 {
+    id: u64,
+    shape: Shape,
+    material: ObjMaterial,
+    thickness: f32,
+    filled: bool,
+    fan_mult: f32,
+    fan_gust: f32,
+    fan_phase: f32,
+    fan_angle: f32,
+    smoke_rgb: [f32; 3],
+}
+
+impl From<SketchObjectV5> for SketchObject {
+    fn from(o: SketchObjectV5) -> Self {
+        SketchObject {
+            id: o.id,
+            shape: o.shape,
+            material: o.material,
+            thickness: o.thickness,
+            filled: o.filled,
+            fan_mult: o.fan_mult,
+            fan_gust: o.fan_gust,
+            fan_phase: o.fan_phase,
+            fan_angle: o.fan_angle,
+            smoke_rgb: o.smoke_rgb,
+            locked: false,
+            hidden: false,
+        }
+    }
 }
 
 /// Scene file (version 3): the vector model plus core settings —
@@ -93,7 +140,7 @@ enum Gesture {
 #[derive(Serialize, Deserialize)]
 struct SceneV3 {
     version: u32,
-    objects: Vec<SketchObject>,
+    objects: Vec<SketchObjectV5>,
     wind_tunnel: bool,
     flow_speed: f32,
     viscosity: f32,
@@ -111,6 +158,26 @@ struct SceneV3 {
 /// re-seeded from the baked stamp dye on load.
 #[derive(Serialize, Deserialize)]
 struct SceneV4 {
+    version: u32,
+    objects: Vec<SketchObjectV5>,
+    wind_tunnel: bool,
+    flow_speed: f32,
+    viscosity: f32,
+    steps_per_frame: u32,
+    domain_width_m: f32,
+    fluid_nu: f32,
+    fluid_rho: f32,
+    ref_width: u32,
+    /// 0 = LBM (incompressible), 1 = Euler (compressible).
+    solver: u32,
+    mach: f32,
+    fluid_a: f32,
+}
+
+/// Scene file (version 6): the v4/v5 settings layout with the live
+/// object type, whose objects now persist `locked` and `hidden` (U2).
+#[derive(Serialize, Deserialize)]
+struct SceneV6 {
     version: u32,
     objects: Vec<SketchObject>,
     wind_tunnel: bool,
@@ -130,6 +197,7 @@ struct SceneV4 {
 const SCENE_V3: u32 = 3;
 const SCENE_V4: u32 = 4;
 const SCENE_V5: u32 = 5;
+const SCENE_V6: u32 = 6;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -346,7 +414,17 @@ pub struct FlowPaintApp {
     // Model + editing state.
     model: SketchModel,
     tool: Tool,
-    selected: Option<u64>,
+    /// The selection: an ORDERED SET of object ids — insertion order,
+    /// no duplicates, last element = primary (anchor for handle grabs
+    /// and the single-object inspector). ALL writes go through the
+    /// select_* / deselect helpers so the invariant holds at every site.
+    selected: Vec<u64>,
+    /// Tree click anchor for Shift-range selection (a display-order row).
+    tree_anchor: Option<u64>,
+    /// Internal clipboard (Ctrl+C/V); `paste_gen` cascades repeated
+    /// pastes by one offset step each, reset on copy.
+    clipboard: Vec<SketchObject>,
+    paste_gen: u32,
     gesture: Gesture,
     // Defaults for newly drawn objects.
     def_material: ObjMaterial,
@@ -470,7 +548,10 @@ impl FlowPaintApp {
         Self {
             model,
             tool: Tool::Select,
-            selected: None,
+            selected: Vec::new(),
+            tree_anchor: None,
+            clipboard: Vec::new(),
+            paste_gen: 0,
             gesture: Gesture::None,
             def_material: ObjMaterial::Wall,
             def_thickness: 6.0,
@@ -567,6 +648,8 @@ impl FlowPaintApp {
                 c.g() as f32 / 255.0,
                 c.b() as f32 / 255.0,
             ],
+            locked: false,
+            hidden: false,
         }
     }
 
@@ -593,7 +676,7 @@ impl FlowPaintApp {
             obj.smoke_rgb = rgb;
         }
         self.model.add(obj.clone());
-        self.selected = Some(obj.id);
+        self.select_only(obj.id);
         self.tool = Tool::Select;
         self.status =
             "Inserted — drag to place, rotate/scale in the Object panel.".into();
@@ -619,6 +702,219 @@ impl FlowPaintApp {
         let step = self.snap_angle_deg.clamp(1.0, 90.0).to_radians();
         let ang = (dy.atan2(dx) / step).round() * step;
         [a[0] + len * ang.cos(), a[1] + len * ang.sin()]
+    }
+
+    // --- Selection: the ordered set and its ONLY writers ---------------
+    // Invariant: `selected` holds distinct ids in insertion order; the
+    // last id is the primary. Every writer site in the app funnels
+    // through these five (plus `selected.clear()` via deselect_all).
+
+    pub(in crate::app) fn sel_contains(&self, id: u64) -> bool {
+        self.selected.contains(&id)
+    }
+
+    /// The primary selected id (only meaningful single-object contexts
+    /// check it; most readers iterate the whole set).
+    pub(in crate::app) fn primary_sel(&self) -> Option<u64> {
+        self.selected.last().copied()
+    }
+
+    /// The single selected id, when exactly one object is selected.
+    pub(in crate::app) fn single_sel(&self) -> Option<u64> {
+        match self.selected.as_slice() {
+            [id] => Some(*id),
+            _ => None,
+        }
+    }
+
+    pub(in crate::app) fn select_only(&mut self, id: u64) {
+        self.selected.clear();
+        self.selected.push(id);
+    }
+
+    pub(in crate::app) fn select_add(&mut self, id: u64) {
+        if !self.selected.contains(&id) {
+            self.selected.push(id);
+        }
+    }
+
+    /// Shift-click semantics: in the set → drop it, else append it.
+    pub(in crate::app) fn select_toggle(&mut self, id: u64) {
+        if let Some(i) = self.selected.iter().position(|&s| s == id) {
+            self.selected.remove(i);
+        } else {
+            self.selected.push(id);
+        }
+    }
+
+    pub(in crate::app) fn deselect(&mut self, id: u64) {
+        self.selected.retain(|&s| s != id);
+    }
+
+    pub(in crate::app) fn deselect_all(&mut self) {
+        self.selected.clear();
+    }
+
+    /// Drop ids that no longer resolve (undo/redo, loads); called once
+    /// per frame before the UI reads the selection.
+    fn prune_selection(&mut self) {
+        let model = &self.model;
+        self.selected.retain(|&id| model.find(id).is_some());
+        if let Some(a) = self.tree_anchor {
+            if model.find(a).is_none() {
+                self.tree_anchor = None;
+            }
+        }
+    }
+
+    /// Selected ids that may be edited (locked objects can sit in the
+    /// selection via the tree but must not be moved/deleted/retuned).
+    pub(in crate::app) fn editable_selection(&self) -> Vec<u64> {
+        self.selected
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.model
+                    .find(id)
+                    .map(|i| !self.model.objects[i].locked)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Apply one edit to every editable selected object as ONE coalesced
+    /// undo entry (multi-object panel widgets).
+    pub(in crate::app) fn edit_selection(&mut self, f: impl Fn(&mut SketchObject)) {
+        let ids = self.editable_selection();
+        let mut pairs = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(i) = self.model.find(id) {
+                let before = self.model.objects[i].clone();
+                f(&mut self.model.objects[i]);
+                pairs.push((id, before));
+            }
+        }
+        self.model.record_modify_many_coalesced(&pairs);
+    }
+
+    /// Delete the editable selection — one undo entry.
+    pub(in crate::app) fn delete_selected(&mut self) {
+        self.finish_gesture();
+        let ids = self.editable_selection();
+        if ids.is_empty() {
+            return;
+        }
+        for id in &ids {
+            self.deselect(*id);
+        }
+        let n = ids.len();
+        self.model.remove_many(&ids);
+        if n > 1 {
+            self.status = format!("Deleted {n} objects.");
+        }
+    }
+
+    // --- Clipboard ------------------------------------------------------
+
+    /// Marker written to the SYSTEM clipboard on copy: egui swallows
+    /// Ctrl+V entirely and emits a Paste event only when the system
+    /// clipboard holds non-empty text, so the internal object clipboard
+    /// must leave this breadcrumb for the shortcut to fire at all.
+    pub(in crate::app) const CLIPBOARD_MARKER: &'static str = "flowpaint/objects";
+
+    pub(in crate::app) fn copy_selected(&mut self, ctx: &egui::Context) {
+        // Clipboard keeps model (z) order so a paste preserves stacking.
+        let objs: Vec<SketchObject> = self
+            .model
+            .objects
+            .iter()
+            .filter(|o| self.selected.contains(&o.id))
+            .cloned()
+            .collect();
+        if !objs.is_empty() {
+            self.paste_gen = 0;
+            self.status = format!("Copied {} object(s).", objs.len());
+            self.clipboard = objs;
+            ctx.output_mut(|o| o.copied_text = Self::CLIPBOARD_MARKER.into());
+        }
+    }
+
+    /// Paste the clipboard: fresh ids, one undo entry, pasted set
+    /// selected. `in_place` pastes at the exact copied coordinates;
+    /// otherwise repeated pastes cascade by one offset step each.
+    pub(in crate::app) fn paste_clipboard(&mut self, in_place: bool) {
+        if self.clipboard.is_empty() {
+            return;
+        }
+        self.finish_gesture();
+        let offset = if in_place {
+            [0.0, 0.0]
+        } else {
+            self.paste_gen += 1;
+            let d = 16.0 * self.paste_gen as f32;
+            [d, d]
+        };
+        let mut copies = Vec::with_capacity(self.clipboard.len());
+        self.deselect_all();
+        for src in &self.clipboard.clone() {
+            let mut copy = src.clone();
+            copy.id = self.model.fresh_id();
+            copy.translate(offset);
+            self.select_add(copy.id);
+            copies.push(copy);
+        }
+        let n = copies.len();
+        self.model.add_many(copies);
+        self.status = format!("Pasted {n} object(s).");
+    }
+
+    // --- Z-order --------------------------------------------------------
+    // model.objects order IS the paint/rasterize order: later wins
+    // overlaps, so these are functional, not cosmetic.
+
+    /// Reorder the selection within the object list. `dir`: +1 raise,
+    /// -1 lower, +2 to front, -2 to back — relative order of the
+    /// selected objects is preserved in all four.
+    pub(in crate::app) fn zorder_selected(&mut self, dir: i8) {
+        if self.selected.is_empty() {
+            return;
+        }
+        self.finish_gesture();
+        let in_sel: Vec<bool> = self
+            .model
+            .objects
+            .iter()
+            .map(|o| self.selected.contains(&o.id))
+            .collect();
+        let ids: Vec<u64> = self.model.objects.iter().map(|o| o.id).collect();
+        let n = ids.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        match dir {
+            2 => {
+                order = (0..n).filter(|&i| !in_sel[i]).collect();
+                order.extend((0..n).filter(|&i| in_sel[i]));
+            }
+            -2 => {
+                order = (0..n).filter(|&i| in_sel[i]).collect();
+                order.extend((0..n).filter(|&i| !in_sel[i]));
+            }
+            1 => {
+                // Bubble each selected run up one slot, topmost first.
+                for i in (0..n.saturating_sub(1)).rev() {
+                    if in_sel[order[i]] && !in_sel[order[i + 1]] {
+                        order.swap(i, i + 1);
+                    }
+                }
+            }
+            _ => {
+                for i in 1..n {
+                    if in_sel[order[i]] && !in_sel[order[i - 1]] {
+                        order.swap(i, i - 1);
+                    }
+                }
+            }
+        }
+        self.model.reorder(order.into_iter().map(|i| ids[i]).collect());
     }
 }
 
@@ -665,6 +961,7 @@ impl eframe::App for FlowPaintApp {
         };
         self.stats_cfl = snapshot.cfl;
 
+        self.prune_selection();
         self.keyboard(ctx, &mut cmds);
         ui::draw(self, ctx, snapshot, &mut cmds);
 
@@ -813,6 +1110,8 @@ fn base_object(model: &mut SketchModel, shape: Shape) -> SketchObject {
         fan_phase: (id as f32 * 0.618_034) % 1.0,
         fan_angle: 0.0,
         smoke_rgb: [0.35, 0.85, 1.0],
+        locked: false,
+        hidden: false,
     }
 }
 
@@ -916,29 +1215,81 @@ impl FlowPaintApp {
                 | Gesture::DrawPoly { id }
                 | Gesture::DrawPencil { id } => {
                     self.model.cancel_last_add(id);
-                    if self.selected == Some(id) {
-                        self.selected = None;
+                    self.deselect(id);
+                }
+                Gesture::MoveSel { before, .. } => {
+                    // Revert the in-flight move on every member.
+                    for (id, before) in before {
+                        if let Some(i) = self.model.find(id) {
+                            let after_bounds = self.model.objects[i].bounds();
+                            self.model
+                                .mark_dirty(after_bounds.union(before.bounds()));
+                            self.model.objects[i] = before;
+                        }
                     }
                 }
-                Gesture::MoveObj { id, before, .. }
-                | Gesture::HandleDrag { id, before, .. } => {
-                    // Revert the in-flight edit.
+                Gesture::HandleDrag { id, before, .. } => {
                     if let Some(i) = self.model.find(id) {
                         let after_bounds = self.model.objects[i].bounds();
                         self.model.mark_dirty(after_bounds.union(before.bounds()));
                         self.model.objects[i] = before;
                     }
                 }
-                Gesture::None => self.selected = None,
+                Gesture::RubberBand { base, .. } => self.selected = base,
+                Gesture::None => self.deselect_all(),
             }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
         {
-            if !matches!(self.gesture, Gesture::None) {
-                // Don't delete out from under an active gesture.
-            } else if let Some(id) = self.selected.take() {
-                self.model.remove(id);
+            if matches!(self.gesture, Gesture::None) {
+                // (An active gesture must not be deleted out from under.)
+                self.delete_selected();
             }
+        }
+        // Select all (unlocked, visible objects); Esc above clears.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+            self.finish_gesture();
+            self.selected = self
+                .model
+                .objects
+                .iter()
+                .filter(|o| !o.locked && !o.hidden)
+                .map(|o| o.id)
+                .collect();
+        }
+        // Clipboard. egui swallows Ctrl+C/Ctrl+V into Copy/Paste EVENTS
+        // (they never arrive as key_pressed), so match the events.
+        let (copy, paste, shift_now) = ctx.input(|i| {
+            let mut c = false;
+            let mut p = false;
+            for e in &i.events {
+                match e {
+                    egui::Event::Copy => c = true,
+                    // Only our own breadcrumb pastes objects; foreign
+                    // clipboard text must not trigger an object paste.
+                    egui::Event::Paste(s) if s == Self::CLIPBOARD_MARKER => {
+                        p = true;
+                    }
+                    _ => {}
+                }
+            }
+            (c, p, i.modifiers.shift)
+        });
+        if copy {
+            self.copy_selected(ctx);
+        }
+        if paste {
+            // Ctrl+Shift+V pastes in place.
+            self.paste_clipboard(shift_now);
+        }
+        // Z-order: Ctrl+]/[ raise/lower, +Shift to front/back.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::CloseBracket)) {
+            let dir = if ctx.input(|i| i.modifiers.shift) { 2 } else { 1 };
+            self.zorder_selected(dir);
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::OpenBracket)) {
+            let dir = if ctx.input(|i| i.modifiers.shift) { -2 } else { -1 };
+            self.zorder_selected(dir);
         }
         // Space pauses on RELEASE, not press: while held it is the pan
         // modifier on the canvas, and a hold that panned must not also
@@ -972,12 +1323,12 @@ impl FlowPaintApp {
             } else {
                 self.model.undo();
             }
-            self.selected = None;
+            self.deselect_all();
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Y)) {
             self.finish_gesture();
             self.model.redo();
-            self.selected = None;
+            self.deselect_all();
         }
         if matches!(self.gesture, Gesture::None) {
             let mut switch = None;
@@ -1005,44 +1356,60 @@ impl FlowPaintApp {
                 self.tool = tool;
             }
         }
-        // Arrow-key nudge for the selected object.
-        if let Some(id) = self.selected {
-            if matches!(self.gesture, Gesture::None) {
-                let step = if ctx.input(|i| i.modifiers.shift) { 1.0 } else { 4.0 };
-                let mut d = [0.0f32; 2];
-                ctx.input(|i| {
-                    if i.key_pressed(egui::Key::ArrowLeft) {
-                        d[0] -= step;
-                    }
-                    if i.key_pressed(egui::Key::ArrowRight) {
-                        d[0] += step;
-                    }
-                    if i.key_pressed(egui::Key::ArrowUp) {
-                        d[1] -= step;
-                    }
-                    if i.key_pressed(egui::Key::ArrowDown) {
-                        d[1] += step;
-                    }
-                });
-                if d != [0.0; 2] {
-                    self.edit_object(id, |o| o.translate(d));
+        // Arrow-key nudge for the whole selection: 1 cell, Shift for a
+        // coarse 8-cell step. One (coalesced) undo entry per selection.
+        if !self.selected.is_empty() && matches!(self.gesture, Gesture::None) {
+            let step = if ctx.input(|i| i.modifiers.shift) { 8.0 } else { 1.0 };
+            let mut d = [0.0f32; 2];
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::ArrowLeft) {
+                    d[0] -= step;
                 }
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    d[0] += step;
+                }
+                if i.key_pressed(egui::Key::ArrowUp) {
+                    d[1] -= step;
+                }
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    d[1] += step;
+                }
+            });
+            if d != [0.0; 2] {
+                self.edit_selection(|o| o.translate(d));
             }
         }
     }
 
+    /// Duplicate the whole selection — one undo entry; the copies become
+    /// the selection (in the originals' z-order).
     fn duplicate_selected(&mut self) {
         self.finish_gesture();
-        if let Some(id) = self.selected {
-            if let Some(i) = self.model.find(id) {
-                let mut copy = self.model.objects[i].clone();
-                copy.id = self.model.fresh_id();
-                copy.translate([16.0, 16.0]);
-                self.selected = Some(copy.id);
-                self.model.add(copy);
-                self.status = "Duplicated.".into();
-            }
+        let src: Vec<SketchObject> = self
+            .model
+            .objects
+            .iter()
+            .filter(|o| self.selected.contains(&o.id))
+            .cloned()
+            .collect();
+        if src.is_empty() {
+            return;
         }
+        let mut copies = Vec::with_capacity(src.len());
+        self.deselect_all();
+        for mut copy in src {
+            copy.id = self.model.fresh_id();
+            copy.translate([16.0, 16.0]);
+            self.select_add(copy.id);
+            copies.push(copy);
+        }
+        let n = copies.len();
+        self.model.add_many(copies);
+        self.status = if n == 1 {
+            "Duplicated.".into()
+        } else {
+            format!("Duplicated {n} objects.")
+        };
     }
 
     /// One harness step per frame: time the frame, set up the scene on
@@ -1087,15 +1454,6 @@ impl FlowPaintApp {
         }
     }
 
-    /// Apply a coalesced, undoable edit to an object (panel widgets).
-    fn edit_object(&mut self, id: u64, f: impl FnOnce(&mut SketchObject)) {
-        if let Some(i) = self.model.find(id) {
-            let before = self.model.objects[i].clone();
-            f(&mut self.model.objects[i]);
-            self.model.record_modify_coalesced(id, before);
-        }
-    }
-
     /// Mutate an object mid-gesture: no undo record (that lands when the
     /// gesture finishes), just damage marking.
     fn mutate_live(&mut self, id: u64, f: impl FnOnce(&mut SketchObject)) {
@@ -1130,12 +1488,10 @@ impl FlowPaintApp {
                     .unwrap_or(true);
                 if degenerate {
                     self.model.cancel_last_add(id);
-                    if self.selected == Some(id) {
-                        self.selected = None;
-                    }
+                    self.deselect(id);
                 } else {
                     self.model.finalize_last_add(id);
-                    self.selected = Some(id);
+                    self.select_only(id);
                 }
             }
             Gesture::DrawShape { id, .. } => {
@@ -1153,12 +1509,10 @@ impl FlowPaintApp {
                     .unwrap_or(true);
                 if degenerate {
                     self.model.cancel_last_add(id);
-                    if self.selected == Some(id) {
-                        self.selected = None;
-                    }
+                    self.deselect(id);
                 } else {
                     self.model.finalize_last_add(id);
-                    self.selected = Some(id);
+                    self.select_only(id);
                 }
             }
             Gesture::DrawPencil { id } => {
@@ -1178,18 +1532,21 @@ impl FlowPaintApp {
                     .unwrap_or(true);
                 if degenerate {
                     self.model.cancel_last_add(id);
-                    if self.selected == Some(id) {
-                        self.selected = None;
-                    }
+                    self.deselect(id);
                 } else {
                     self.model.finalize_last_add(id);
-                    self.selected = Some(id);
+                    self.select_only(id);
                 }
             }
-            Gesture::MoveObj { id, before, .. }
-            | Gesture::HandleDrag { id, before, .. } => {
+            Gesture::MoveSel { before, .. } => {
+                // One undo entry for the whole selection's move.
+                self.model.record_modify_many(&before);
+            }
+            Gesture::HandleDrag { id, before, .. } => {
                 self.model.record_modify(id, before);
             }
+            // Selection was applied live; nothing to finalize.
+            Gesture::RubberBand { .. } => {}
             Gesture::None => {}
         }
     }
@@ -1198,8 +1555,8 @@ impl FlowPaintApp {
         // Commit any in-flight gesture so the file doesn't capture a
         // polyline's cursor-tracking rubber vertex.
         self.finish_gesture();
-        let scene = SceneV4 {
-            version: SCENE_V5,
+        let scene = SceneV6 {
+            version: SCENE_V6,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -1240,20 +1597,37 @@ impl FlowPaintApp {
         } else {
             0
         };
-        if !(SCENE_V3..=SCENE_V5).contains(&version) {
+        if !(SCENE_V3..=SCENE_V6).contains(&version) {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
             return;
         }
         // A v3 file is a v4 file without the solver fields; v5 shares
-        // the v4 layout.
-        let decoded = if version >= SCENE_V4 {
-            bincode::deserialize::<SceneV4>(&bytes)
-        } else {
-            bincode::deserialize::<SceneV3>(&bytes).map(|s| SceneV4 {
+        // the v4 layout; v6 appends per-object lock/hide, so pre-v6
+        // objects decode via the SketchObjectV5 mirror and convert.
+        let decoded = if version >= SCENE_V6 {
+            bincode::deserialize::<SceneV6>(&bytes)
+        } else if version >= SCENE_V4 {
+            bincode::deserialize::<SceneV4>(&bytes).map(|s| SceneV6 {
                 version: s.version,
-                objects: s.objects,
+                objects: s.objects.into_iter().map(Into::into).collect(),
+                wind_tunnel: s.wind_tunnel,
+                flow_speed: s.flow_speed,
+                viscosity: s.viscosity,
+                steps_per_frame: s.steps_per_frame,
+                domain_width_m: s.domain_width_m,
+                fluid_nu: s.fluid_nu,
+                fluid_rho: s.fluid_rho,
+                ref_width: s.ref_width,
+                solver: s.solver,
+                mach: s.mach,
+                fluid_a: s.fluid_a,
+            })
+        } else {
+            bincode::deserialize::<SceneV3>(&bytes).map(|s| SceneV6 {
+                version: s.version,
+                objects: s.objects.into_iter().map(Into::into).collect(),
                 wind_tunnel: s.wind_tunnel,
                 flow_speed: s.flow_speed,
                 viscosity: s.viscosity,
@@ -1270,7 +1644,7 @@ impl FlowPaintApp {
         match decoded {
             Ok(scene) => {
                 self.finish_gesture();
-                self.selected = None;
+                self.deselect_all();
                 let mut objects = scene.objects;
                 // Drop payloads a corrupt or crafted file could smuggle in
                 // that the rasterizer / bounds math can't survive.
@@ -1391,3 +1765,81 @@ fn object_is_sane(o: &SketchObject) -> bool {
 }
 
 // --- The wgpu paint callback ------------------------------------------
+
+#[cfg(test)]
+mod scene_tests {
+    use super::*;
+
+    fn v5_obj(id: u64) -> SketchObjectV5 {
+        SketchObjectV5 {
+            id,
+            shape: Shape::Ellipse { c: [10.0, 20.0], r: [5.0, 5.0], angle: 0.3 },
+            material: ObjMaterial::Fan,
+            thickness: 6.0,
+            filled: true,
+            fan_mult: 1.5,
+            fan_gust: 0.2,
+            fan_phase: 0.1,
+            fan_angle: 0.4,
+            smoke_rgb: [0.1, 0.2, 0.3],
+        }
+    }
+
+    /// A v5-layout file (written by the pre-U2 code) still decodes, and
+    /// its objects convert with lock/hide off.
+    #[test]
+    fn v5_bytes_decode_and_convert() {
+        let scene = SceneV4 {
+            version: SCENE_V5,
+            objects: vec![v5_obj(7)],
+            wind_tunnel: true,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 1,
+            mach: 1.6,
+            fluid_a: 343.0,
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        // The version peek the loader does.
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(version, SCENE_V5);
+        let back = bincode::deserialize::<SceneV4>(&bytes).unwrap();
+        let obj: SketchObject = back.objects.into_iter().next().unwrap().into();
+        assert_eq!(obj.id, 7);
+        assert!(!obj.locked && !obj.hidden);
+        assert_eq!(obj.fan_mult, 1.5);
+    }
+
+    /// v6 round-trips lock/hide, and its version peek reads 6.
+    #[test]
+    fn v6_roundtrip_persists_lock_hide() {
+        let mut obj: SketchObject = v5_obj(3).into();
+        obj.locked = true;
+        obj.hidden = true;
+        let scene = SceneV6 {
+            version: SCENE_V6,
+            objects: vec![obj],
+            wind_tunnel: false,
+            flow_speed: 0.05,
+            viscosity: 0.02,
+            steps_per_frame: 8,
+            domain_width_m: 2.0,
+            fluid_nu: 1.0e-6,
+            fluid_rho: 998.0,
+            ref_width: 1280,
+            solver: 0,
+            mach: 1.6,
+            fluid_a: 1481.0,
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(version, SCENE_V6);
+        let back = bincode::deserialize::<SceneV6>(&bytes).unwrap();
+        assert!(back.objects[0].locked && back.objects[0].hidden);
+    }
+}

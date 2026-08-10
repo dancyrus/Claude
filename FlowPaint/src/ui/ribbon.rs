@@ -78,7 +78,7 @@ impl FlowPaintApp {
                 .clicked()
             {
                 self.finish_gesture();
-                self.selected = None;
+                self.deselect_all();
                 self.model.replace_all(Vec::new());
                 cmds.push(Cmd::ResetFlow);
             }
@@ -88,14 +88,14 @@ impl FlowPaintApp {
                 if theme::ribbon_button(ui, false, false, ph::ARROW_U_UP_LEFT, "Undo").clicked() {
                     self.finish_gesture();
                     self.model.undo();
-                    self.selected = None;
+                    self.deselect_all();
                 }
             });
             ui.add_enabled_ui(self.model.can_redo(), |ui| {
                 if theme::ribbon_button(ui, false, false, ph::ARROW_U_UP_RIGHT, "Redo").clicked() {
                     self.finish_gesture();
                     self.model.redo();
-                    self.selected = None;
+                    self.deselect_all();
                 }
             });
         });
@@ -363,7 +363,7 @@ impl FlowPaintApp {
                     .clicked()
                 {
                     self.finish_gesture();
-                    self.selected = None;
+                    self.deselect_all();
                     let (vw, vh) = self.stats_grid;
                     let objs = build_preset(p, &mut self.model, vw, vh);
                     self.model.replace_all(objs);
@@ -498,9 +498,9 @@ impl FlowPaintApp {
             {
                 self.view_request = Some(ViewRequest::OneToOne);
             }
-            ui.add_enabled_ui(self.selected.is_some(), |ui| {
+            ui.add_enabled_ui(!self.selected.is_empty(), |ui| {
                 if theme::ribbon_button(ui, false, false, ph::SELECTION, "Selection")
-                    .on_hover_text("Zoom to the selected object. Shortcut: Ctrl+2.")
+                    .on_hover_text("Zoom to the selection. Shortcut: Ctrl+2.")
                     .clicked()
                 {
                     self.view_request = Some(ViewRequest::Selection);

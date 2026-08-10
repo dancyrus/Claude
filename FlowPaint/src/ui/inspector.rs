@@ -31,7 +31,7 @@ impl FlowPaintApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if self.selected.is_some()
+                        if !self.selected.is_empty()
                             && !matches!(self.gesture, Gesture::None)
                         {
                             // Mid-gesture: the object panel would fight
@@ -40,7 +40,9 @@ impl FlowPaintApp {
                             ui.label(
                                 egui::RichText::new("(finish the gesture…)").weak(),
                             );
-                        } else if let Some(id) = self.selected {
+                        } else if self.selected.len() > 1 {
+                            self.multi_panel(ui, cmds);
+                        } else if let Some(id) = self.single_sel() {
                             self.object_panel(ui, id, snap, cmds);
                         } else {
                             self.defaults_panel(ui, cmds);
@@ -59,9 +61,26 @@ impl FlowPaintApp {
         cmds: &mut Vec<Cmd>,
     ) {
         let Some(i) = self.model.find(id) else {
-            self.selected = None;
+            self.deselect_all();
             return;
         };
+        if self.model.objects[i].locked {
+            ui.label(super::theme::heading("Object — locked"));
+            ui.label(
+                egui::RichText::new(
+                    "Locked objects can't be edited or moved. Unlock from \
+                     the model tree (or below).",
+                )
+                .small()
+                .weak(),
+            );
+            if ui.button("Unlock").clicked() {
+                let before = self.model.objects[i].clone();
+                self.model.objects[i].locked = false;
+                self.model.record_modify(id, before);
+            }
+            return;
+        }
         let before = self.model.objects[i].clone();
         let mut obj = before.clone();
         let mut changed = false;
@@ -241,12 +260,11 @@ impl FlowPaintApp {
                 self.duplicate_selected();
             }
             if ui.button("Delete (Del)").clicked() {
-                self.selected = None;
-                self.model.remove(id);
+                self.delete_selected();
             }
         });
         // Deleting or duplicating invalidates `i`/`before`; bail out.
-        if self.selected != Some(id) {
+        if self.single_sel() != Some(id) {
             return;
         }
 
@@ -265,6 +283,140 @@ impl FlowPaintApp {
                 .weak(),
             );
         }
+    }
+
+    /// The multi-selection panel: shared properties across the set, with
+    /// a mixed-value indicator where members disagree — a property is
+    /// never silently overwritten by the first object's value; only an
+    /// actual edit applies to the whole (editable) selection, as one
+    /// coalesced undo entry. Rotate/scale about a common pivot is U3.
+    fn multi_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        let ids = self.selected.clone();
+        let objs: Vec<usize> = ids.iter().filter_map(|&id| self.model.find(id)).collect();
+        ui.label(super::theme::heading(format!("Objects — {} selected", objs.len())));
+        let locked_n = objs
+            .iter()
+            .filter(|&&i| self.model.objects[i].locked)
+            .count();
+        if locked_n > 0 {
+            super::theme::derived(
+                ui,
+                format!("{locked_n} locked (edits skip them)"),
+            );
+        }
+
+        // Material: highlighted only when the whole selection agrees.
+        let mats: [(ObjMaterial, &str); 4] = [
+            (ObjMaterial::Wall, "Solid, no-slip"),
+            (ObjMaterial::Fan, "Blows along the shape"),
+            (ObjMaterial::Smoke, "Passive dye emitter"),
+            (ObjMaterial::Drain, "Lets flow leave"),
+        ];
+        let non_stamp: Vec<usize> = objs
+            .iter()
+            .copied()
+            .filter(|&i| !matches!(self.model.objects[i].shape, Shape::Stamp { .. }))
+            .collect();
+        if !non_stamp.is_empty() {
+            let first = self.model.objects[non_stamp[0]].material;
+            let uniform_mat = non_stamp
+                .iter()
+                .all(|&i| self.model.objects[i].material == first);
+            let mut set_mat = None;
+            ui.horizontal_wrapped(|ui| {
+                for (m, tip) in mats {
+                    let on = uniform_mat && first == m;
+                    if super::theme::toggle(ui, on, m.label())
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        set_mat = Some(m);
+                    }
+                }
+            });
+            if !uniform_mat {
+                super::theme::derived(ui, "material: (mixed)".into());
+            }
+            if let Some(m) = set_mat {
+                // Stamps carry their own cell types; leave them alone.
+                self.edit_selection(|o| {
+                    if !matches!(o.shape, Shape::Stamp { .. }) {
+                        o.material = m;
+                    }
+                });
+                if m == ObjMaterial::Smoke {
+                    cmds.push(Cmd::SetRenderMode(RenderMode::Dye));
+                }
+            }
+        }
+
+        // Thickness: mixed indicator, edits apply to the whole set.
+        let thick: Vec<f32> = objs
+            .iter()
+            .map(|&i| self.model.objects[i].thickness)
+            .collect();
+        if let Some(&t0) = thick.first() {
+            let uniform_t = thick.iter().all(|&t| (t - t0).abs() < 1e-3);
+            // Seed the widget from the PRIMARY object; nothing is applied
+            // until the user actually edits the value.
+            let mut t = self
+                .primary_sel()
+                .and_then(|id| self.model.find(id))
+                .map(|i| self.model.objects[i].thickness)
+                .unwrap_or(t0);
+            ui.horizontal(|ui| {
+                let changed = ui
+                    .add(
+                        egui::DragValue::new(&mut t)
+                            .range(1.0..=24.0)
+                            .speed(0.1)
+                            .suffix(" cells"),
+                    )
+                    .changed();
+                ui.label(if uniform_t { "thickness" } else { "thickness (mixed)" });
+                if changed {
+                    self.edit_selection(|o| o.thickness = t);
+                }
+            });
+            if uniform_t {
+                let ps = self.phys_cache;
+                super::theme::derived(ui, format!("= {}", fmt_len(ps.len_m(t0))));
+            }
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Duplicate (Ctrl+D)").clicked() {
+                self.duplicate_selected();
+            }
+            if ui.button("Delete (Del)").clicked() {
+                self.delete_selected();
+            }
+        });
+        // Z-order for the set (also in the tree's context menu).
+        ui.horizontal(|ui| {
+            if ui.button("Front").on_hover_text("Ctrl+Shift+]").clicked() {
+                self.zorder_selected(2);
+            }
+            if ui.button("Raise").on_hover_text("Ctrl+]").clicked() {
+                self.zorder_selected(1);
+            }
+            if ui.button("Lower").on_hover_text("Ctrl+[").clicked() {
+                self.zorder_selected(-1);
+            }
+            if ui.button("Back").on_hover_text("Ctrl+Shift+[").clicked() {
+                self.zorder_selected(-2);
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Drag any selected object to move the set; arrows nudge \
+                 (Shift = coarse). Rotate/scale of a multi-selection \
+                 arrives with U3.",
+            )
+            .small()
+            .weak(),
+        );
     }
 
     /// The Engine group for a generated part with fan cells: chamber

@@ -12,7 +12,7 @@ impl FlowPaintApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("New (clear everything)").clicked() {
                         self.finish_gesture();
-                        self.selected = None;
+                        self.deselect_all();
                         self.model.replace_all(Vec::new());
                         cmds.push(Cmd::ResetFlow);
                         ui.close_menu();
@@ -57,13 +57,37 @@ impl FlowPaintApp {
                     if ui.button("Undo        Ctrl+Z").clicked() {
                         self.finish_gesture();
                         self.model.undo();
-                        self.selected = None;
+                        self.deselect_all();
                         ui.close_menu();
                     }
                     if ui.button("Redo        Ctrl+Y").clicked() {
                         self.finish_gesture();
                         self.model.redo();
-                        self.selected = None;
+                        self.deselect_all();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Copy        Ctrl+C").clicked() {
+                        self.copy_selected(&ui.ctx().clone());
+                        ui.close_menu();
+                    }
+                    if ui.button("Paste       Ctrl+V").clicked() {
+                        self.paste_clipboard(false);
+                        ui.close_menu();
+                    }
+                    if ui.button("Paste in place  Ctrl+Shift+V").clicked() {
+                        self.paste_clipboard(true);
+                        ui.close_menu();
+                    }
+                    if ui.button("Select all  Ctrl+A").clicked() {
+                        self.finish_gesture();
+                        self.selected = self
+                            .model
+                            .objects
+                            .iter()
+                            .filter(|o| !o.locked && !o.hidden)
+                            .map(|o| o.id)
+                            .collect();
                         ui.close_menu();
                     }
                     ui.separator();
