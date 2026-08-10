@@ -18,16 +18,14 @@ pub const RESOLUTIONS: [(&str, usize, usize); 4] = [
 /// of the visible height added on EACH side. A larger margin pushes the
 /// domain boundaries (and their artifacts) away from what you see; the
 /// outermost cells also get an absorbing sponge layer.
-pub const MARGIN_CHOICES: [(&str, f32); 4] = [
-    ("None", 0.0),
+pub const MARGIN_CHOICES: [(&str, f32); 3] = [
     ("Small (+25 %)", 0.25),
     ("Medium (+50 %)", 0.5),
     ("Large (+100 %)", 1.0),
 ];
-pub const DEFAULT_MARGIN_INDEX: usize = 2;
+pub const DEFAULT_MARGIN_INDEX: usize = 1;
 
-pub const PARTICLE_CHOICES: [(&str, u32); 5] = [
-    ("Off", 0),
+pub const PARTICLE_CHOICES: [(&str, u32); 4] = [
     ("100 k", 100_000),
     ("500 k", 500_000),
     ("1 M", 1_000_000),
@@ -308,6 +306,9 @@ pub struct GpuSim {
     pub total_steps: f64,
     pending_reset: bool,
     pending_clear_dye: bool,
+    /// Advance one frame's worth of steps despite `paused`; cleared by
+    /// `encode_compute` after one frame.
+    pub step_once: bool,
     /// Steps actually encoded last frame (for stats/particle dt).
     pub steps_last_frame: u32,
 }
@@ -668,6 +669,7 @@ impl GpuSim {
             total_steps: 0.0,
             pending_reset: true,
             pending_clear_dye: true,
+            step_once: false,
             steps_last_frame: 0,
         };
         // Content (including tunnel bands) is projected from the sketch
@@ -1004,7 +1006,12 @@ impl GpuSim {
     /// Encode this frame's compute work onto the provided encoder.
     pub fn encode_compute(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let (w, h) = (self.geo.w, self.geo.h);
-        let steps = if self.settings.paused { 0 } else { self.settings.steps_per_frame.max(1) };
+        let steps = if !self.settings.paused || self.step_once {
+            self.settings.steps_per_frame.max(1)
+        } else {
+            0
+        };
+        self.step_once = false;
         self.steps_last_frame = steps;
 
         let params = SimParamsRaw {
