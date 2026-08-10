@@ -4,7 +4,7 @@
 //! use compact label + widget rows, mockup-style.
 
 use crate::app::{build_preset, Cmd, FlowPaintApp, RibbonTab, ScenePreset, Tool, UiSnapshot, FLUID_PRESETS};
-use crate::sim::{RenderMode, SolverMode, PARTICLE_CHOICES};
+use crate::sim::{color_ranges, RangeMode, RenderMode, SolverMode, PARTICLE_CHOICES};
 use eframe::egui;
 
 use super::units::{fmt_density, fmt_len, fmt_speed, fmt_time};
@@ -426,11 +426,20 @@ impl FlowPaintApp {
         });
         group(ui, "Mapping", |ui| {
             ui.vertical(|ui| {
+                let range_auto =
+                    color_ranges().lock().unwrap()[snap.mode as usize].mode == RangeMode::Auto;
                 let mut gain = snap.display_gain;
                 row(ui, "display gain", |ui| {
                     if ui
-                        .add(egui::Slider::new(&mut gain, 0.25..=4.0).logarithmic(true))
+                        .add_enabled(
+                            range_auto || snap.mode == RenderMode::Dye,
+                            egui::Slider::new(&mut gain, 0.25..=4.0).logarithmic(true),
+                        )
                         .on_hover_text("Scales the speed/vorticity/pressure color mapping")
+                        .on_disabled_hover_text(
+                            "The color range is pinned; set the range to Auto \
+                             to use the gain",
+                        )
                         .changed()
                     {
                         cmds.push(Cmd::SetDisplayGain(gain));

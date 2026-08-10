@@ -4,7 +4,7 @@
 //! callback encodes the compute + render work each frame.
 
 use crate::geometry::{Geometry, GridRect};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
 /// Visible-canvas resolutions; the simulated grid is larger by the margin.
 pub const RESOLUTIONS: [(&str, usize, usize); 4] = [
@@ -64,6 +64,57 @@ impl RenderMode {
             RenderMode::Pressure => "Pressure",
         }
     }
+}
+
+// --- Color range (plan v4.1, T2-A) -----------------------------------
+//
+// The saturation point of the field color mapping, per render mode. This
+// lives behind a process-wide handle rather than in `Settings` because
+// the UI panels never hold `&mut GpuSim` (it lives in egui-wgpu's
+// `CallbackResources`) and the app's `Cmd` plumbing belongs to Track 1
+// while the tracks run concurrently. Fold into `Settings` + `Cmd` after
+// the merge.
+
+/// How the color-mapping range for one render mode is chosen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RangeMode {
+    /// The saturation point follows the inlet condition and the display
+    /// gain — the pre-T2-A behavior, where the scale floats.
+    Auto,
+    /// The physical value that was on screen when the user locked is
+    /// kept; the scale no longer follows the flow settings. After the
+    /// capture this behaves exactly like `Manual`.
+    Locked,
+    /// The user typed the saturation value in physical units.
+    Manual,
+}
+
+/// One render mode's range. The two values describe the same saturation
+/// point: the physical value is authoritative for `Locked` and `Manual`,
+/// and the UI rewrites the render-unit twin every frame (the physical
+/// conversions live app-side, next to the rest of the unit handling);
+/// under `Auto` the UI keeps both tracking the current settings.
+#[derive(Clone, Copy)]
+pub struct FieldRange {
+    pub mode: RangeMode,
+    /// Saturation point in render-buffer units (velocity-buffer units for
+    /// Speed, their curl for Vorticity, density deviation for Pressure).
+    /// This is what the shader mapping uses.
+    pub sat_render: f32,
+    /// The same point in physical units (m/s, 1/s, Pa) — what the UI
+    /// shows and edits, and what a pinned range holds on to.
+    pub sat_phys: f32,
+}
+
+const FIELD_RANGE_DEFAULT: FieldRange =
+    FieldRange { mode: RangeMode::Auto, sat_render: 1.0, sat_phys: 0.0 };
+
+/// Shared color-range state, indexed by `RenderMode as usize`. The Dye
+/// entry is unused — smoke is a passive tracer with no scale to lock.
+static COLOR_RANGES: Mutex<[FieldRange; 4]> = Mutex::new([FIELD_RANGE_DEFAULT; 4]);
+
+pub fn color_ranges() -> &'static Mutex<[FieldRange; 4]> {
+    &COLOR_RANGES
 }
 
 /// Simulation settings mirrored by the UI.
@@ -893,6 +944,28 @@ impl GpuSim {
         }
     }
 
+    /// The display gain the render uniform should carry. A pinned
+    /// (Locked/Manual) range maps onto the one knob the shader exposes:
+    /// every mapping in render.wgsl is linear in `display_gain`, so a
+    /// fixed saturation point is a per-frame gain — each arm below sets
+    /// the shader's clip point to `sat_render` by inverting the
+    /// corresponding normalization. Auto passes the user's gain through.
+    fn range_display_gain(&self) -> f32 {
+        let mode = self.settings.render_mode;
+        let fr = color_ranges().lock().unwrap()[mode as usize];
+        if fr.mode == RangeMode::Auto {
+            return self.settings.display_gain;
+        }
+        let sat = fr.sat_render.max(1e-9);
+        let inlet = self.render_inlet_speed();
+        match mode {
+            RenderMode::Speed => (inlet * 1.6).max(1e-3) / sat,
+            RenderMode::Vorticity => inlet.max(0.02) / (4.0 * sat),
+            RenderMode::Pressure => 1.0 / (25.0 * sat),
+            RenderMode::Dye => self.settings.display_gain,
+        }
+    }
+
 
     pub fn set_wind_tunnel(&mut self, on: bool) {
         self.settings.wind_tunnel = on;
@@ -1171,7 +1244,7 @@ impl GpuSim {
             inlet_speed: self.render_inlet_speed(),
             vis_origin: [self.margin as u32, self.margin as u32],
             vis_size: [self.vis_w as u32, self.vis_h as u32],
-            display_gain: self.settings.display_gain,
+            display_gain: self.range_display_gain(),
             smoke_gain: self.settings.smoke_gain,
             particle_size: self.settings.particle_size,
             particle_brightness: self.settings.particle_brightness,
@@ -1225,7 +1298,9 @@ impl GpuSim {
             inlet_speed: self.render_inlet_speed(),
             vis_origin: [self.margin as u32, self.margin as u32],
             vis_size: [self.vis_w as u32, self.vis_h as u32],
-            display_gain: self.settings.display_gain,
+            // The same effective gain as the live view, so an exported
+            // PNG of a locked range matches the screen.
+            display_gain: self.range_display_gain(),
             smoke_gain: self.settings.smoke_gain,
             particle_size: self.settings.particle_size,
             particle_brightness: self.settings.particle_brightness,
