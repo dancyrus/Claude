@@ -12,7 +12,10 @@ struct RenderParams {
     width: u32,        // full grid cells in x (including margin)
     height: u32,       // full grid cells in y
     mode: u32,         // 0 dye, 1 speed, 2 vorticity, 3 pressure
-    flags: u32,        // bit 0: draw boundary tints
+    flags: u32,        // bit 0: draw boundary tints; bit 1: swap the
+                       // view's colormap (speed -> coolwarm, vorticity/
+                       // pressure -> inferno). The legend mirrors both
+                       // maps CPU-side (app.rs stop tables).
     vp_origin: vec2f,  // canvas viewport origin, framebuffer px
     vp_size: vec2f,    // canvas viewport size, framebuffer px
     lb_origin: vec2f,  // letterboxed visible-window origin, framebuffer px
@@ -147,7 +150,14 @@ fn fs_field(@builtin(position) frag: vec4f) -> @location(0) vec4f {
         switch R.mode {
             case MODE_SPEED: {
                 let s = length(sample_vel(g));
-                col = inferno_map(s * R.display_gain / max(R.inlet_speed * 1.6, 1e-3));
+                let t = s * R.display_gain / max(R.inlet_speed * 1.6, 1e-3);
+                if ((R.flags & 2u) != 0u) {
+                    // Sequential data on the diverging map: 0..1 spans
+                    // the full blue-white-red ramp.
+                    col = coolwarm_map(t * 2.0 - 1.0);
+                } else {
+                    col = inferno_map(t);
+                }
             }
             case MODE_VORTICITY: {
                 let vr = sample_vel(g + vec2f(1.0, 0.0));
@@ -155,11 +165,23 @@ fn fs_field(@builtin(position) frag: vec4f) -> @location(0) vec4f {
                 let vu = sample_vel(g + vec2f(0.0, 1.0));
                 let vd = sample_vel(g - vec2f(0.0, 1.0));
                 let curl = 0.5 * ((vr.y - vl.y) - (vu.x - vd.x));
-                col = coolwarm_map(curl * R.display_gain * (4.0 / max(R.inlet_speed, 0.02)));
+                let t = curl * R.display_gain * (4.0 / max(R.inlet_speed, 0.02));
+                if ((R.flags & 2u) != 0u) {
+                    // Diverging data on the sequential map: -1..1 spans
+                    // the inferno ramp end to end.
+                    col = inferno_map(t * 0.5 + 0.5);
+                } else {
+                    col = coolwarm_map(t);
+                }
             }
             case MODE_PRESSURE: {
                 let p = density[idx] - 1.0;
-                col = coolwarm_map(p * R.display_gain * 25.0);
+                let t = p * R.display_gain * 25.0;
+                if ((R.flags & 2u) != 0u) {
+                    col = inferno_map(t * 0.5 + 0.5);
+                } else {
+                    col = coolwarm_map(t);
+                }
             }
             default: { // MODE_DYE
                 let bg = vec3f(0.030, 0.040, 0.070);

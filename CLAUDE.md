@@ -8,15 +8,44 @@ object model (`model.rs`): objects stay live and editable, the grid is a
 damage-region re-projection, **nothing is ever flattened** — any eraser
 must be a per-object, undoable operation (see plan phase 6a).
 
-The UI overhaul spec is `docs/flowpaint-ui-overhaul-plan-v3.md` (v3
-supersedes v2; corrected against `docs/ui-inventory.md`). The layout
-mockup `docs/ui-target.html` is authoritative for spacing, color, type
-and panel arrangement — not for widget construction or numeric values.
+The working plan is `docs/flowpaint-plan-v4.1.md` (six units on two
+tracks; supersedes v4's phase numbering — the v4 reasoning doc was never
+checked in). Standing constraints carry from
+`docs/flowpaint-ui-overhaul-plan-v3.md`; the layout mockup
+`docs/ui-target.html` is authoritative for spacing, color, type and
+panel arrangement — not for widget construction or numeric values.
+
+## Unit status (plan v4.1)
+
+- **Branch names** (the real git branches; earlier notes calling U1's
+  branch `ui/u1-navigation` are wrong — that branch does not exist):
+  - Track 1 / U1: `claude/flowpaint-v4.1-u1-nav-o8c1im`
+  - Track 2 / T2-A: `claude/t2a-color-range-opuijy`
+- **T2-A (color range + colormap): done** except asymmetric manual
+  min/max (deliberately unimplemented — needs a per-mode offset in the
+  `render.wgsl` normalization). T2-B not started; it waits for U1 to
+  merge (`ui/status.rs`).
+- T2-A decisions a later unit must not re-derive (details in
+  `docs/t2a-color-range.md`):
+  - Color-range + colormap state lives in `sim.rs` behind
+    `sim::color_ranges()` (a `Mutex`) ONLY because `app.rs`
+    (`Cmd`/`UiSnapshot`, frozen for Track 1) never hands panels
+    `&mut GpuSim`. **Fold into `Settings` + `Cmd` at the track merge.**
+  - Locked/manual ranges and colormap picks are **not persisted in
+    scene files** (scene IO is app.rs). U5's share-ready export needs
+    them persisted — add at the merge with the scene-format bump.
+  - Locked pins the **physical** value: the legend number holds and the
+    colors re-derive through the current unit scaling. The sim maps a
+    pinned range onto `display_gain` per frame (every render.wgsl
+    mapping is linear in it); `render.wgsl` flags bit 1 = swap the
+    view's colormap away from its default binding.
 
 ## Hard rules
 
 - **Never edit anything under `FlowPaint/src/shaders/`** during the UI
-  effort. The inferno/coolwarm stop tables in `app.rs` mirror
+  effort. One approved exception has landed: T2-A's colormap-swap
+  branches in `render.wgsl` (`flags` bit 1; no uniform added or
+  reordered). The inferno/coolwarm stop tables in `app.rs` mirror
   `render.wgsl` and must stay linked to it (don't re-theme them alone).
 - **egui stays at 0.29.1 — the upgrade is deferred** (plan v3). Moving
   to 0.35 drags wgpu 22→29 through all of `sim.rs`. API breaks waiting

@@ -1,8 +1,9 @@
-# T2-A — locked color range (plan v4.1)
+# T2-A — locked color range and colormap choice (plan v4.1)
 
-State of the unit after the first landing. The colormap picker half of
-T2-A is **not** implemented — it is gated on a shader edit (see the
-report section at the bottom of this file).
+State of the unit after the second landing. The colormap picker is now
+implemented (the shader edit was approved: `render.wgsl` flags bit 1,
+no uniform added or reordered). Asymmetric manual min/max remains
+deliberately unimplemented (see the report section at the bottom).
 
 ## What exists
 
@@ -16,15 +17,26 @@ one of:
 - **Manual** — the user types the saturation value in physical units
   (m/s, 1/s, Pa).
 
+Each view also picks its **colormap**: Inferno (sequential) or
+Coolwarm (diverging), instead of the fixed per-mode binding. The
+default binding is unchanged (Speed → Inferno, Vorticity/Pressure →
+Coolwarm); the shader draws the other map when `RenderParams.flags`
+bit 1 is set (`GpuSim::render_flags` sets it when the pick differs
+from `ColorMap::default_for(mode)`). A diverging quantity on Inferno
+maps −1..1 across the ramp; Speed on Coolwarm maps 0..1 across the
+full blue-white-red ramp. The legend bar mirrors the pick through the
+existing `inferno_color`/`coolwarm_color` CPU tables in app.rs, which
+are unchanged.
+
 Controls live in the legend, directly under the color bar (`range`
-combo + `max` entry). They are not in the Results ribbon because the
+combo + `max` entry + `map` combo). They are not in the Results ribbon because the
 Results tab has no width left at the 900 px minimum (measured ~820 px
 used; a new group pushed it past 900). The ribbon's `display gain`
 slider disables while the current mode's range is pinned, with a
 disabled-hover explaining why. Smoke has no scale, so Dye mode has no
 range control.
 
-## How it works without touching app.rs or shaders
+## How it works without touching app.rs
 
 - Every mapping in `render.wgsl` is linear in `display_gain`, so a
   fixed saturation point is a per-frame effective gain.
@@ -60,23 +72,16 @@ range control.
 - The min end is not adjustable: Speed saturates from a pinned 0,
   Vorticity and Pressure stay symmetric about 0. That is the shape of
   the shader's normalization; an asymmetric min/max needs a per-mode
-  offset uniform in `render.wgsl` (same report gate as the colormap
-  picker).
+  offset uniform in `render.wgsl`, which was not approved (only the
+  flags-bit colormap edit was).
 - Range state is not persisted in scene files (scene IO is app.rs,
   frozen for Track 1). Revisit at the merge.
 
-## Report: the shader-gated remainder
+## Report: the remainder
 
-Blocked pending approval to touch `shaders/render.wgsl`:
-
-1. **Colormap choice** (inferno vs coolwarm as a user pick per view).
-   `fs_field` hardwires `inferno_map` to Speed and `coolwarm_map` to
-   Vorticity/Pressure; no uniform selects a map. Smallest change: read
-   bit 1 of the existing `RenderParams.flags` as "swap colormap"
-   (no layout change), branch in the three arms, mirror the choice in
-   the legend bar via the existing `inferno_color`/`coolwarm_color`
-   CPU tables in app.rs (which need no change — they already mirror
-   both maps).
-2. **Asymmetric manual min/max** — needs a per-mode offset in the
-   normalization (either two uniforms or a `min`/`max` pair replacing
-   `display_gain` for these modes).
+**Asymmetric manual min/max** stays unimplemented by decision: it
+needs a per-mode offset in the `render.wgsl` normalization (either two
+uniforms or a `min`/`max` pair replacing `display_gain` for these
+modes), and only the flags-bit colormap edit was approved. The shipped
+Manual control is the shader-expressible form — one max, with Speed's
+min pinned at 0 and Vorticity/Pressure symmetric about 0.

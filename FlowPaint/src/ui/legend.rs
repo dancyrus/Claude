@@ -2,7 +2,7 @@
 //! color-scale bar for the current view.
 
 use crate::app::{coolwarm_color, inferno_color, FlowPaintApp, UiSnapshot};
-use crate::sim::{color_ranges, FieldRange, RangeMode, RenderMode, SolverMode};
+use crate::sim::{color_ranges, ColorMap, FieldRange, RangeMode, RenderMode, SolverMode};
 use eframe::egui;
 
 use super::units::{
@@ -176,7 +176,7 @@ impl FlowPaintApp {
                 }
                 RenderMode::Speed => {
                     ui.label("Speed |u|");
-                    Self::colormap_bar(ui, |t| inferno_color(t));
+                    Self::colormap_bar(ui, fr.map);
                     ui.horizontal(|ui| {
                         super::theme::mono_small(ui, "0".into());
                         ui.with_layout(
@@ -190,7 +190,7 @@ impl FlowPaintApp {
                 }
                 RenderMode::Vorticity => {
                     ui.label("Vorticity ω (curl)");
-                    Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
+                    Self::colormap_bar(ui, fr.map);
                     ui.horizontal(|ui| {
                         super::theme::mono_small(ui, format!("-{}", fmt_omega(fr.sat_phys)));
                         ui.with_layout(
@@ -205,7 +205,7 @@ impl FlowPaintApp {
                 }
                 RenderMode::Pressure => {
                     ui.label("Pressure Δp (gauge)");
-                    Self::colormap_bar(ui, |t| coolwarm_color(t * 2.0 - 1.0));
+                    Self::colormap_bar(ui, fr.map);
                     ui.horizontal(|ui| {
                         super::theme::mono_small(ui, format!("-{}", fmt_pressure(fr.sat_phys)));
                         ui.with_layout(
@@ -226,11 +226,12 @@ impl FlowPaintApp {
         });
     }
 
-    /// The range selector under the color bar (plan v4.1, T2-A): Auto
-    /// follows the flow settings, Locked pins the scale as it is, Manual
-    /// takes a typed saturation value in physical units — per render
-    /// mode. It lives here, next to the scale it governs, because the
-    /// Results ribbon has no width left at the 900 px minimum.
+    /// The scale controls under the color bar (plan v4.1, T2-A): the
+    /// range selector (Auto follows the flow settings, Locked pins the
+    /// scale as it is, Manual takes a typed saturation value in physical
+    /// units) and the colormap picker — per render mode. They live here,
+    /// next to the scale they govern, because the Results ribbon has no
+    /// width left at the 900 px minimum.
     fn range_controls(&self, ui: &mut egui::Ui, mode: RenderMode, fr: FieldRange) {
         // Collect edits, write back afterwards — holding the lock across
         // the combo closure invites a deadlock. Picking Locked needs no
@@ -238,6 +239,7 @@ impl FlowPaintApp {
         // value in `sat_phys` this frame, and the mode switch pins it.
         let mut set_mode: Option<RangeMode> = None;
         let mut set_phys: Option<f32> = None;
+        let mut set_map: Option<ColorMap> = None;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("range").small().color(super::theme::INK_3));
             let current = match fr.mode {
@@ -302,7 +304,34 @@ impl FlowPaintApp {
                 }
             });
         }
-        if set_mode.is_some() || set_phys.is_some() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("map").small().color(super::theme::INK_3));
+            let map_name = |m: ColorMap| match m {
+                ColorMap::Inferno => "Inferno",
+                ColorMap::Coolwarm => "Coolwarm",
+            };
+            egui::ComboBox::from_id_salt("legend_colormap")
+                .width(88.0)
+                .selected_text(map_name(fr.map))
+                .show_ui(ui, |ui| {
+                    for m in [ColorMap::Inferno, ColorMap::Coolwarm] {
+                        if super::theme::toggle(ui, fr.map == m, map_name(m))
+                            .on_hover_text(match m {
+                                ColorMap::Inferno => {
+                                    "Sequential: dark to bright yellow"
+                                }
+                                ColorMap::Coolwarm => {
+                                    "Diverging: blue and red around the middle"
+                                }
+                            })
+                            .clicked()
+                        {
+                            set_map = Some(m);
+                        }
+                    }
+                });
+        });
+        if set_mode.is_some() || set_phys.is_some() || set_map.is_some() {
             let mut cr = color_ranges().lock().unwrap();
             if let Some(m) = set_mode {
                 cr[mode as usize].mode = m;
@@ -310,10 +339,17 @@ impl FlowPaintApp {
             if let Some(v) = set_phys {
                 cr[mode as usize].sat_phys = v.max(1e-6);
             }
+            if let Some(m) = set_map {
+                cr[mode as usize].map = m;
+            }
         }
     }
 
-    fn colormap_bar(ui: &mut egui::Ui, color: impl Fn(f32) -> egui::Color32) {
+    /// The color-scale bar, drawn with the view's chosen map. `t` runs
+    /// 0..1 left to right; the diverging map spans its full ramp across
+    /// that, matching the shader's swap convention (render.wgsl flags
+    /// bit 1).
+    fn colormap_bar(ui: &mut egui::Ui, map: ColorMap) {
         let (rect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width().min(184.0), 14.0),
             egui::Sense::hover(),
@@ -323,13 +359,17 @@ impl FlowPaintApp {
         for i in 0..n {
             let t0 = i as f32 / n as f32;
             let t1 = (i + 1) as f32 / n as f32;
+            let t = (t0 + t1) * 0.5;
             painter.rect_filled(
                 egui::Rect::from_min_max(
                     egui::pos2(rect.min.x + rect.width() * t0, rect.min.y),
                     egui::pos2(rect.min.x + rect.width() * t1, rect.max.y),
                 ),
                 0.0,
-                color((t0 + t1) * 0.5),
+                match map {
+                    ColorMap::Inferno => inferno_color(t),
+                    ColorMap::Coolwarm => coolwarm_color(t * 2.0 - 1.0),
+                },
             );
         }
     }

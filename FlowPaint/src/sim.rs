@@ -89,6 +89,25 @@ pub enum RangeMode {
     Manual,
 }
 
+/// Which colormap paints a field view. The ramps live in render.wgsl
+/// with CPU mirrors in app.rs (the legend bars); this only picks one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ColorMap {
+    Inferno,
+    Coolwarm,
+}
+
+impl ColorMap {
+    /// The map a render mode is born with — the pre-T2-A binding, which
+    /// is also what the shader draws when flags bit 1 is clear.
+    pub fn default_for(mode: RenderMode) -> ColorMap {
+        match mode {
+            RenderMode::Dye | RenderMode::Speed => ColorMap::Inferno,
+            RenderMode::Vorticity | RenderMode::Pressure => ColorMap::Coolwarm,
+        }
+    }
+}
+
 /// One render mode's range. The two values describe the same saturation
 /// point: the physical value is authoritative for `Locked` and `Manual`,
 /// and the UI rewrites the render-unit twin every frame (the physical
@@ -104,14 +123,22 @@ pub struct FieldRange {
     /// The same point in physical units (m/s, 1/s, Pa) — what the UI
     /// shows and edits, and what a pinned range holds on to.
     pub sat_phys: f32,
+    /// The colormap this view draws with (user-pickable, T2-A).
+    pub map: ColorMap,
 }
 
-const FIELD_RANGE_DEFAULT: FieldRange =
-    FieldRange { mode: RangeMode::Auto, sat_render: 1.0, sat_phys: 0.0 };
+const fn field_range_default(map: ColorMap) -> FieldRange {
+    FieldRange { mode: RangeMode::Auto, sat_render: 1.0, sat_phys: 0.0, map }
+}
 
 /// Shared color-range state, indexed by `RenderMode as usize`. The Dye
 /// entry is unused — smoke is a passive tracer with no scale to lock.
-static COLOR_RANGES: Mutex<[FieldRange; 4]> = Mutex::new([FIELD_RANGE_DEFAULT; 4]);
+static COLOR_RANGES: Mutex<[FieldRange; 4]> = Mutex::new([
+    field_range_default(ColorMap::Inferno),  // Dye (unused)
+    field_range_default(ColorMap::Inferno),  // Speed
+    field_range_default(ColorMap::Coolwarm), // Vorticity
+    field_range_default(ColorMap::Coolwarm), // Pressure
+]);
 
 pub fn color_ranges() -> &'static Mutex<[FieldRange; 4]> {
     &COLOR_RANGES
@@ -944,6 +971,18 @@ impl GpuSim {
         }
     }
 
+    /// The flags word for the render uniform: bit 0 draws boundary
+    /// tints, bit 1 tells the shader to swap the view's colormap away
+    /// from its default binding (see ColorMap::default_for).
+    fn render_flags(&self) -> u32 {
+        let mut flags = if self.settings.boundary_tints { 1 } else { 0 };
+        let mode = self.settings.render_mode;
+        if color_ranges().lock().unwrap()[mode as usize].map != ColorMap::default_for(mode) {
+            flags |= 2;
+        }
+        flags
+    }
+
     /// The display gain the render uniform should carry. A pinned
     /// (Locked/Manual) range maps onto the one knob the shader exposes:
     /// every mapping in render.wgsl is linear in `display_gain`, so a
@@ -1236,7 +1275,7 @@ impl GpuSim {
             width: self.geo.w as u32,
             height: self.geo.h as u32,
             mode: self.settings.render_mode as u32,
-            flags: if self.settings.boundary_tints { 1 } else { 0 },
+            flags: self.render_flags(),
             vp_origin: self.mapping.vp_origin,
             vp_size: self.mapping.vp_size,
             lb_origin: self.mapping.lb_origin,
@@ -1290,7 +1329,7 @@ impl GpuSim {
             width: self.geo.w as u32,
             height: self.geo.h as u32,
             mode: self.settings.render_mode as u32,
-            flags: if self.settings.boundary_tints { 1 } else { 0 },
+            flags: self.render_flags(),
             vp_origin: [0.0, 0.0],
             vp_size: [w as f32, h as f32],
             lb_origin: [0.0, 0.0],
