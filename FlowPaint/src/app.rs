@@ -39,6 +39,26 @@ impl Tool {
     ];
 }
 
+/// Which ribbon tab is open (the ribbon itself lives in ui/ribbon.rs).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RibbonTab {
+    Home,
+    Geometry,
+    Physics,
+    Study,
+    Results,
+}
+
+impl RibbonTab {
+    const ALL: [(RibbonTab, &'static str); 5] = [
+        (RibbonTab::Home, "Home"),
+        (RibbonTab::Geometry, "Geometry"),
+        (RibbonTab::Physics, "Physics"),
+        (RibbonTab::Study, "Study"),
+        (RibbonTab::Results, "Results"),
+    ];
+}
+
 /// The in-progress pointer gesture.
 enum Gesture {
     None,
@@ -315,6 +335,8 @@ struct UiSnapshot {
     mach: f32,
     /// CFL time step of the Euler solver (nondimensional).
     euler_dt: f32,
+    /// Inlet-state CFL estimate (see GpuSim::cfl_estimate).
+    cfl: f32,
     display_gain: f32,
     smoke_gain: f32,
     particle_size: f32,
@@ -382,6 +404,7 @@ pub struct FlowPaintApp {
     nozzle_real_ve: Option<f32>,
     nozzle_fan_auto: bool,
     // UI chrome.
+    ribbon_tab: RibbonTab,
     show_about: bool,
     show_shortcuts: bool,
     show_legend: bool,
@@ -397,6 +420,10 @@ pub struct FlowPaintApp {
     stats_mlups: f32,
     stats_re: u32,
     stats_euler: bool,
+    /// Inlet speed in m/s (mode-aware), for the status strip.
+    stats_u_inf: f32,
+    /// Inlet-state CFL estimate, for the status strip.
+    stats_cfl: f32,
     stats_steps_per_s: f32,
     stats_sim_steps: f64,
     sim_time_s: f64,
@@ -468,6 +495,7 @@ impl FlowPaintApp {
             nozzle_params: crate::generators::NozzleParams::default(),
             nozzle_real_ve: None,
             nozzle_fan_auto: true,
+            ribbon_tab: RibbonTab::Home,
             show_about: false,
             show_shortcuts: false,
             show_legend: true,
@@ -484,6 +512,8 @@ impl FlowPaintApp {
             stats_mlups: 0.0,
             stats_re: 0,
             stats_euler: false,
+            stats_u_inf: 0.0,
+            stats_cfl: 0.0,
             bench: if std::env::args().any(|a| a == "--bench") {
                 Some(BenchState { frame: 0, samples: Vec::new(), last: None })
             } else {
@@ -604,6 +634,7 @@ impl eframe::App for FlowPaintApp {
                 solver: sim.settings.solver,
                 mach: sim.settings.mach,
                 euler_dt: sim.euler_dt(),
+                cfl: sim.cfl_estimate(),
                 display_gain: sim.settings.display_gain,
                 smoke_gain: sim.settings.smoke_gain,
                 particle_size: sim.settings.particle_size,
@@ -613,6 +644,12 @@ impl eframe::App for FlowPaintApp {
         };
         self.phys_cache = self.phys_scale(&snapshot);
         self.stats_euler = snapshot.solver == SolverMode::Euler;
+        self.stats_u_inf = if self.stats_euler {
+            snapshot.mach * self.fluid_a
+        } else {
+            self.phys_cache.u_phys(snapshot.flow)
+        };
+        self.stats_cfl = snapshot.cfl;
 
         self.keyboard(ctx, &mut cmds);
         ui::draw(self, ctx, snapshot, &mut cmds);

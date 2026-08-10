@@ -868,6 +868,19 @@ impl GpuSim {
         0.35 / (2.0 * self.settings.mach.max(0.3) + 3.5)
     }
 
+    /// Inlet-state CFL estimate for the status strip. Euler: the Courant
+    /// number of the freestream state, dt * (|u_inlet| + a) / dx with
+    /// a = 1 and dx = 1 — the field maximum can run higher through
+    /// expansions (the dt budget in euler_dt covers that envelope). LBM
+    /// has no acoustic CFL in the same sense; the analogous advective
+    /// number is the inlet lattice speed in cells per step.
+    pub fn cfl_estimate(&self) -> f32 {
+        match self.settings.solver {
+            SolverMode::Euler => self.euler_dt() * (self.settings.mach.max(0.0) + 1.0),
+            SolverMode::Lbm => self.settings.flow_speed,
+        }
+    }
+
     /// Inlet-speed normalization for the renderer, in the same units as
     /// the velocity buffer (LBM: lattice cells/step; Euler: the velocity
     /// buffer stores u * dt, so the reference is mach * dt AS OF the last

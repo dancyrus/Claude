@@ -1,27 +1,21 @@
-//! The left control panel: action row, tools, object/defaults dispatch,
-//! sketch aids, generators, scene presets, view and physics sections.
+//! Phase 3a holding pen for the pre-ribbon control column (action row,
+//! tools, sketch aids, generators, scene presets, view, physics). 3b
+//! relocates these sections into the ribbon tabs; nothing here is new.
 
 use crate::app::{
-    build_preset, fmt_len, fmt_speed, fmt_time, Cmd, FlowPaintApp, Gesture,
-    ScenePreset, Tool, UiSnapshot, FLUID_PRESETS,
+    build_preset, fmt_len, fmt_speed, fmt_time, Cmd, FlowPaintApp, ScenePreset,
+    Tool, UiSnapshot, FLUID_PRESETS,
 };
 use crate::sim::{RenderMode, SolverMode, PARTICLE_CHOICES};
 use eframe::egui;
 
 impl FlowPaintApp {
-    pub(in crate::app) fn side_panel(&mut self, ctx: &egui::Context, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
-        egui::SidePanel::left("controls")
-            .default_width(248.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        self.side_panel_contents(ui, snap, cmds);
-                    });
-            });
-    }
-
-    fn side_panel_contents(&mut self, ui: &mut egui::Ui, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
+    /// Phase 3a holding pen: the old control column, drawn inside the
+    /// settings panel until 3b distributes these sections into their
+    /// ribbon tabs (Tools/Sketch aids -> Geometry, Generators/Scene
+    /// presets -> Study, View -> Results, Physics/Advanced -> Physics,
+    /// action row -> Home). Content unchanged from the phase 1 split.
+    pub(in crate::app) fn legacy_controls(&mut self, ui: &mut egui::Ui, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
         // Everyday actions live at the top of the panel.
         ui.horizontal(|ui| {
             if ui
@@ -88,17 +82,6 @@ impl FlowPaintApp {
             .small()
             .weak(),
         );
-
-        ui.separator();
-        if self.selected.is_some() && !matches!(self.gesture, Gesture::None) {
-            // Mid-gesture: the object panel would fight the drag.
-            ui.label(super::theme::heading("Object"));
-            ui.label(egui::RichText::new("(finish the gesture…)").weak());
-        } else if let Some(id) = self.selected {
-            self.object_panel(ui, id, cmds);
-        } else {
-            self.defaults_panel(ui, cmds);
-        }
 
         ui.separator();
         ui.label(super::theme::heading("Sketch aids"));

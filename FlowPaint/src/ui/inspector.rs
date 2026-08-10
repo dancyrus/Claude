@@ -1,12 +1,59 @@
 //! The object inspector (selected-object properties) and the defaults
 //! panel for newly drawn objects.
 
-use crate::app::{fmt_len, Cmd, FlowPaintApp};
+use crate::app::{fmt_len, Cmd, FlowPaintApp, Gesture, UiSnapshot};
 use crate::model::{ObjMaterial, Shape};
 use crate::sim::RenderMode;
 use eframe::egui;
 
+use super::theme;
+
 impl FlowPaintApp {
+    /// The settings panel: the property block for whatever the tree has
+    /// selected. The three-way branch (mid-gesture placeholder, object
+    /// inspector, defaults) moved here unchanged from the old control
+    /// column — the mid-gesture guard exists because the inspector
+    /// fights an active drag.
+    pub(in crate::app) fn settings_panel(
+        &mut self,
+        ctx: &egui::Context,
+        snap: UiSnapshot,
+        cmds: &mut Vec<Cmd>,
+    ) {
+        egui::SidePanel::left("settings")
+            .resizable(true)
+            .default_width(theme::dim::SETTINGS_WIDTH)
+            .show(ctx, |ui| {
+                ui.label(theme::heading("Settings"));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.selected.is_some()
+                            && !matches!(self.gesture, Gesture::None)
+                        {
+                            // Mid-gesture: the object panel would fight
+                            // the drag.
+                            ui.label(theme::heading("Object"));
+                            ui.label(
+                                egui::RichText::new("(finish the gesture…)").weak(),
+                            );
+                        } else if let Some(id) = self.selected {
+                            self.object_panel(ui, id, cmds);
+                        } else {
+                            self.defaults_panel(ui, cmds);
+                        }
+                        ui.separator();
+                        // Phase 3a holding pen: every remaining control,
+                        // reachable and scrollable until 3b moves them
+                        // into the ribbon.
+                        egui::CollapsingHeader::new("All controls (ribbon pending, 3b)")
+                            .default_open(true)
+                            .show(ui, |ui| self.legacy_controls(ui, snap, cmds));
+                    });
+            });
+    }
+
     /// Properties of the selected object: every knob edits the live model
     /// (undoably, with per-widget coalescing).
     pub(in crate::app) fn object_panel(&mut self, ui: &mut egui::Ui, id: u64, cmds: &mut Vec<Cmd>) {

@@ -3,10 +3,11 @@
 Per the plan's working rules: broken things outside the current phase go
 here instead of being fixed inline.
 
-- **Status bar text overlap.** At 1440×900 the left-aligned status
-  message and the right-aligned stats readout overlap mid-bar (seen in
-  the phase 1 verification screenshot). Phase 3's message-line/status
-  strip split resolves it; if phase 3 slips, truncate the message.
+- ~~**Status bar text overlap.**~~ Fixed in phase 3a: the bottom panel
+  is now a message line over a separate full-width status strip.
+  Remaining nit: at the 900 px minimum width the strip's rightmost
+  segments (MLUPS, Re) clip at the edge instead of eliding — revisit
+  when 3b finalizes the strip's contents.
 - **Legend `ρ` row rounds 1.2 → "1 kg/m³"** (`{:.0}` in
   `ui/legend.rs`). Phase 4 (units consolidation) owns formatter decimal
   counts.
