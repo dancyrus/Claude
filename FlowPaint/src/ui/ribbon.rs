@@ -3,7 +3,7 @@
 //! Every button is a phosphor icon over a text label; value controls
 //! use compact label + widget rows, mockup-style.
 
-use crate::app::{build_preset, Cmd, FlowPaintApp, RibbonTab, ScenePreset, Tool, UiSnapshot, FLUID_PRESETS};
+use crate::app::{build_preset, Cmd, FlowPaintApp, RibbonTab, ScenePreset, Tool, UiSnapshot, ViewRequest, FLUID_PRESETS};
 use crate::sim::{RenderMode, SolverMode, PARTICLE_CHOICES};
 use eframe::egui;
 
@@ -58,6 +58,12 @@ impl FlowPaintApp {
             };
             if theme::ribbon_button(ui, false, false, icon, label).clicked() {
                 cmds.push(Cmd::TogglePause);
+            }
+            if theme::ribbon_button(ui, false, false, ph::SKIP_FORWARD, "Step")
+                .on_hover_text("Advance the simulation by one frame.")
+                .clicked()
+            {
+                cmds.push(Cmd::StepOnce);
             }
         });
         group(ui, "Scene", |ui| {
@@ -393,22 +399,38 @@ impl FlowPaintApp {
         });
         group(ui, "Particles", |ui| {
             ui.vertical(|ui| {
-                row(ui, "count", |ui| {
-                    egui::ComboBox::from_id_salt("ribbon_particles")
-                        .width(80.0)
-                        .selected_text(PARTICLE_CHOICES[self.particle_index].0)
-                        .show_ui(ui, |ui| {
-                            for (i, (label, count)) in
-                                PARTICLE_CHOICES.iter().enumerate()
-                            {
-                                if theme::toggle(ui, i == self.particle_index, *label)
-                                    .clicked()
+                if ui
+                    .checkbox(&mut self.particles_on, "Particles")
+                    .on_hover_text("Show tracer particles.")
+                    .changed()
+                {
+                    let count = if self.particles_on {
+                        PARTICLE_CHOICES[self.particle_index].1
+                    } else {
+                        0
+                    };
+                    cmds.push(Cmd::SetParticles(count));
+                }
+                // The count keeps its last value while unchecked, so
+                // rechecking restores it.
+                ui.add_enabled_ui(self.particles_on, |ui| {
+                    row(ui, "count", |ui| {
+                        egui::ComboBox::from_id_salt("ribbon_particles")
+                            .width(80.0)
+                            .selected_text(PARTICLE_CHOICES[self.particle_index].0)
+                            .show_ui(ui, |ui| {
+                                for (i, (label, count)) in
+                                    PARTICLE_CHOICES.iter().enumerate()
                                 {
-                                    self.particle_index = i;
-                                    cmds.push(Cmd::SetParticles(*count));
+                                    if theme::toggle(ui, i == self.particle_index, *label)
+                                        .clicked()
+                                    {
+                                        self.particle_index = i;
+                                        cmds.push(Cmd::SetParticles(*count));
+                                    }
                                 }
-                            }
-                        });
+                            });
+                    });
                 });
                 let mut psize = snap.particle_size;
                 row(ui, "size", |ui| {
@@ -459,6 +481,30 @@ impl FlowPaintApp {
                         cmds.push(Cmd::SetSpongeStrength(sponge));
                     }
                 });
+            });
+        });
+        // Requests only — the canvas consumes them, where the viewport
+        // geometry is known (Half B of U1).
+        group(ui, "View", |ui| {
+            if theme::ribbon_button(ui, false, false, ph::FRAME_CORNERS, "Fit")
+                .on_hover_text("Fit the domain in the window. Shortcut: Ctrl+0.")
+                .clicked()
+            {
+                self.view_request = Some(ViewRequest::Fit);
+            }
+            if theme::ribbon_button(ui, false, false, ph::NUMBER_SQUARE_ONE, "1:1")
+                .on_hover_text("Show one grid cell per pixel. Shortcut: Ctrl+1.")
+                .clicked()
+            {
+                self.view_request = Some(ViewRequest::OneToOne);
+            }
+            ui.add_enabled_ui(self.selected.is_some(), |ui| {
+                if theme::ribbon_button(ui, false, false, ph::SELECTION, "Selection")
+                    .on_hover_text("Zoom to the selected object. Shortcut: Ctrl+2.")
+                    .clicked()
+                {
+                    self.view_request = Some(ViewRequest::Selection);
+                }
             });
         });
     }

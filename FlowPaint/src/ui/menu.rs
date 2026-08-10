@@ -87,13 +87,28 @@ impl FlowPaintApp {
                         ui.label("Extra simulated area around the canvas;");
                         ui.label("edges also get an absorbing sponge layer.");
                         ui.separator();
-                        for (i, (label, _)) in MARGIN_CHOICES.iter().enumerate() {
-                            if ui.radio(i == self.margin_index, *label).clicked() {
-                                self.margin_index = i;
-                                cmds.push(Cmd::SetMargin(i));
-                                ui.close_menu();
-                            }
+                        // The size choice survives unchecking, so
+                        // rechecking restores it.
+                        if ui
+                            .checkbox(&mut self.margin_on, "Simulated margin")
+                            .changed()
+                        {
+                            let frac = if self.margin_on {
+                                MARGIN_CHOICES[self.margin_index].1
+                            } else {
+                                0.0
+                            };
+                            cmds.push(Cmd::SetMarginFrac(frac));
                         }
+                        ui.add_enabled_ui(self.margin_on, |ui| {
+                            for (i, (label, frac)) in MARGIN_CHOICES.iter().enumerate() {
+                                if ui.radio(i == self.margin_index, *label).clicked() {
+                                    self.margin_index = i;
+                                    cmds.push(Cmd::SetMarginFrac(*frac));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                     });
                 });
                 ui.menu_button("Help", |ui| {

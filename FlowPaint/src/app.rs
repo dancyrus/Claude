@@ -7,7 +7,7 @@
 use crate::model::{ObjMaterial, Shape, SketchModel, SketchObject};
 use crate::sim::{
     GpuSim, RenderMode, SolverMode, ViewportMapping, DEFAULT_MARGIN_INDEX,
-    MARGIN_CHOICES, RESOLUTIONS,
+    RESOLUTIONS,
 };
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -318,12 +318,14 @@ struct UiSnapshot {
 /// owned by the app and edited directly.
 enum Cmd {
     TogglePause,
+    /// Advance one frame (steps_per_frame solver steps), pausing first.
+    StepOnce,
     ResetFlow,
     SetSolver(SolverMode),
     SetMach(f32),
     SetWindTunnel(bool),
     SetResolution(usize),
-    SetMargin(usize),
+    SetMarginFrac(f32),
     SetParticles(u32),
     SetRenderMode(RenderMode),
     SetFlowSpeed(f32),
@@ -379,8 +381,17 @@ pub struct FlowPaintApp {
     show_shortcuts: bool,
     show_legend: bool,
     res_index: usize,
+    /// Tracer particles on/off; `particle_index` keeps the last count so
+    /// rechecking restores it (the snap_enabled/snap_spacing pattern).
+    particles_on: bool,
     particle_index: usize,
+    /// Simulated margin on/off; `margin_index` keeps the last size.
+    margin_on: bool,
     margin_index: usize,
+    /// Staged inspector transform: (object id, rotation °, scale %).
+    /// The fields hold cumulative deltas since the selection changed —
+    /// not absolute object properties (see object_panel).
+    inspector_stage: Option<(u64, f32, f32)>,
     status: String,
     hover_cell: Option<[f32; 2]>,
     /// Set by ribbon buttons / shortcuts, consumed by the canvas next
@@ -473,8 +484,11 @@ impl FlowPaintApp {
             show_shortcuts: false,
             show_legend: true,
             res_index,
+            particles_on: false, // Settings::default starts with no tracers
             particle_index: 0,
+            margin_on: true,
             margin_index: DEFAULT_MARGIN_INDEX,
+            inspector_stage: None,
             status: String::from(
                 "Draw with the sketch tools; every object stays selectable and editable.",
             ),
@@ -670,6 +684,12 @@ impl eframe::App for FlowPaintApp {
 fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
     match cmd {
         Cmd::TogglePause => sim.settings.paused = !sim.settings.paused,
+        Cmd::StepOnce => {
+            // Pausing first means Step while running reads as "pause,
+            // then advance one more frame".
+            sim.settings.paused = true;
+            sim.step_once = true;
+        }
         Cmd::ResetFlow => sim.reset_flow(),
         Cmd::SetSolver(m) => {
             if sim.settings.solver != m {
@@ -694,8 +714,8 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             app.model.mark_all_dirty();
             app.stats_grid = sim.grid_size();
         }
-        Cmd::SetMargin(i) => {
-            sim.set_margin_frac(MARGIN_CHOICES[i].1);
+        Cmd::SetMarginFrac(frac) => {
+            sim.set_margin_frac(frac);
             app.model.mark_all_dirty();
         }
         Cmd::SetParticles(n) => sim.settings.particle_count = n,

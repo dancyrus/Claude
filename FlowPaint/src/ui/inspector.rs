@@ -186,24 +186,55 @@ impl FlowPaintApp {
             });
         }
 
+        // Staged-delta transform fields, reset per selection: a selection
+        // has no single intrinsic angle or size, so an absolute angle
+        // field cannot extend to multi-selections rotating about a common
+        // pivot (U3). Only the change since the last frame is applied.
+        let (_, mut stage_rot, mut stage_scale) = match self.inspector_stage {
+            Some(s) if s.0 == id => s,
+            _ => (id, 0.0, 100.0),
+        };
         ui.horizontal(|ui| {
             ui.label("Rotate");
-            for (label, da) in [("-15°", -15.0f32), ("+15°", 15.0), ("+90°", 90.0)] {
-                if ui.small_button(label).clicked() {
-                    obj.rotate_by(da.to_radians());
-                    changed = true;
-                }
+            let r_old = stage_rot;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut stage_rot)
+                        .range(-3600.0..=3600.0)
+                        .speed(1.0)
+                        .suffix("°"),
+                )
+                .on_hover_text("Rotate the object about its center.")
+                .changed()
+            {
+                obj.rotate_by((stage_rot - r_old).to_radians());
+                changed = true;
+            }
+            if ui.small_button("+90°").clicked() {
+                obj.rotate_by(90.0f32.to_radians());
+                stage_rot += 90.0;
+                changed = true;
             }
         });
         ui.horizontal(|ui| {
             ui.label("Scale");
-            for (label, f) in [("×0.8", 0.8f32), ("×1.25", 1.25)] {
-                if ui.small_button(label).clicked() {
-                    obj.scale_by(f);
-                    changed = true;
-                }
+            let p_old = stage_scale;
+            if ui
+                .add(
+                    // The lower bound keeps the applied ratio away from 0.
+                    egui::DragValue::new(&mut stage_scale)
+                        .range(5.0..=2000.0)
+                        .speed(1.0)
+                        .suffix(" %"),
+                )
+                .on_hover_text("Scale the object about its center.")
+                .changed()
+            {
+                obj.scale_by(stage_scale / p_old);
+                changed = true;
             }
         });
+        self.inspector_stage = Some((id, stage_rot, stage_scale));
 
         ui.horizontal(|ui| {
             if ui.button("Duplicate (Ctrl+D)").clicked() {
