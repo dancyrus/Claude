@@ -1261,6 +1261,7 @@ dependencies = [
 name = "flowpaint"
 version = "2.0.0"
 dependencies = [
+ "ab_glyph",
  "bincode",
  "bytemuck",
  "eframe",

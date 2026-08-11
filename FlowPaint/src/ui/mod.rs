@@ -3,6 +3,7 @@
 //! per-frame draw order; all state stays in `app.rs`.
 
 mod canvas;
+mod export;
 mod generators;
 mod inspector;
 mod legend;

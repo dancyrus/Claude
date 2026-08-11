@@ -46,6 +46,12 @@ pub(crate) fn set_unit_system(s: UnitSystem) {
     INCH_MODE.store(s == UnitSystem::DecimalInch, Ordering::Relaxed);
 }
 
+/// Tests that flip the process-wide mirror serialize on this (cargo
+/// runs test fns in parallel); every such test must hold it and leave
+/// the mirror on SI.
+#[cfg(test)]
+pub(crate) static UNIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const M_PER_IN: f32 = 0.0254;
 const PA_PER_PSI: f32 = 6894.757;
 /// kg/m³ → lbm/ft³. Density is the one deliberate mixed unit in inch
@@ -55,6 +61,26 @@ const PA_PER_PSI: f32 = 6894.757;
 const LBFT3_PER_KGM3: f32 = 0.062_428;
 /// m²/s → in²/s.
 const IN2_PER_M2: f32 = 1.0 / (M_PER_IN * M_PER_IN);
+
+/// Nearest "nice" 1-2-5 length to `target_m`, stepped in the ACTIVE
+/// display unit (metres or inches), so a scale bar reads a round
+/// number in either system — 10.000 in, not 7.874 in (U5; shared by
+/// the canvas scale bar and the export sheet).
+pub(crate) fn nice_len_m(target_m: f32) -> f32 {
+    let unit = if unit_system() == UnitSystem::DecimalInch { M_PER_IN } else { 1.0 };
+    let t = (target_m / unit).max(1e-12);
+    let decade = 10f32.powf(t.log10().floor());
+    let mut best = f32::INFINITY;
+    let mut len = decade;
+    for m in [1.0, 2.0, 5.0, 10.0] {
+        let err = ((m * decade) / t).ln().abs();
+        if err < best {
+            best = err;
+            len = m * decade;
+        }
+    }
+    len * unit
+}
 
 /// ASME decimal-inch number: fixed decimals, and a value below one
 /// drops the leading zero (".500", "-.010") the way an inch dimension
@@ -332,6 +358,7 @@ mod tests {
     /// restored at the end because it is the process-wide default.
     #[test]
     fn inch_mode_formats_and_si_round_trip() {
+        let _g = UNIT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(unit_system(), UnitSystem::Si);
         assert_eq!(fmt_len(0.0254), "2.5 cm");
         assert_eq!(fmt_speed(34.0), "34.00 m/s");

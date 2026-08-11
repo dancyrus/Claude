@@ -52,6 +52,7 @@ impl FlowPaintApp {
                         ("Ctrl+1", "1:1 — one cell per pixel"),
                         ("Ctrl+2", "zoom to the selection"),
                         ("Ctrl+Z / Ctrl+Y", "undo / redo"),
+                        ("Ctrl+E / Ctrl+Shift+E", "quick export PNG: canvas / annotated"),
                         (
                             "S / L / R / E / P / B",
                             "select / line / rect / ellipse / polyline / pencil",

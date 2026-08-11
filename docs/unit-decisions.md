@@ -433,3 +433,51 @@ stated in the eraser tooltip next to the stamp refusal).
 - Mirror H/V of a symmetric selection about a line through its own
   geometry can legitimately overlap the original — not a bug; the
   copies remain distinct objects in the tree.
+
+## U5 (share-ready output)
+
+- **One export path, two variants**: `Cmd::ExportPng(path, ExportKind)`
+  — `Canvas` saves the GPU readback exactly as before U5
+  (bit-identical pixels); `Annotated` appends a sheet BELOW the canvas
+  (`ui/export.rs::compose_annotated`), never over it. The sheet:
+  burned-in legend with the range's pinned physical value, a 1-2-5
+  scale bar (1 px = 1 cell), and the run-conditions block — solver,
+  fluid + ρ, Mach·a∞ or Re·ν, grid+margin, cell Δx, domain, elapsed t.
+- **The sheet is self-describing**: every value formats through
+  `ui/units.rs` in the exporter's ACTIVE system, each value carries
+  its unit, and a "Units" line names the system (SI (metric) / ASME
+  decimal inch). Two people exporting the same scene print different
+  numbers; that is correct and the sheet says which language it
+  speaks. Pinned by test alongside the locked-range legend labels.
+- Composition is a pure function of an `ExportInfo` struct — GPU-free
+  tests cover the strings (both systems, both solvers), locked-range
+  labels, canvas-pixel preservation, and the narrow-canvas wrap.
+  Range values need no sync step: `Settings.ranges` carries the
+  frame-synced physical twins (T2-A), and the export render reuses
+  `range_display_gain`, so pixels AND printed range match the screen.
+- Text: egui's embedded Hack (the app's monospace face), rasterized
+  via `ab_glyph` — already in the tree through epaint; pinned as a
+  direct dependency, so U5 adds no new compiled code. Colors from
+  `ui/theme.rs`; bars sample the app.rs CPU colormap mirrors.
+- **Quick export**: Ctrl+E (canvas) / Ctrl+Shift+E (annotated) write
+  the first free `flowpaint-export-NN[-annotated].png` in the working
+  directory — the dialog-free companions to the File-menu items (rfd
+  needs a portal/GTK, which headless hosts lack), same `Cmd` path.
+- **First-run sample scene: the Pinball preset** (over the RS-25
+  insert): it works on the default LBM solver, while a nozzle needs
+  chamber spin-up and reads best in compressible mode; Pinball also
+  states the mental model (obstacles + tunnel + smoke) in one glance.
+  The RS-25 stays discoverable in Study▸Generators. `--bench` is
+  unaffected: it replaces the scene at its first frame.
+- **First-run tracers ON (100 k) — this deliberately moves U1's
+  "tracers are opt-in" default**, stated here per this file's
+  contract: verified live that inlet-seeded smoke crosses ~4 % of the
+  domain in the first two seconds, so a cold-start Smoke view does
+  not read as "flow already moving" — the plan's first-run
+  requirement. Particles advect everywhere from frame one and are the
+  only instant whole-field motion signal that leaves solver state
+  untouched. The Results▸Particles checkbox (U1's off-switch
+  machinery, unchanged) turns them off with one click.
+- No bench re-run: U5 touches no per-frame path (export-time and
+  startup-scene code only; `ui/canvas.rs`, `model.rs`, the rasterizer
+  and shaders untouched).
