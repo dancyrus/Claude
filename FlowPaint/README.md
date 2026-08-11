@@ -51,10 +51,21 @@ it re-rasterizes crisply.
   polygon, Esc cancels.
 - **Pencil (B)** — freehand strokes are simplified (Ramer–Douglas–
   Peucker) into clean polylines whose vertices stay draggable.
+- **Fill (F)** — the paint bucket: click an enclosed region and it is
+  traced into a real filled polygon of the current material (the
+  outline is a snapshot; it stays editable but doesn't follow the
+  walls if they move). Regions open to the domain edge refuse.
+- **Eraser (X)** — true vector erase: strokes cut lines and polylines
+  and carve filled shapes (a partial erase turns a rectangle or
+  ellipse into a polygon), one undo step per stroke. Generated stamps
+  can't be erased yet — overdraw them with walls instead.
+- **Measure (M)** — pick two points, read distance and angle.
 - **Sketch aids**: optional snap-to-grid with adjustable spacing (drawn
-  faintly while a draw tool is armed), live dimension readouts in real
-  units (length + angle, width × height, diameters), cursor cell
-  coordinates in the status bar.
+  faintly while a draw tool is armed), object snaps to endpoints /
+  intersections / midpoints / centers / perpendiculars (hold Ctrl to
+  suspend), live dimension readouts in real units (length + angle,
+  width × height, diameters), cursor cell coordinates in the status
+  bar.
 - **Materials**: Wall (no-slip solid), Fan (inlet — blows along the
   shape for lines/polylines, settable direction for filled shapes, with
   per-fan **speed multiplier** and **gustiness** that makes the jet

@@ -2415,13 +2415,20 @@ impl FlowPaintApp {
             }
             // Conjugate the stroke into stored space: centres through
             // the inverse chain, radius divided by the composed scale.
+            // The guards conjugate the same way (review finding): they
+            // mean WORLD cells, so in stored space they divide by the
+            // scale (length) and scale² (area) — otherwise a scaled-up
+            // group drops visible fragments as "slivers".
+            let s = abs.s.max(1e-9);
             let inv = abs.inverse();
+            let min_len = crate::geomops::MIN_RUN_LEN / s;
+            let min_area = crate::geomops::MIN_AREA / (s * s);
             let caps: Vec<Capsule> = caps_world
                 .iter()
                 .map(|c| Capsule {
                     a: inv.apply(c.a),
                     b: inv.apply(c.b),
-                    r: c.r / abs.s.max(1e-9),
+                    r: c.r / s,
                 })
                 .collect();
             let obj = &self.model.objects[i];
@@ -2439,7 +2446,7 @@ impl FlowPaintApp {
                     }
                 }
                 Shape::Line { a, b } => {
-                    match clip_path(&[*a, *b], false, &caps, half_t) {
+                    match clip_path(&[*a, *b], false, &caps, half_t, min_len) {
                         ClipPath::Untouched => {}
                         ClipPath::Erased => changes.push((id, Vec::new())),
                         ClipPath::Runs(runs) => {
@@ -2450,7 +2457,7 @@ impl FlowPaintApp {
                 }
                 Shape::Poly { pts: ppts, closed } => {
                     if obj.filled && *closed {
-                        match subtract_polygon(ppts, &caps) {
+                        match subtract_polygon(ppts, &caps, min_area) {
                             PolySubtract::Untouched => {}
                             PolySubtract::Erased => changes.push((id, Vec::new())),
                             PolySubtract::WouldHole => hole_refusals.push("polygon"),
@@ -2460,7 +2467,7 @@ impl FlowPaintApp {
                             }
                         }
                     } else {
-                        match clip_path(ppts, *closed, &caps, half_t) {
+                        match clip_path(ppts, *closed, &caps, half_t, min_len) {
                             ClipPath::Untouched => {}
                             ClipPath::Erased => changes.push((id, Vec::new())),
                             ClipPath::Runs(runs) => {
@@ -2477,7 +2484,7 @@ impl FlowPaintApp {
                     let ring = shape_ring(&self.model.objects[i].shape);
                     let obj = &self.model.objects[i];
                     if obj.filled {
-                        match subtract_polygon(&ring, &caps) {
+                        match subtract_polygon(&ring, &caps, min_area) {
                             PolySubtract::Untouched => {}
                             PolySubtract::Erased => changes.push((id, Vec::new())),
                             PolySubtract::WouldHole => hole_refusals.push(
@@ -2492,7 +2499,7 @@ impl FlowPaintApp {
                             }
                         }
                     } else {
-                        match clip_path(&ring, true, &caps, half_t) {
+                        match clip_path(&ring, true, &caps, half_t, min_len) {
                             ClipPath::Untouched => {}
                             ClipPath::Erased => changes.push((id, Vec::new())),
                             ClipPath::Runs(runs) => {

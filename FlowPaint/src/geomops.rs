@@ -101,8 +101,12 @@ impl Capsule {
     }
 
     /// Polygonize into a convex ring with positive shoelace area.
+    /// No minimum-radius clamp here: the radius was guarded in WORLD
+    /// cells by the caller, and under a scaled-up group the STORED
+    /// radius is legitimately smaller (clip_path honors it unclamped —
+    /// filled and outline objects must erase with the same radius).
     fn polygonize(&self) -> Vec<[f32; 2]> {
-        let r = self.r.max(0.5); // the canvas 0.5-cell guard, re-asserted
+        let r = self.r.max(1e-3);
         // Semicircle segment count from a ~0.15-cell chord tolerance.
         let dev = (1.0f32 - (0.15 / r).min(0.9)).acos().max(0.05);
         let n = ((std::f32::consts::PI / (2.0 * dev)).ceil() as usize).clamp(6, 24);
@@ -199,11 +203,15 @@ pub enum ClipPath {
 /// the user sees, not an invisible centerline. Cut points are found by
 /// sampling + bisection — robust against capsule unions with no case
 /// analysis.
+/// `min_len` is the fragment-length guard in the SAME space as `pts`
+/// (callers under a scaled group pass MIN_RUN_LEN divided by the
+/// composed scale, so the guard means world cells everywhere).
 pub fn clip_path(
     pts: &[[f32; 2]],
     closed: bool,
     caps: &[Capsule],
     extra_r: f32,
+    min_len: f32,
 ) -> ClipPath {
     let n = pts.len();
     if n < 2 || caps.is_empty() {
@@ -228,7 +236,11 @@ pub fn clip_path(
         let a = pts[k];
         let b = pts[(k + 1) % n];
         let sl = len(sub(b, a)).max(1e-6);
-        let samples = ((sl / step).ceil() as usize).clamp(2, 512);
+        // The cap must stay above segment-length / step for anything
+        // that fits the grid: a perpendicular stroke's negative-
+        // clearance dip is only ~2(r+extra) wide, so undersampling a
+        // long segment silently misses the stroke (review finding).
+        let samples = ((sl / step).ceil() as usize).clamp(2, 16384);
         let f = |t: f32| clearance(lerp(a, b, t));
         let mut kept: Vec<(f32, f32)> = Vec::new();
         let mut prev_v = f(0.0) >= 0.0;
@@ -322,7 +334,7 @@ pub fn clip_path(
     let mut out = Vec::new();
     for mut run in runs {
         run.dedup_by(|a, b| len(sub(*a, *b)) < WELD_EPS);
-        if run.len() >= 2 && path_len(&run) >= MIN_RUN_LEN {
+        if run.len() >= 2 && path_len(&run) >= min_len {
             out.push(run);
         }
     }
@@ -350,7 +362,13 @@ pub enum PolySubtract {
 /// ordered so the working boundary stays connected to the original one:
 /// a stroke that starts interior but crosses the edge subtracts fine;
 /// only a stroke whose whole footprint is interior refuses.
-pub fn subtract_polygon(poly: &[[f32; 2]], caps: &[Capsule]) -> PolySubtract {
+/// `min_area` follows the clip_path convention: the sliver guard in
+/// the same space as `poly` (world guard divided by scale²).
+pub fn subtract_polygon(
+    poly: &[[f32; 2]],
+    caps: &[Capsule],
+    min_area: f32,
+) -> PolySubtract {
     if poly.len() < 3 || caps.is_empty() {
         return PolySubtract::Untouched;
     }
@@ -460,7 +478,7 @@ pub fn subtract_polygon(poly: &[[f32; 2]], caps: &[Capsule]) -> PolySubtract {
     let mut out: Vec<Vec<[f32; 2]>> = Vec::new();
     for mut p in pieces {
         dedupe_ring(&mut p);
-        if p.len() >= 3 && signed_area(&p).abs() >= MIN_AREA {
+        if p.len() >= 3 && signed_area(&p).abs() >= min_area {
             out.push(p);
         }
     }
@@ -835,7 +853,7 @@ mod tests {
     #[test]
     fn open_polyline_split_by_disc() {
         let pts = vec![[0.0, 0.0], [40.0, 0.0]];
-        match clip_path(&pts, false, &[cap([20.0, 0.0], [20.0, 0.0], 4.0)], 0.0) {
+        match clip_path(&pts, false, &[cap([20.0, 0.0], [20.0, 0.0], 4.0)], 0.0, MIN_RUN_LEN) {
             ClipPath::Runs(runs) => {
                 assert_eq!(runs.len(), 2);
                 assert!((runs[0].last().unwrap()[0] - 16.0).abs() < 0.1);
@@ -848,7 +866,7 @@ mod tests {
     #[test]
     fn polyline_fully_inside_erases() {
         let pts = vec![[9.0, 10.0], [11.0, 10.0]];
-        match clip_path(&pts, false, &[cap([10.0, 10.0], [10.0, 10.0], 5.0)], 0.0) {
+        match clip_path(&pts, false, &[cap([10.0, 10.0], [10.0, 10.0], 5.0)], 0.0, MIN_RUN_LEN) {
             ClipPath::Erased => {}
             _ => panic!("expected erased"),
         }
@@ -857,7 +875,7 @@ mod tests {
     #[test]
     fn polyline_missed_is_untouched() {
         let pts = vec![[0.0, 0.0], [40.0, 0.0]];
-        match clip_path(&pts, false, &[cap([20.0, 30.0], [20.0, 30.0], 4.0)], 0.0) {
+        match clip_path(&pts, false, &[cap([20.0, 30.0], [20.0, 30.0], 4.0)], 0.0, MIN_RUN_LEN) {
             ClipPath::Untouched => {}
             _ => panic!("expected untouched"),
         }
@@ -870,16 +888,16 @@ mod tests {
         let pts = vec![[0.0, 0.0], [40.0, 0.0]];
         let caps = [cap([20.0, 4.0], [20.0, 4.0], 3.0)];
         assert!(matches!(
-            clip_path(&pts, false, &caps, 0.0),
+            clip_path(&pts, false, &caps, 0.0, MIN_RUN_LEN),
             ClipPath::Untouched
         ));
-        assert!(matches!(clip_path(&pts, false, &caps, 2.0), ClipPath::Runs(_)));
+        assert!(matches!(clip_path(&pts, false, &caps, 2.0, MIN_RUN_LEN), ClipPath::Runs(_)));
     }
 
     #[test]
     fn closed_ring_cut_once_opens_into_one_run() {
         let pts = vec![[0.0, 0.0], [20.0, 0.0], [20.0, 20.0], [0.0, 20.0]];
-        match clip_path(&pts, true, &[cap([0.0, 10.0], [0.0, 10.0], 3.0)], 0.0) {
+        match clip_path(&pts, true, &[cap([0.0, 10.0], [0.0, 10.0], 3.0)], 0.0, MIN_RUN_LEN) {
             ClipPath::Runs(runs) => {
                 assert_eq!(runs.len(), 1);
                 assert!(path_len(&runs[0]) > 60.0);
@@ -895,7 +913,7 @@ mod tests {
             cap([0.0, 10.0], [0.0, 10.0], 3.0),
             cap([20.0, 10.0], [20.0, 10.0], 3.0),
         ];
-        match clip_path(&pts, true, &caps, 0.0) {
+        match clip_path(&pts, true, &caps, 0.0, MIN_RUN_LEN) {
             ClipPath::Runs(runs) => assert_eq!(runs.len(), 2),
             _ => panic!("expected two runs"),
         }
@@ -911,13 +929,33 @@ mod tests {
             cap([10.0, 0.0], [10.0, 0.0], 8.0),   // covers [2, 18]
             cap([25.0, 0.0], [25.0, 0.0], 6.8),   // covers [18.2, 31.8]
         ];
-        match clip_path(&pts, false, &caps, 0.0) {
+        match clip_path(&pts, false, &caps, 0.0, MIN_RUN_LEN) {
             ClipPath::Runs(runs) => {
                 assert_eq!(runs.len(), 2, "the 0.2-cell shard must be dropped");
                 assert!(path_len(&runs[0]) >= MIN_RUN_LEN);
                 assert!(path_len(&runs[1]) >= MIN_RUN_LEN);
             }
             _ => panic!("expected runs"),
+        }
+    }
+
+    #[test]
+    fn guards_conjugate_with_the_caller_scale() {
+        // A stored-space stub of length 0.5: dropped at the world guard
+        // (group scale 1) but kept when the caller conjugates the guard
+        // for a scale-8 group (0.5 stored = 4 world cells — visible
+        // geometry, not a sliver). Review finding regression.
+        // Disc covers [0.5, 9.5]: a 0.5-length left stub and a healthy
+        // right run.
+        let pts = vec![[0.0, 0.0], [14.0, 0.0]];
+        let caps = [cap([5.0, 0.0], [5.0, 0.0], 4.5)];
+        match clip_path(&pts, false, &caps, 0.0, MIN_RUN_LEN) {
+            ClipPath::Runs(runs) => assert_eq!(runs.len(), 1),
+            _ => panic!("expected the long side only"),
+        }
+        match clip_path(&pts, false, &caps, 0.0, MIN_RUN_LEN / 8.0) {
+            ClipPath::Runs(runs) => assert_eq!(runs.len(), 2),
+            _ => panic!("expected both stubs at the conjugated guard"),
         }
     }
 
@@ -931,7 +969,7 @@ mod tests {
     fn bite_from_edge_keeps_one_piece() {
         let p = square(20.0);
         let caps = [cap([10.0, 0.0], [10.0, 0.0], 4.0)];
-        match subtract_polygon(&p, &caps) {
+        match subtract_polygon(&p, &caps, MIN_AREA) {
             PolySubtract::Pieces(ps) => {
                 assert_eq!(ps.len(), 1);
                 let a = signed_area(&ps[0]).abs();
@@ -946,7 +984,7 @@ mod tests {
     fn stroke_through_middle_splits_in_two() {
         let p = square(20.0);
         let caps = [cap([10.0, -5.0], [10.0, 25.0], 2.0)];
-        match subtract_polygon(&p, &caps) {
+        match subtract_polygon(&p, &caps, MIN_AREA) {
             PolySubtract::Pieces(ps) => {
                 assert_eq!(ps.len(), 2);
                 let total: f32 = ps.iter().map(|p| signed_area(p).abs()).sum();
@@ -961,7 +999,7 @@ mod tests {
     fn interior_stroke_refuses_with_hole() {
         let p = square(20.0);
         let caps = [cap([10.0, 10.0], [10.0, 10.0], 3.0)];
-        assert!(matches!(subtract_polygon(&p, &caps), PolySubtract::WouldHole));
+        assert!(matches!(subtract_polygon(&p, &caps, MIN_AREA), PolySubtract::WouldHole));
     }
 
     #[test]
@@ -975,7 +1013,7 @@ mod tests {
             caps.push(cap([x, 10.0], [x + 1.5, 10.0], 2.0));
             x += 1.5;
         }
-        match subtract_polygon(&p, &caps) {
+        match subtract_polygon(&p, &caps, MIN_AREA) {
             PolySubtract::Pieces(ps) => {
                 let total: f32 = ps.iter().map(|p| signed_area(p).abs()).sum();
                 assert!(total < 370.0, "carved area missing: {total}");
@@ -989,14 +1027,14 @@ mod tests {
     fn covering_stroke_erases() {
         let p = square(10.0);
         let caps = [cap([5.0, 5.0], [5.0, 5.0], 12.0)];
-        assert!(matches!(subtract_polygon(&p, &caps), PolySubtract::Erased));
+        assert!(matches!(subtract_polygon(&p, &caps, MIN_AREA), PolySubtract::Erased));
     }
 
     #[test]
     fn miss_is_untouched() {
         let p = square(10.0);
         let caps = [cap([30.0, 30.0], [30.0, 30.0], 3.0)];
-        assert!(matches!(subtract_polygon(&p, &caps), PolySubtract::Untouched));
+        assert!(matches!(subtract_polygon(&p, &caps, MIN_AREA), PolySubtract::Untouched));
     }
 
     #[test]
@@ -1005,7 +1043,7 @@ mod tests {
         // piece near the original area — never micro-fragments.
         let p = square(20.0);
         let caps = [cap([20.2, 20.2], [20.2, 20.2], 0.6)];
-        match subtract_polygon(&p, &caps) {
+        match subtract_polygon(&p, &caps, MIN_AREA) {
             PolySubtract::Untouched => {}
             PolySubtract::Pieces(ps) => {
                 assert_eq!(ps.len(), 1);

@@ -691,15 +691,9 @@ fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
+// One point-to-segment distance in the crate (U4): geomops owns it.
 fn seg_dist(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
-    let ab = [b[0] - a[0], b[1] - a[1]];
-    let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-    let t = if l2 > 1e-6 {
-        (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    dist(p, [a[0] + t * ab[0], a[1] + t * ab[1]])
+    crate::geomops::seg_point_dist(p, a, b)
 }
 
 fn to_local(p: [f32; 2], c: [f32; 2], angle: f32) -> [f32; 2] {

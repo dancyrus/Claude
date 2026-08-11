@@ -360,7 +360,10 @@ impl FlowPaintApp {
             self.tool,
             Tool::Line | Tool::Rect | Tool::Ellipse | Tool::Polyline | Tool::Measure
         ) || matches!(self.gesture, Gesture::HandleDrag { .. });
-        if self.osnap_enabled && osnap_tool && !ctrl && !pan_mode {
+        // Shift hands the position to angle-snap (or the square/circle
+        // constraint), which overrides any object snap — computing one
+        // anyway would draw a marker at a point the vertex won't go to.
+        if self.osnap_enabled && osnap_tool && !ctrl && !shift && !pan_mode {
             if let Some(pos) = pointer.or(response.hover_pos()) {
                 let cursor = to_cell(pos);
                 let radius = SNAP_RADIUS_PT * ppp / px_per_cell;
