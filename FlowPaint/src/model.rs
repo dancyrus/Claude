@@ -89,6 +89,46 @@ impl Sim2 {
     }
 }
 
+/// An affine reflection across a line — deliberately NOT a `Sim2`
+/// (det = −1; the similarity family cannot express it), which is why
+/// mirroring bakes into stored geometry per shape instead of composing
+/// through group transforms.
+#[derive(Clone, Copy)]
+pub struct Reflect2 {
+    /// A point on the line.
+    o: [f32; 2],
+    /// Unit direction of the line.
+    d: [f32; 2],
+}
+
+impl Reflect2 {
+    /// The reflection across the line through `a` and `b`; `None` when
+    /// they coincide (no line to reflect across).
+    pub fn across(a: [f32; 2], b: [f32; 2]) -> Option<Reflect2> {
+        let v = [b[0] - a[0], b[1] - a[1]];
+        let l = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        if l < 1e-6 {
+            return None;
+        }
+        Some(Reflect2 { o: a, d: [v[0] / l, v[1] / l] })
+    }
+
+    pub fn apply(&self, p: [f32; 2]) -> [f32; 2] {
+        let r = [p[0] - self.o[0], p[1] - self.o[1]];
+        let t = r[0] * self.d[0] + r[1] * self.d[1];
+        [
+            2.0 * (self.o[0] + t * self.d[0]) - p[0],
+            2.0 * (self.o[1] + t * self.d[1]) - p[1],
+        ]
+    }
+
+    /// The line's angle: a stored shape angle `x` reflects to
+    /// `2·angle − x`.
+    pub fn angle(&self) -> f32 {
+        self.d[1].atan2(self.d[0])
+    }
+}
+
 /// Shape geometry, in visible-canvas cells (an object's coordinates are
 /// expressed in its PARENT's space — world when `parent` is None).
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -411,6 +451,49 @@ impl SketchObject {
         self.apply_sim(new_abs.inverse().compose(old_abs));
     }
 
+    /// Reflect the stored geometry across a line in THIS object's
+    /// stored (parent) space. A reflection is not a similarity, so it
+    /// bakes per shape: point shapes reflect their points, parametric
+    /// shapes conjugate their angle (`x → 2θ − x`, θ the line angle —
+    /// Rect/Ellipse are symmetric in their local y, so that alone is
+    /// exact), a stamp additionally flips its raster rows, and a Group
+    /// node conjugates its transform to `M ∘ G ∘ M`. Because
+    /// `M ∘ G₁ ∘ G₂ ∘ leaf = (M G₁ M)(M G₂ M)(M leaf)` (M² = id), the
+    /// SAME reflection applies at every level of a subtree: mirroring
+    /// a group is "conjugate every node, reflect every leaf" with one
+    /// line, and composition reproduces the mirrored world geometry.
+    pub fn reflect(&mut self, m: Reflect2) {
+        let two_theta = 2.0 * m.angle();
+        match &mut self.shape {
+            Shape::Line { a, b } => {
+                *a = m.apply(*a);
+                *b = m.apply(*b);
+            }
+            Shape::Poly { pts, .. } => {
+                for p in pts {
+                    *p = m.apply(*p);
+                }
+            }
+            Shape::Rect { c, angle, .. } | Shape::Ellipse { c, angle, .. } => {
+                *c = m.apply(*c);
+                *angle = two_theta - *angle;
+            }
+            Shape::Stamp { raster, c, angle, .. } => {
+                *c = m.apply(*c);
+                *angle = two_theta - *angle;
+                flip_raster_rows(raster);
+            }
+            Shape::Group { t, rot, scale } => {
+                let g = Sim2 { t: *t, rot: *rot, s: *scale };
+                *t = m.apply(g.apply(m.apply([0.0, 0.0])));
+                *rot = -*rot;
+            }
+        }
+        // A reflection is an isometry: thickness holds; the fan aim
+        // conjugates like any other stored angle.
+        self.fan_angle = two_theta - self.fan_angle;
+    }
+
     /// Uniformly rescale everything (resolution switches).
     pub fn rescale_all(&mut self, f: f32) {
         let sc = |p: &mut [f32; 2]| {
@@ -678,6 +761,26 @@ fn seg_intersects_aabb(a: [f32; 2], b: [f32; 2], min: [f32; 2], max: [f32; 2]) -
         }
     }
     true
+}
+
+/// Flip a stamp raster vertically (row y ↔ row h−1−y) and negate the
+/// stored fan vectors' y components — the local-space FlipY that pairs
+/// with the angle conjugation in `SketchObject::reflect` so a mirrored
+/// stamp samples exactly its reflected cells (cell y covers [y, y+1),
+/// so the discrete row swap IS the reflection about the raster centre).
+fn flip_raster_rows(r: &mut GeoRegion) {
+    let (w, h) = raster_dims(r);
+    for y in 0..h / 2 {
+        let (a, b) = (y * w, (h - 1 - y) * w);
+        for x in 0..w {
+            r.cell.swap(a + x, b + x);
+            r.fan.swap(a + x, b + x);
+            r.dye_src.swap(a + x, b + x);
+        }
+    }
+    for f in &mut r.fan {
+        f[1] = -f[1];
+    }
 }
 
 fn raster_dims(r: &GeoRegion) -> (usize, usize) {
@@ -1395,6 +1498,111 @@ impl SketchModel {
         self.undo.push(ModelOp::Modify { i, before, after, coalesce: false });
         self.redo.clear();
         Ok(())
+    }
+
+    // --- Mirror / linear array (deferred out of U4, landed after) ----
+    // Both produce INDEPENDENT deep copies — fresh ids, parent links
+    // rewired within each copy, nothing shared with the originals —
+    // and commit as ONE undo entry via add_many's Group op.
+
+    /// Deep-copy the subtree at `root`: fresh ids, parent links
+    /// remapped WITHIN the copy (the copied root keeps the original
+    /// root's parent, staying its sibling), `f` applied to every copy
+    /// (`true` = the root). Returns (copies in model order, new root
+    /// id). Nothing is added to the model here.
+    fn copy_subtree_with(
+        &mut self,
+        root: u64,
+        mut f: impl FnMut(&mut SketchObject, bool),
+    ) -> Option<(Vec<SketchObject>, u64)> {
+        self.find(root)?;
+        let ids = self.subtree_ids(root);
+        // Fresh ids minted first, then parents remapped — children can
+        // precede their group node in z-order (the paste convention).
+        let mut id_map = std::collections::HashMap::new();
+        for &id in &ids {
+            id_map.insert(id, self.fresh_id());
+        }
+        let mut copies = Vec::with_capacity(ids.len());
+        for &id in &ids {
+            let i = self.find(id).unwrap();
+            let mut c = self.objects[i].clone();
+            c.id = id_map[&id];
+            if let Some(np) = c.parent.and_then(|p| id_map.get(&p).copied()) {
+                c.parent = Some(np);
+            }
+            f(&mut c, id == root);
+            copies.push(c);
+        }
+        Some((copies, id_map[&root]))
+    }
+
+    /// Mirror the subtrees rooted at `roots` (OUTERMOST ids — the
+    /// transform_targets convention) across the WORLD line a–b: one
+    /// independent deep copy per root, all added as ONE undo entry.
+    /// Each copy stays a sibling of its original; the world line
+    /// conjugates into that root's parent space (a similarity maps the
+    /// line, and the reflection about the mapped line IS the
+    /// conjugated reflection), and the same parent-space reflection
+    /// then applies to every node of the subtree (see
+    /// `SketchObject::reflect`). Returns the new root ids.
+    pub fn mirror_subtrees(&mut self, roots: &[u64], a: [f32; 2], b: [f32; 2]) -> Vec<u64> {
+        if Reflect2::across(a, b).is_none() {
+            return Vec::new();
+        }
+        let mut all = Vec::new();
+        let mut new_roots = Vec::new();
+        for &root in roots {
+            if self.find(root).is_none() {
+                continue;
+            }
+            let inv = self.parent_abs(root).inverse();
+            let Some(m) = Reflect2::across(inv.apply(a), inv.apply(b)) else {
+                continue;
+            };
+            if let Some((copies, nr)) = self.copy_subtree_with(root, |c, _| c.reflect(m))
+            {
+                new_roots.push(nr);
+                all.extend(copies);
+            }
+        }
+        self.add_many(all);
+        new_roots
+    }
+
+    /// Linear array: `copies` additional deep copies of each subtree
+    /// in `roots` (OUTERMOST ids), the k-th translated by k·`step`
+    /// (WORLD cells), all added as ONE undo entry. Only each copy's
+    /// root translates — the step converts into its kept parent's
+    /// space and the subtree follows through composition. Returns the
+    /// new root ids.
+    pub fn array_subtrees(
+        &mut self,
+        roots: &[u64],
+        step: [f32; 2],
+        copies: usize,
+    ) -> Vec<u64> {
+        let mut all = Vec::new();
+        let mut new_roots = Vec::new();
+        for k in 1..=copies {
+            let d = [step[0] * k as f32, step[1] * k as f32];
+            for &root in roots {
+                if self.find(root).is_none() {
+                    continue;
+                }
+                let dl = self.parent_abs(root).inverse().apply_vec(d);
+                if let Some((copies_k, nr)) = self.copy_subtree_with(root, |c, is_root| {
+                    if is_root {
+                        c.translate(dl);
+                    }
+                }) {
+                    new_roots.push(nr);
+                    all.extend(copies_k);
+                }
+            }
+        }
+        self.add_many(all);
+        new_roots
     }
 
     /// Remove an object added by the in-flight gesture along with its
@@ -2358,5 +2566,226 @@ mod tests {
         assert!(!line.intersects_rect([70.0, 10.0], [90.0, 30.0]));
         // Band containing the whole object: selected.
         assert!(line.intersects_rect([-10.0, -10.0], [110.0, 110.0]));
+    }
+
+    // --- Mirror / linear array ----------------------------------------
+
+    fn close(a: [f32; 2], b: [f32; 2]) -> bool {
+        (a[0] - b[0]).abs() < 1e-2 && (a[1] - b[1]).abs() < 1e-2
+    }
+
+    /// Mirroring across a picked line reflects the world geometry,
+    /// keeps parametric shapes parametric, and is ONE undo entry.
+    #[test]
+    fn mirror_reflects_across_picked_line() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [10.0, 4.0]);
+        let new = m.mirror_subtrees(&[a], [0.0, -5.0], [0.0, 5.0]); // x = 0
+        assert_eq!(new.len(), 1);
+        let c = m.world_center(new[0]).unwrap();
+        assert!(close(c, [-10.0, 4.0]), "mirrored centre {c:?}");
+        let ni = m.find(new[0]).unwrap();
+        assert!(matches!(m.objects[ni].shape, Shape::Rect { .. }));
+        // The original did not move.
+        assert!(close(m.world_center(a).unwrap(), [10.0, 4.0]));
+        m.undo(); // ONE entry removes the copy
+        assert!(m.find(new[0]).is_none());
+        assert!(m.find(a).is_some());
+        m.redo();
+        assert!(m.find(new[0]).is_some());
+    }
+
+    /// A degenerate line (a == b) mirrors nothing.
+    #[test]
+    fn mirror_refuses_degenerate_line() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [10.0, 4.0]);
+        let new = m.mirror_subtrees(&[a], [3.0, 3.0], [3.0, 3.0]);
+        assert!(new.is_empty());
+        assert_eq!(m.objects.len(), 1);
+        let _ = a;
+    }
+
+    /// Mirroring a group copies the WHOLE subtree with parent links
+    /// rewired to the new copies — and the copy is not entangled with
+    /// its source: transforming or editing the original afterwards
+    /// leaves the mirrored copy's world geometry untouched (and vice
+    /// versa).
+    #[test]
+    fn mirrored_group_is_deep_and_disentangled() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [10.0, 2.0]);
+        let b = obj(&mut m, [20.0, 12.0]);
+        let g = m.group_objects(&[a, b]).unwrap();
+        let new = m.mirror_subtrees(&[g], [0.0, 0.0], [0.0, 1.0]); // x = 0
+        assert_eq!(new.len(), 1);
+        let ng = new[0];
+        assert_ne!(ng, g);
+        // Two members, fresh ids, parents rewired to the NEW group.
+        let members = m.children_of(ng);
+        assert_eq!(members.len(), 2);
+        for &c in &members {
+            assert!(c != a && c != b, "copy shares an id with its source");
+            assert_eq!(m.objects[m.find(c).unwrap()].parent, Some(ng));
+        }
+        // Originals still point at the original group.
+        assert_eq!(m.objects[m.find(a).unwrap()].parent, Some(g));
+        // World geometry reflected: the copies' centres are the
+        // originals' with x negated.
+        let mut want: Vec<[f32; 2]> = [a, b]
+            .iter()
+            .map(|&id| {
+                let c = m.world_center(id).unwrap();
+                [-c[0], c[1]]
+            })
+            .collect();
+        for &c in &members {
+            let wc = m.world_center(c).unwrap();
+            let hit = want.iter().position(|&w| close(w, wc));
+            assert!(hit.is_some(), "unexpected copy centre {wc:?}");
+            want.remove(hit.unwrap());
+        }
+        // DISENTANGLEMENT: move/rotate/scale the ORIGINAL group; the
+        // copy's members hold still.
+        let frozen: Vec<[f32; 2]> =
+            members.iter().map(|&c| m.world_center(c).unwrap()).collect();
+        m.translate_world(g, [37.0, -12.0]);
+        m.rotate_world(g, [0.0, 0.0], 0.6);
+        m.scale_world(g, [5.0, 5.0], 1.4);
+        for (i, &c) in members.iter().enumerate() {
+            assert!(
+                close(m.world_center(c).unwrap(), frozen[i]),
+                "copy moved with its source"
+            );
+        }
+        // And the reverse: moving the copy leaves the original alone.
+        let oa = m.world_center(a).unwrap();
+        m.translate_world(ng, [5.0, 5.0]);
+        assert!(close(m.world_center(a).unwrap(), oa), "source moved with its copy");
+    }
+
+    /// Mirroring a root nested under transformed ancestors conjugates
+    /// the world line into the root's parent space: the copy's leaf
+    /// lands exactly at the reflection of the original leaf's world
+    /// position, and the copy stays a sibling of its original.
+    #[test]
+    fn mirror_conjugates_through_transformed_ancestors() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [10.0, 5.0]);
+        let inner = m.group_objects(&[a]).unwrap();
+        let outer = m.group_objects(&[inner]).unwrap();
+        let oi = m.find(outer).unwrap();
+        m.objects[oi].rotate_about([3.0, 7.0], 0.8);
+        m.objects[oi].scale_about([1.0, 2.0], 1.7);
+        m.objects[oi].translate([4.0, -6.0]);
+        let (la, lb) = ([-3.0, 4.0], [9.0, -2.0]);
+        let wa = m.world_center(a).unwrap();
+        let new = m.mirror_subtrees(&[inner], la, lb);
+        assert_eq!(new.len(), 1);
+        // Sibling: the copy sits under OUTER, next to inner.
+        assert_eq!(m.objects[m.find(new[0]).unwrap()].parent, Some(outer));
+        let leaf = m.children_of(new[0])[0];
+        let expect = Reflect2::across(la, lb).unwrap().apply(wa);
+        let got = m.world_center(leaf).unwrap();
+        assert!(close(got, expect), "got {got:?}, want {expect:?}");
+    }
+
+    /// The linear array steps each copy by k·step in WORLD space (even
+    /// through a rotated parent), rewires parents, and is ONE undo
+    /// entry for all copies together.
+    #[test]
+    fn array_steps_in_world_space_one_undo_entry() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [10.0, 5.0]);
+        let inner = m.group_objects(&[a]).unwrap();
+        let outer = m.group_objects(&[inner]).unwrap();
+        let oi = m.find(outer).unwrap();
+        m.objects[oi].rotate_about([0.0, 0.0], std::f32::consts::FRAC_PI_2);
+        let w0 = m.world_center(a).unwrap();
+        let n0 = m.objects.len();
+        let new = m.array_subtrees(&[inner], [30.0, 10.0], 2);
+        assert_eq!(new.len(), 2);
+        for (k, &nr) in new.iter().enumerate() {
+            let leaf = m.children_of(nr)[0];
+            let wc = m.world_center(leaf).unwrap();
+            let f = (k + 1) as f32;
+            assert!(
+                close(wc, [w0[0] + 30.0 * f, w0[1] + 10.0 * f]),
+                "copy {k} at {wc:?}"
+            );
+            // Independence: fresh subtree, parent rewired.
+            assert_eq!(m.objects[m.find(leaf).unwrap()].parent, Some(nr));
+            assert_ne!(leaf, a);
+        }
+        m.undo(); // ONE entry removes every copy
+        assert_eq!(m.objects.len(), n0);
+        m.redo();
+        assert_eq!(m.objects.len(), n0 + 4); // 2 copies × (group + leaf)
+    }
+
+    /// A mirrored stamp rasterizes exactly the row-flipped cells of
+    /// its source (the raster flip + angle conjugation pairing).
+    #[test]
+    fn mirrored_stamp_rasterizes_flipped() {
+        use crate::geometry::Geometry;
+        // A 4×4 raster with one asymmetric wall cell and a fan cell.
+        // (Even height + integer centre keep grid-cell centres off the
+        // raster row boundaries, so the discrete flip is exact.)
+        let (w, h) = (4usize, 4usize);
+        let mut cell = vec![CELL_FLUID; w * h];
+        let mut fan = vec![[0.0f32; 4]; w * h];
+        let dye = vec![[0.0f32; 4]; w * h];
+        cell[0] = CELL_WALL; // top-left
+        cell[1 * w + 2] = CELL_INLET;
+        fan[1 * w + 2] = [0.5, 0.25, 0.0, 0.0];
+        let raster = GeoRegion {
+            rect: (0, 0, w as i32, h as i32),
+            cell,
+            fan,
+            dye_src: dye,
+        };
+        let mut m = SketchModel::default();
+        let id = m.fresh_id();
+        m.add(SketchObject {
+            id,
+            shape: Shape::Stamp { raster, c: [8.0, 8.0], scale: 1.0, angle: 0.0 },
+            material: ObjMaterial::Wall,
+            thickness: 1.0,
+            filled: false,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: None,
+        });
+        let mut geo_src = Geometry::new(16, 16);
+        m.rasterize_region(&mut geo_src, GridRect::full(16, 16), 0, false);
+        // Mirror across the horizontal line y = 8 (the stamp's centre
+        // row): the result must be the vertical flip of the original.
+        let new = m.mirror_subtrees(&[id], [0.0, 8.0], [1.0, 8.0]);
+        assert_eq!(new.len(), 1);
+        // Rasterize the copy alone.
+        let keep = new[0];
+        let src_i = m.find(id).unwrap();
+        m.objects[src_i].hidden = true;
+        let mut geo_cpy = Geometry::new(16, 16);
+        m.rasterize_region(&mut geo_cpy, GridRect::full(16, 16), 0, false);
+        for y in 0..16usize {
+            for x in 0..16usize {
+                assert_eq!(
+                    geo_cpy.cell[y * 16 + x],
+                    geo_src.cell[(15 - y) * 16 + x],
+                    "cell ({x},{y}) is not the flip of its source"
+                );
+            }
+        }
+        // The fan vector flips its y component and keeps x.
+        let fi = (0..256).find(|&i| geo_cpy.cell[i] == CELL_INLET).unwrap();
+        assert!((geo_cpy.fan[fi][0] - 0.5).abs() < 1e-4);
+        assert!((geo_cpy.fan[fi][1] + 0.25).abs() < 1e-4);
+        let _ = keep;
     }
 }

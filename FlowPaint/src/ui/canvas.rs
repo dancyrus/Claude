@@ -358,7 +358,12 @@ impl FlowPaintApp {
         self.osnap_hit = None;
         let osnap_tool = matches!(
             self.tool,
-            Tool::Line | Tool::Rect | Tool::Ellipse | Tool::Polyline | Tool::Measure
+            Tool::Line
+                | Tool::Rect
+                | Tool::Ellipse
+                | Tool::Polyline
+                | Tool::Measure
+                | Tool::Mirror
         ) || matches!(self.gesture, Gesture::HandleDrag { .. });
         // Shift hands the position to angle-snap (or the square/circle
         // constraint), which overrides any object snap — computing one
@@ -375,7 +380,7 @@ impl FlowPaintApp {
                 };
                 let anchor = match &self.gesture {
                     Gesture::DrawShape { anchor, .. } => Some(*anchor),
-                    Gesture::Measure { a, .. } => Some(*a),
+                    Gesture::Measure { a, .. } | Gesture::MirrorLine { a, .. } => Some(*a),
                     Gesture::DrawPoly { id } => {
                         self.model.find(*id).and_then(|i| {
                             match &self.model.objects[i].shape {
@@ -567,6 +572,18 @@ impl FlowPaintApp {
                         let a = self.snap_active(raw);
                         self.gesture = Gesture::Measure { a, b: a };
                     }
+                    Tool::Mirror => {
+                        self.finish_gesture();
+                        if self.transform_targets().is_empty() {
+                            self.status = "Select something to mirror first — the \
+                                           Mirror tool copies the selection across \
+                                           a picked line."
+                                .into();
+                        } else {
+                            let a = self.snap_active(raw);
+                            self.gesture = Gesture::MirrorLine { a, b: a };
+                        }
+                    }
                 }
             }
         }
@@ -677,6 +694,16 @@ impl FlowPaintApp {
                     if let Gesture::Measure { b: bb, .. } = &mut self.gesture {
                         *bb = b;
                     }
+                } else if let Gesture::MirrorLine { a, .. } = &self.gesture {
+                    let a = *a;
+                    let b = if shift {
+                        self.angle_snap(a, raw)
+                    } else {
+                        self.snap_active(raw)
+                    };
+                    if let Gesture::MirrorLine { b: bb, .. } = &mut self.gesture {
+                        *bb = b;
+                    }
                 }
             }
         }
@@ -702,6 +729,7 @@ impl FlowPaintApp {
                     | Gesture::GizmoPivot
                     | Gesture::Erase { .. }
                     | Gesture::Measure { .. }
+                    | Gesture::MirrorLine { .. }
             )
         {
             self.finish_gesture();
@@ -1494,6 +1522,26 @@ impl FlowPaintApp {
                     super::theme::SNAP_MARK,
                 );
             }
+        }
+
+        // Mirror: the picked line, extended dashed across the view so
+        // the reflection axis reads at a glance.
+        if let Gesture::MirrorLine { a, b } = &self.gesture {
+            let (pa, pb) = (to_screen(*a), to_screen(*b));
+            let stroke = egui::Stroke::new(1.5, super::theme::SNAP_MARK);
+            let d = pb - pa;
+            if d.length() > 1.0 {
+                let dir = d.normalized() * 4000.0;
+                painter.extend(egui::Shape::dashed_line(
+                    &[pa - dir, pb + dir],
+                    egui::Stroke::new(1.0, super::theme::SNAP_MARK),
+                    8.0,
+                    6.0,
+                ));
+            }
+            painter.line_segment([pa, pb], stroke);
+            painter.circle_stroke(pa, 3.0, stroke);
+            painter.circle_stroke(pb, 3.0, stroke);
         }
 
         // Object-snap indicator (U4): a kind-shaped marker at the
