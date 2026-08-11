@@ -81,11 +81,12 @@ impl FlowPaintApp {
                     }
                     if ui.button("Select all  Ctrl+A").clicked() {
                         self.finish_gesture();
+                        // Top-level only: group members follow their group.
                         self.selected = self
                             .model
                             .objects
                             .iter()
-                            .filter(|o| !o.locked && !o.hidden)
+                            .filter(|o| o.parent.is_none() && !o.locked && !o.hidden)
                             .map(|o| o.id)
                             .collect();
                         ui.close_menu();

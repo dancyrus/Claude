@@ -28,8 +28,8 @@ pub(super) fn draw(
 ) {
     app.menu_bar(ctx, snapshot, cmds);
     app.ribbon(ctx, snapshot, cmds);
-    app.status_bar(ctx);
-    app.tree_panel(ctx);
+    app.status_bar(ctx, cmds);
+    app.tree_panel(ctx, cmds);
     app.settings_panel(ctx, snapshot, cmds);
     app.legend_panel(ctx, snapshot, cmds);
     app.canvas(ctx, cmds);

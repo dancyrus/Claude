@@ -96,12 +96,31 @@ enum Gesture {
         corner: [f32; 2],
         base: Vec<u64>,
     },
+    /// Gizmo rotation about `pivot` (world cells). `before` pairs the
+    /// transform targets at gesture start; each drag frame restores
+    /// them and applies the accumulated `total` afresh, so the gesture
+    /// never compounds float error (U3).
+    GizmoRotate {
+        before: Vec<(u64, SketchObject)>,
+        pivot: [f32; 2],
+        start_ang: f32,
+        total: f32,
+    },
+    /// Gizmo uniform scale about `pivot`; same restore-and-reapply
+    /// scheme as GizmoRotate.
+    GizmoScale {
+        before: Vec<(u64, SketchObject)>,
+        pivot: [f32; 2],
+        start_dist: f32,
+        total: f32,
+    },
+    /// Dragging the gizmo pivot marker (no model edit).
+    GizmoPivot,
 }
 
 /// Object layout of scene files v3–v5, BEFORE lock/hide existed. bincode
-/// is positional, so the live `SketchObject` (which appends `locked` and
-/// `hidden`) cannot decode old files directly; old payloads decode into
-/// this mirror and convert.
+/// is positional, so the live `SketchObject` cannot decode old files
+/// directly; old payloads decode into this mirror and convert.
 #[derive(Serialize, Deserialize)]
 struct SketchObjectV5 {
     id: u64,
@@ -116,9 +135,9 @@ struct SketchObjectV5 {
     smoke_rgb: [f32; 3],
 }
 
-impl From<SketchObjectV5> for SketchObject {
+impl From<SketchObjectV5> for SketchObjectV7 {
     fn from(o: SketchObjectV5) -> Self {
-        SketchObject {
+        SketchObjectV7 {
             id: o.id,
             shape: o.shape,
             material: o.material,
@@ -131,6 +150,45 @@ impl From<SketchObjectV5> for SketchObject {
             smoke_rgb: o.smoke_rgb,
             locked: false,
             hidden: false,
+        }
+    }
+}
+
+/// Object layout of scene files v6–v7 (lock/hide present, BEFORE U3's
+/// `parent` link). Decodes via this mirror; groups didn't exist yet, so
+/// every pre-v8 object loads as a root.
+#[derive(Serialize, Deserialize)]
+struct SketchObjectV7 {
+    id: u64,
+    shape: Shape,
+    material: ObjMaterial,
+    thickness: f32,
+    filled: bool,
+    fan_mult: f32,
+    fan_gust: f32,
+    fan_phase: f32,
+    fan_angle: f32,
+    smoke_rgb: [f32; 3],
+    locked: bool,
+    hidden: bool,
+}
+
+impl From<SketchObjectV7> for SketchObject {
+    fn from(o: SketchObjectV7) -> Self {
+        SketchObject {
+            id: o.id,
+            shape: o.shape,
+            material: o.material,
+            thickness: o.thickness,
+            filled: o.filled,
+            fan_mult: o.fan_mult,
+            fan_gust: o.fan_gust,
+            fan_phase: o.fan_phase,
+            fan_angle: o.fan_angle,
+            smoke_rgb: o.smoke_rgb,
+            locked: o.locked,
+            hidden: o.hidden,
+            parent: None,
         }
     }
 }
@@ -174,12 +232,13 @@ struct SceneV4 {
     fluid_a: f32,
 }
 
-/// Scene file (version 6): the v4/v5 settings layout with the live
-/// object type, whose objects now persist `locked` and `hidden` (U2).
+/// Scene file (version 6): the v4/v5 settings layout, whose objects now
+/// persist `locked` and `hidden` (U2). Objects decode via the pre-U3
+/// mirror (no parent links yet).
 #[derive(Serialize, Deserialize)]
 struct SceneV6 {
     version: u32,
-    objects: Vec<SketchObject>,
+    objects: Vec<SketchObjectV7>,
     wind_tunnel: bool,
     flow_speed: f32,
     viscosity: f32,
@@ -213,7 +272,7 @@ struct SceneRange {
 #[derive(Serialize, Deserialize)]
 struct SceneV7 {
     version: u32,
-    objects: Vec<SketchObject>,
+    objects: Vec<SketchObjectV7>,
     wind_tunnel: bool,
     flow_speed: f32,
     viscosity: f32,
@@ -269,11 +328,74 @@ impl From<FieldRange> for SceneRange {
     }
 }
 
+/// A persisted probe (v8): id and position in visible cells. Sample
+/// histories are runtime-only — they describe a flow that a load resets.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct SceneProbe {
+    id: u32,
+    pos: [f32; 2],
+}
+
+/// Scene file (version 8, U3): the v7 settings layout with the live
+/// object type — objects now persist `parent` links and `Shape::Group`
+/// nodes — plus the probe set (closing T2-B's persistence debt) and the
+/// plot-panel preferences.
+#[derive(Serialize, Deserialize)]
+struct SceneV8 {
+    version: u32,
+    objects: Vec<SketchObject>,
+    wind_tunnel: bool,
+    flow_speed: f32,
+    viscosity: f32,
+    steps_per_frame: u32,
+    domain_width_m: f32,
+    fluid_nu: f32,
+    fluid_rho: f32,
+    ref_width: u32,
+    /// 0 = LBM (incompressible), 1 = Euler (compressible).
+    solver: u32,
+    mach: f32,
+    fluid_a: f32,
+    /// Indexed by `RenderMode as usize`; the Dye entry is unused.
+    ranges: [SceneRange; 4],
+    probes: Vec<SceneProbe>,
+    /// `ProbeQuantity` as its ALL-index (0 Speed … 3 Smoke).
+    probe_quantity: u32,
+    probe_show_plot: bool,
+}
+
+impl SceneV8 {
+    /// A pre-v8 scene: same settings, root-only objects, no probes.
+    fn from_v7(s: SceneV7) -> Self {
+        SceneV8 {
+            version: s.version,
+            objects: s.objects.into_iter().map(Into::into).collect(),
+            wind_tunnel: s.wind_tunnel,
+            flow_speed: s.flow_speed,
+            viscosity: s.viscosity,
+            steps_per_frame: s.steps_per_frame,
+            domain_width_m: s.domain_width_m,
+            fluid_nu: s.fluid_nu,
+            fluid_rho: s.fluid_rho,
+            ref_width: s.ref_width,
+            solver: s.solver,
+            mach: s.mach,
+            fluid_a: s.fluid_a,
+            ranges: s.ranges,
+            probes: Vec::new(),
+            probe_quantity: 0,
+            probe_show_plot: false,
+        }
+    }
+}
+
 const SCENE_V3: u32 = 3;
 const SCENE_V4: u32 = 4;
 const SCENE_V5: u32 = 5;
 const SCENE_V6: u32 = 6;
 const SCENE_V7: u32 = 7;
+/// U3. T2-C lands concurrently and takes v9 — do not reuse.
+const SCENE_V8: u32 = 8;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -462,6 +584,17 @@ struct UiSnapshot {
     ranges: [FieldRange; 4],
 }
 
+/// Per-frame read snapshot of the sim-owned probe store (T2-B fold):
+/// rows for the tree and markers always; the full sample series only
+/// while the plot panel is open (it is the one heavy clone).
+#[derive(Default)]
+struct ProbeUi {
+    rows: Vec<(u32, [f32; 2])>,
+    show_plot: bool,
+    quantity: crate::sim::ProbeQuantity,
+    series: Vec<(u32, Vec<crate::sim::ProbeSample>)>,
+}
+
 /// Commands for the sim (settings and file ops); the sketch model is
 /// owned by the app and edited directly.
 enum Cmd {
@@ -490,6 +623,19 @@ enum Cmd {
     SetRangeMode(RenderMode, RangeMode),
     SetRangeMax(RenderMode, f32),
     SetColorMap(RenderMode, ColorMap),
+    /// Probe edits (T2-B fold): the store lives in `Settings.probes`;
+    /// panels read the per-frame `ProbeUi` snapshot and write these.
+    AddProbe([f32; 2]),
+    RemoveProbe(u32),
+    SetProbeQuantity(crate::sim::ProbeQuantity),
+    SetProbePlot(bool),
+    ClearProbeSamples,
+    /// Replace the whole probe set (scene loads).
+    LoadProbes {
+        probes: Vec<(u32, [f32; 2])>,
+        quantity: crate::sim::ProbeQuantity,
+        show_plot: bool,
+    },
     ExportPng(std::path::PathBuf),
     SetMapping(ViewportMapping),
 }
@@ -550,10 +696,27 @@ pub struct FlowPaintApp {
     /// Simulated margin on/off; `margin_index` keeps the last size.
     margin_on: bool,
     margin_index: usize,
-    /// Staged inspector transform: (object id, rotation °, scale %).
-    /// The fields hold cumulative deltas since the selection changed —
-    /// not absolute object properties (see object_panel).
-    inspector_stage: Option<(u64, f32, f32)>,
+    /// Staged inspector transform: (selection id set, rotation °,
+    /// scale %). The fields hold cumulative deltas since the selection
+    /// changed — not absolute object properties (see object_panel).
+    inspector_stage: Option<(Vec<u64>, f32, f32)>,
+    /// "Entered" group (double-click): clicks inside it select one
+    /// level below it instead of the outermost group.
+    entered_group: Option<u64>,
+    /// Gizmo pivot override (world cells) and the selection set it was
+    /// staged for — reverts to the selection-bounds centre when the
+    /// selection changes (U3).
+    gizmo_pivot: Option<[f32; 2]>,
+    gizmo_pivot_sel: Vec<u64>,
+    /// The next canvas click places a probe (armed from the tree).
+    probe_arming: bool,
+    /// Per-frame snapshot of the sim-owned probe state for the panels
+    /// (T2-B fold: the store lives in `Settings`, edits go through
+    /// `Cmd`; this is the read path).
+    probe_ui: ProbeUi,
+    /// The canvas view mapping pushed this frame — lets status.rs draw
+    /// probe markers without owning the canvas.
+    canvas_mapping: Option<ViewportMapping>,
     status: String,
     hover_cell: Option<[f32; 2]>,
     /// Set by ribbon buttons / shortcuts, consumed by the canvas next
@@ -669,6 +832,12 @@ impl FlowPaintApp {
             margin_on: true,
             margin_index: DEFAULT_MARGIN_INDEX,
             inspector_stage: None,
+            entered_group: None,
+            gizmo_pivot: None,
+            gizmo_pivot_sel: Vec::new(),
+            probe_arming: false,
+            probe_ui: ProbeUi::default(),
+            canvas_mapping: None,
             status: String::from(
                 "Draw with the sketch tools; every object stays selectable and editable.",
             ),
@@ -734,6 +903,7 @@ impl FlowPaintApp {
             ],
             locked: false,
             hidden: false,
+            parent: None,
         }
     }
 
@@ -764,6 +934,74 @@ impl FlowPaintApp {
         self.tool = Tool::Select;
         self.status =
             "Inserted — drag to place, rotate/scale in the Object panel.".into();
+    }
+
+    /// Insert a generated nozzle. With the chamber fan on, the insert
+    /// is an ENGINE GROUP: the bell stamp plus a real Fan rect child
+    /// across the chamber entrance — the parent link is what makes it
+    /// an engine (the pre-U3 build baked `CELL_INLET` cells into the
+    /// stamp and the inspector re-detected them by raster scanning).
+    /// One `add_many` = one undo entry for the whole insert.
+    pub(in crate::app) fn insert_nozzle_object(
+        &mut self,
+        params: crate::generators::NozzleParams,
+    ) {
+        let walls = crate::generators::generate_nozzle(&params);
+        if !params.chamber_fan {
+            self.insert_stamp_object(walls);
+            return;
+        }
+        self.finish_gesture();
+        let (vw, vh) = self.stats_grid;
+        let c = [vw as f32 * 0.5, vh as f32 * 0.5];
+        let gid = self.model.fresh_id();
+        let group = SketchObject {
+            id: gid,
+            shape: Shape::Group { t: [0.0, 0.0], rot: 0.0, scale: 1.0 },
+            material: ObjMaterial::Wall,
+            thickness: 1.0,
+            filled: false,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: None,
+        };
+        let mut bell = self.new_object(Shape::Stamp {
+            raster: walls,
+            c,
+            scale: 1.0,
+            angle: 0.0,
+        });
+        bell.material = ObjMaterial::Wall;
+        bell.fan_mult = 1.0;
+        bell.fan_gust = 0.0;
+        bell.parent = Some(gid);
+        let (off, half) = crate::generators::nozzle_fan_layout(&params);
+        let mut fan = self.new_object(Shape::Rect {
+            c: [c[0] + off[0], c[1] + off[1]],
+            half,
+            angle: 0.0,
+        });
+        fan.material = ObjMaterial::Fan;
+        fan.filled = true;
+        fan.thickness = 1.0;
+        fan.fan_mult = params.fan_mult.clamp(0.2, 2.0);
+        fan.fan_gust = 0.0;
+        fan.fan_angle = 0.0; // blows +x; aim by rotating the group
+        // The chamber plume color the baked stamps used.
+        fan.smoke_rgb = [0.95, 0.85, 0.55];
+        fan.parent = Some(gid);
+        // Group node first so the children's damage marks resolve
+        // their chain during the add.
+        self.model.add_many(vec![group, fan, bell]);
+        self.select_only(gid);
+        self.tool = Tool::Select;
+        self.status =
+            "Engine inserted — drag to place; aim it with Rotate.".into();
     }
 
     // --- Sketch aids ---------------------------------------------------
@@ -853,17 +1091,73 @@ impl FlowPaintApp {
 
     /// Selected ids that may be edited (locked objects can sit in the
     /// selection via the tree but must not be moved/deleted/retuned).
+    /// Lock state is EFFECTIVE — a locked ancestor group locks the
+    /// whole subtree.
     pub(in crate::app) fn editable_selection(&self) -> Vec<u64> {
         self.selected
             .iter()
             .copied()
+            .filter(|&id| self.model.find(id).is_some() && !self.model.eff_locked(id))
+            .collect()
+    }
+
+    /// The editable selection reduced to its OUTERMOST members: when a
+    /// group and one of its descendants are both selected, only the
+    /// group transforms — the descendant follows through composition
+    /// (transforming both would apply the edit twice).
+    pub(in crate::app) fn transform_targets(&self) -> Vec<u64> {
+        let sel = self.editable_selection();
+        sel.iter()
+            .copied()
             .filter(|&id| {
-                self.model
-                    .find(id)
-                    .map(|i| !self.model.objects[i].locked)
-                    .unwrap_or(false)
+                !sel.iter()
+                    .any(|&other| other != id && self.model.is_descendant(id, other))
             })
             .collect()
+    }
+
+    /// Expand a set of ids to include every descendant (dedup'd, model
+    /// order): deletes, copies and z-order moves act on whole subtrees.
+    pub(in crate::app) fn expand_subtrees(&self, ids: &[u64]) -> Vec<u64> {
+        self.model
+            .objects
+            .iter()
+            .filter(|o| {
+                ids.contains(&o.id)
+                    || ids.iter().any(|&a| self.model.is_descendant(o.id, a))
+            })
+            .map(|o| o.id)
+            .collect()
+    }
+
+    /// World-space AABB of the whole selection (the gizmo box and the
+    /// common transform pivot).
+    pub(in crate::app) fn selection_world_bounds(&self) -> Option<crate::geometry::GridRect> {
+        let mut acc: Option<crate::geometry::GridRect> = None;
+        for &id in &self.selected {
+            if let Some(b) = self.model.world_bounds(id) {
+                acc = Some(match acc {
+                    Some(u) => u.union(b),
+                    None => b,
+                });
+            }
+        }
+        acc
+    }
+
+    /// The pivot the selection transforms about: the dragged gizmo
+    /// pivot while it belongs to this selection, else the selection
+    /// bounds centre.
+    pub(in crate::app) fn transform_pivot(&mut self) -> Option<[f32; 2]> {
+        if self.gizmo_pivot_sel != self.selected {
+            self.gizmo_pivot = None;
+            self.gizmo_pivot_sel = self.selected.clone();
+        }
+        if let Some(p) = self.gizmo_pivot {
+            return Some(p);
+        }
+        let b = self.selection_world_bounds()?;
+        Some([(b.x0 + b.x1) as f32 * 0.5, (b.y0 + b.y1) as f32 * 0.5])
     }
 
     /// Apply one edit to every editable selected object as ONE coalesced
@@ -881,13 +1175,16 @@ impl FlowPaintApp {
         self.model.record_modify_many_coalesced(&pairs);
     }
 
-    /// Delete the editable selection — one undo entry.
+    /// Delete the editable selection — whole subtrees, one undo entry.
+    /// Children are removed before their ancestors so each removal's
+    /// damage region resolves through a still-intact chain.
     pub(in crate::app) fn delete_selected(&mut self) {
         self.finish_gesture();
-        let ids = self.editable_selection();
+        let mut ids = self.expand_subtrees(&self.editable_selection());
         if ids.is_empty() {
             return;
         }
+        ids.sort_by_key(|&id| std::cmp::Reverse(self.model.depth(id)));
         for id in &ids {
             self.deselect(*id);
         }
@@ -896,6 +1193,57 @@ impl FlowPaintApp {
         if n > 1 {
             self.status = format!("Deleted {n} objects.");
         }
+    }
+
+    /// Group the selection's outermost members under a new group node;
+    /// the group becomes the selection (Ctrl+G).
+    pub(in crate::app) fn group_selected(&mut self) {
+        self.finish_gesture();
+        let targets = self.transform_targets();
+        if targets.is_empty() {
+            return;
+        }
+        if let Some(gid) = self.model.group_objects(&targets) {
+            self.select_only(gid);
+            self.entered_group = None;
+            self.status = format!("Grouped {} object(s).", targets.len());
+        }
+    }
+
+    /// Dissolve every selected group one level; the freed children
+    /// become the selection (Ctrl+Shift+G).
+    pub(in crate::app) fn ungroup_selected(&mut self) {
+        self.finish_gesture();
+        let groups: Vec<u64> = self
+            .editable_selection()
+            .into_iter()
+            .filter(|&id| {
+                self.model
+                    .find(id)
+                    .map(|i| matches!(self.model.objects[i].shape, Shape::Group { .. }))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if groups.is_empty() {
+            return;
+        }
+        self.deselect_all();
+        self.entered_group = None;
+        let mut n = 0;
+        for gid in groups {
+            let children = self.model.children_of(gid);
+            if self.model.ungroup(gid) {
+                n += 1;
+                for c in children {
+                    self.select_add(c);
+                }
+            }
+        }
+        self.status = if n == 1 {
+            "Ungrouped.".into()
+        } else {
+            format!("Ungrouped {n} groups.")
+        };
     }
 
     // --- Clipboard ------------------------------------------------------
@@ -908,12 +1256,24 @@ impl FlowPaintApp {
 
     pub(in crate::app) fn copy_selected(&mut self, ctx: &egui::Context) {
         // Clipboard keeps model (z) order so a paste preserves stacking.
+        // Selecting a group copies its whole subtree; the copied roots
+        // are FLATTENED to world space (their ancestor transforms baked
+        // in), so a paste lands at the copied world position no matter
+        // what happened to the original group in the meantime.
+        let ids = self.expand_subtrees(&self.selected);
         let objs: Vec<SketchObject> = self
             .model
             .objects
             .iter()
-            .filter(|o| self.selected.contains(&o.id))
-            .cloned()
+            .filter(|o| ids.contains(&o.id))
+            .map(|o| {
+                let mut c = o.clone();
+                if !ids.contains(&c.parent.unwrap_or(0)) || c.parent.is_none() {
+                    c.apply_sim(self.model.parent_abs(c.id));
+                    c.parent = None;
+                }
+                c
+            })
             .collect();
         if !objs.is_empty() {
             self.paste_gen = 0;
@@ -938,13 +1298,29 @@ impl FlowPaintApp {
             let d = 16.0 * self.paste_gen as f32;
             [d, d]
         };
-        let mut copies = Vec::with_capacity(self.clipboard.len());
+        // Fresh ids minted first, then parent links remapped WITHIN the
+        // pasted set (children can precede their group node in z-order,
+        // so the mint must be a separate pass). Clipboard roots are
+        // world-space with parent None; only roots translate — their
+        // subtrees follow through composition.
+        let src_list = self.clipboard.clone();
+        let mut id_map: std::collections::HashMap<u64, u64> = Default::default();
+        for src in &src_list {
+            id_map.insert(src.id, self.model.fresh_id());
+        }
+        let mut copies = Vec::with_capacity(src_list.len());
         self.deselect_all();
-        for src in &self.clipboard.clone() {
+        for src in &src_list {
             let mut copy = src.clone();
-            copy.id = self.model.fresh_id();
-            copy.translate(offset);
-            self.select_add(copy.id);
+            copy.id = id_map[&src.id];
+            match copy.parent.and_then(|p| id_map.get(&p).copied()) {
+                Some(np) => copy.parent = Some(np),
+                None => {
+                    copy.parent = None;
+                    copy.translate(offset);
+                    self.select_add(copy.id);
+                }
+            }
             copies.push(copy);
         }
         let n = copies.len();
@@ -964,11 +1340,14 @@ impl FlowPaintApp {
             return;
         }
         self.finish_gesture();
+        // Whole subtrees move together — raising a group means raising
+        // what it contains (the node itself never rasterizes).
+        let expanded = self.expand_subtrees(&self.selected);
         let in_sel: Vec<bool> = self
             .model
             .objects
             .iter()
-            .map(|o| self.selected.contains(&o.id))
+            .map(|o| expanded.contains(&o.id))
             .collect();
         let ids: Vec<u64> = self.model.objects.iter().map(|o| o.id).collect();
         let n = ids.len();
@@ -1016,6 +1395,22 @@ impl eframe::App for FlowPaintApp {
             let Some(rs) = frame.wgpu_render_state() else { return };
             let renderer = rs.renderer.read();
             let Some(sim) = renderer.callback_resources.get::<GpuSim>() else { return };
+            // Probe read path (T2-B fold): rows always; the sample
+            // series — the one heavy clone — only while the plot shows.
+            let pr = &sim.settings.probes;
+            self.probe_ui = ProbeUi {
+                rows: pr.probes.iter().map(|p| (p.id, p.pos)).collect(),
+                show_plot: pr.show_plot,
+                quantity: pr.quantity,
+                series: if pr.show_plot {
+                    pr.probes
+                        .iter()
+                        .map(|p| (p.id, p.samples.iter().copied().collect()))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            };
             UiSnapshot {
                 flow: sim.settings.flow_speed,
                 visc: sim.settings.viscosity,
@@ -1148,6 +1543,48 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::SetRangeMode(m, v) => sim.settings.ranges[m as usize].mode = v,
         Cmd::SetRangeMax(m, v) => sim.settings.ranges[m as usize].sat_phys = v.max(1e-6),
         Cmd::SetColorMap(m, v) => sim.settings.ranges[m as usize].map = v,
+        Cmd::AddProbe(pos) => {
+            let pr = &mut sim.settings.probes;
+            if pr.probes.len() < crate::sim::MAX_PROBES {
+                let id = pr.next_id;
+                pr.next_id += 1;
+                pr.probes.push(crate::sim::Probe {
+                    id,
+                    pos,
+                    samples: Default::default(),
+                });
+                pr.show_plot = true;
+                app.status = format!("Probe P{id} placed.");
+            }
+        }
+        Cmd::RemoveProbe(id) => {
+            let pr = &mut sim.settings.probes;
+            pr.probes.retain(|p| p.id != id);
+            if pr.probes.is_empty() {
+                pr.show_plot = false;
+            }
+        }
+        Cmd::SetProbeQuantity(q) => sim.settings.probes.quantity = q,
+        Cmd::SetProbePlot(on) => sim.settings.probes.show_plot = on,
+        Cmd::ClearProbeSamples => {
+            for p in &mut sim.settings.probes.probes {
+                p.samples.clear();
+            }
+        }
+        Cmd::LoadProbes { probes, quantity, show_plot } => {
+            let pr = &mut sim.settings.probes;
+            pr.next_id = probes.iter().map(|&(id, _)| id).max().unwrap_or(0) + 1;
+            pr.probes = probes
+                .into_iter()
+                .map(|(id, pos)| crate::sim::Probe {
+                    id,
+                    pos,
+                    samples: Default::default(),
+                })
+                .collect();
+            pr.quantity = quantity;
+            pr.show_plot = show_plot;
+        }
         Cmd::ExportPng(p) => {
             app.status = match sim.export_png(&p) {
                 Ok(()) => format!("Exported {}", p.display()),
@@ -1207,6 +1644,7 @@ fn base_object(model: &mut SketchModel, shape: Shape) -> SketchObject {
         smoke_rgb: [0.35, 0.85, 1.0],
         locked: false,
         hidden: false,
+        parent: None,
     }
 }
 
@@ -1305,6 +1743,10 @@ impl FlowPaintApp {
             self.finish_gesture();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.probe_arming {
+                self.probe_arming = false;
+                self.status = "Probe placement cancelled.".into();
+            } else {
             match std::mem::replace(&mut self.gesture, Gesture::None) {
                 Gesture::DrawShape { id, .. }
                 | Gesture::DrawPoly { id }
@@ -1314,24 +1756,24 @@ impl FlowPaintApp {
                 }
                 Gesture::MoveSel { before, .. } => {
                     // Revert the in-flight move on every member.
-                    for (id, before) in before {
-                        if let Some(i) = self.model.find(id) {
-                            let after_bounds = self.model.objects[i].bounds();
-                            self.model
-                                .mark_dirty(after_bounds.union(before.bounds()));
-                            self.model.objects[i] = before;
-                        }
-                    }
+                    self.restore_before(&before);
                 }
                 Gesture::HandleDrag { id, before, .. } => {
-                    if let Some(i) = self.model.find(id) {
-                        let after_bounds = self.model.objects[i].bounds();
-                        self.model.mark_dirty(after_bounds.union(before.bounds()));
-                        self.model.objects[i] = before;
+                    self.restore_before(&[(id, before)]);
+                }
+                Gesture::GizmoRotate { before, .. } | Gesture::GizmoScale { before, .. } => {
+                    self.restore_before(&before);
+                }
+                Gesture::GizmoPivot => {}
+                Gesture::RubberBand { base, .. } => self.selected = base,
+                Gesture::None => {
+                    // First Esc leaves an entered group, second clears
+                    // the selection.
+                    if self.entered_group.take().is_none() {
+                        self.deselect_all();
                     }
                 }
-                Gesture::RubberBand { base, .. } => self.selected = base,
-                Gesture::None => self.deselect_all(),
+            }
             }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
@@ -1341,16 +1783,25 @@ impl FlowPaintApp {
                 self.delete_selected();
             }
         }
-        // Select all (unlocked, visible objects); Esc above clears.
+        // Select all TOP-LEVEL objects (group members follow their
+        // group); locked or hidden ones stay out. Esc above clears.
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
             self.finish_gesture();
             self.selected = self
                 .model
                 .objects
                 .iter()
-                .filter(|o| !o.locked && !o.hidden)
+                .filter(|o| o.parent.is_none() && !o.locked && !o.hidden)
                 .map(|o| o.id)
                 .collect();
+        }
+        // Group / ungroup (U3).
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::G)) {
+            if ctx.input(|i| i.modifiers.shift) {
+                self.ungroup_selected();
+            } else {
+                self.group_selected();
+            }
         }
         // Clipboard. egui swallows Ctrl+C/Ctrl+V into Copy/Paste EVENTS
         // (they never arrive as key_pressed), so match the events.
@@ -1471,31 +1922,71 @@ impl FlowPaintApp {
                 }
             });
             if d != [0.0; 2] {
-                self.edit_selection(|o| o.translate(d));
+                self.transform_selection_world(|m, id| m.translate_world(id, d));
             }
         }
     }
 
-    /// Duplicate the whole selection — one undo entry; the copies become
-    /// the selection (in the originals' z-order).
+    /// Apply a world-space transform to the selection's OUTERMOST
+    /// editable members as ONE coalesced undo entry (arrow nudges, the
+    /// inspector's rotate/scale/centre fields). The closure gets the
+    /// model so it can use the world-space ops, which damage-mark
+    /// through the ancestor chain themselves.
+    pub(in crate::app) fn transform_selection_world(
+        &mut self,
+        f: impl Fn(&mut SketchModel, u64),
+    ) {
+        let ids = self.transform_targets();
+        let mut pairs = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(i) = self.model.find(id) {
+                let before = self.model.objects[i].clone();
+                f(&mut self.model, id);
+                pairs.push((id, before));
+            }
+        }
+        self.model.record_modify_many_coalesced(&pairs);
+    }
+
+    /// Duplicate the whole selection (subtrees included) — one undo
+    /// entry; the copies become the selection. Copied roots stay
+    /// siblings of their originals (same parent), offset by one step in
+    /// WORLD space; members keep their remapped hierarchy.
     fn duplicate_selected(&mut self) {
         self.finish_gesture();
+        let ids = self.expand_subtrees(&self.selected);
         let src: Vec<SketchObject> = self
             .model
             .objects
             .iter()
-            .filter(|o| self.selected.contains(&o.id))
+            .filter(|o| ids.contains(&o.id))
             .cloned()
             .collect();
         if src.is_empty() {
             return;
         }
+        let mut id_map: std::collections::HashMap<u64, u64> = Default::default();
+        for s in &src {
+            id_map.insert(s.id, self.model.fresh_id());
+        }
         let mut copies = Vec::with_capacity(src.len());
         self.deselect_all();
         for mut copy in src {
-            copy.id = self.model.fresh_id();
-            copy.translate([16.0, 16.0]);
-            self.select_add(copy.id);
+            copy.id = id_map[&copy.id];
+            match copy.parent.and_then(|p| id_map.get(&p).copied()) {
+                Some(np) => copy.parent = Some(np),
+                None => {
+                    // Forest root: offset one paste step in world space,
+                    // converted into its (kept) parent's space.
+                    let dl = self
+                        .model
+                        .abs_of(copy.parent)
+                        .inverse()
+                        .apply_vec([16.0, 16.0]);
+                    copy.translate(dl);
+                    self.select_add(copy.id);
+                }
+            }
             copies.push(copy);
         }
         let n = copies.len();
@@ -1550,13 +2041,15 @@ impl FlowPaintApp {
     }
 
     /// Mutate an object mid-gesture: no undo record (that lands when the
-    /// gesture finishes), just damage marking.
+    /// gesture finishes), just world-footprint damage marking (the
+    /// object may live inside a transformed group).
     fn mutate_live(&mut self, id: u64, f: impl FnOnce(&mut SketchObject)) {
-        if let Some(i) = self.model.find(id) {
-            let b0 = self.model.objects[i].bounds();
-            f(&mut self.model.objects[i]);
-            let b1 = self.model.objects[i].bounds();
-            self.model.mark_dirty(b0.union(b1));
+        if self.model.find(id).is_some() {
+            self.model.mark_world_dirty(id);
+            if let Some(i) = self.model.find(id) {
+                f(&mut self.model.objects[i]);
+            }
+            self.model.mark_world_dirty(id);
         }
     }
 
@@ -1640,9 +2133,26 @@ impl FlowPaintApp {
             Gesture::HandleDrag { id, before, .. } => {
                 self.model.record_modify(id, before);
             }
+            // One undo entry for the whole gizmo transform.
+            Gesture::GizmoRotate { before, .. } | Gesture::GizmoScale { before, .. } => {
+                self.model.record_modify_many(&before);
+            }
+            Gesture::GizmoPivot => {}
             // Selection was applied live; nothing to finalize.
             Gesture::RubberBand { .. } => {}
             Gesture::None => {}
+        }
+    }
+
+    /// Restore a gesture's `before` set verbatim (Esc mid-gizmo), with
+    /// world-footprint damage marks on both states.
+    pub(in crate::app) fn restore_before(&mut self, before: &[(u64, SketchObject)]) {
+        for (id, b) in before {
+            self.model.mark_world_dirty(*id);
+            if let Some(i) = self.model.find(*id) {
+                self.model.objects[i] = b.clone();
+            }
+            self.model.mark_world_dirty(*id);
         }
     }
 
@@ -1650,8 +2160,8 @@ impl FlowPaintApp {
         // Commit any in-flight gesture so the file doesn't capture a
         // polyline's cursor-tracking rubber vertex.
         self.finish_gesture();
-        let scene = SceneV7 {
-            version: SCENE_V7,
+        let scene = SceneV8 {
+            version: SCENE_V8,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -1668,6 +2178,17 @@ impl FlowPaintApp {
             mach: snap.mach,
             fluid_a: self.fluid_a,
             ranges: snap.ranges.map(SceneRange::from),
+            probes: self
+                .probe_ui
+                .rows
+                .iter()
+                .map(|&(id, pos)| SceneProbe { id, pos })
+                .collect(),
+            probe_quantity: crate::sim::ProbeQuantity::ALL
+                .iter()
+                .position(|&q| q == self.probe_ui.quantity)
+                .unwrap_or(0) as u32,
+            probe_show_plot: self.probe_ui.show_plot,
         };
         match bincode::serialize(&scene) {
             Ok(bytes) => {
@@ -1693,7 +2214,7 @@ impl FlowPaintApp {
         } else {
             0
         };
-        if !(SCENE_V3..=SCENE_V7).contains(&version) {
+        if !(SCENE_V3..=SCENE_V8).contains(&version) {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
@@ -1701,15 +2222,20 @@ impl FlowPaintApp {
         }
         // A v3 file is a v4 file without the solver fields; v5 shares
         // the v4 layout; v6 appends per-object lock/hide, so pre-v6
-        // objects decode via the SketchObjectV5 mirror and convert; v7
-        // appends the color ranges, defaulted for anything older.
-        let decoded = if version >= SCENE_V7 {
-            bincode::deserialize::<SceneV7>(&bytes)
+        // objects decode via the SketchObjectV5 mirror; v7 appends the
+        // color ranges; v8 (U3) appends parent links / group nodes and
+        // the probe set — pre-v8 objects decode via the SketchObjectV7
+        // mirror, everything older gets defaults.
+        let decoded = if version >= SCENE_V8 {
+            bincode::deserialize::<SceneV8>(&bytes)
+        } else if version >= SCENE_V7 {
+            bincode::deserialize::<SceneV7>(&bytes).map(SceneV8::from_v7)
         } else if version >= SCENE_V6 {
-            bincode::deserialize::<SceneV6>(&bytes).map(SceneV7::from_v6)
+            bincode::deserialize::<SceneV6>(&bytes)
+                .map(|s| SceneV8::from_v7(SceneV7::from_v6(s)))
         } else if version >= SCENE_V4 {
             bincode::deserialize::<SceneV4>(&bytes).map(|s| {
-                SceneV7::from_v6(SceneV6 {
+                SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
                     version: s.version,
                     objects: s.objects.into_iter().map(Into::into).collect(),
                     wind_tunnel: s.wind_tunnel,
@@ -1723,11 +2249,11 @@ impl FlowPaintApp {
                     solver: s.solver,
                     mach: s.mach,
                     fluid_a: s.fluid_a,
-                })
+                }))
             })
         } else {
             bincode::deserialize::<SceneV3>(&bytes).map(|s| {
-                SceneV7::from_v6(SceneV6 {
+                SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
                     version: s.version,
                     objects: s.objects.into_iter().map(Into::into).collect(),
                     wind_tunnel: s.wind_tunnel,
@@ -1741,7 +2267,7 @@ impl FlowPaintApp {
                     solver: 0,
                     mach: 1.6,
                     fluid_a: 343.0,
-                })
+                }))
             })
         };
         match decoded {
@@ -1754,6 +2280,7 @@ impl FlowPaintApp {
                 let before_n = objects.len();
                 objects.retain(object_is_sane);
                 let dropped = before_n - objects.len();
+                sanitize_parents(&mut objects);
                 // Pre-v5 files predate the recolorable stamp plume: their
                 // stamps' smoke_rgb is an unused default, so seed it from
                 // the baked fan dye to keep old scenes' plume colors.
@@ -1764,15 +2291,30 @@ impl FlowPaintApp {
                         }
                     }
                 }
-                // Rescale into the current grid width.
+                // Rescale into the current grid width (probe positions
+                // are visible-cell coordinates like everything else).
                 let cur_w = self.stats_grid.0 as f32;
                 let f = cur_w / (scene.ref_width.max(1) as f32);
+                let mut probes = scene.probes;
+                probes.retain(|p| p.pos[0].is_finite() && p.pos[1].is_finite());
+                probes.truncate(crate::sim::MAX_PROBES);
                 if (f - 1.0).abs() > 1e-3 {
                     for o in &mut objects {
                         o.rescale_all(f);
                     }
+                    for p in &mut probes {
+                        p.pos[0] *= f;
+                        p.pos[1] *= f;
+                    }
                 }
                 self.model.replace_all(objects);
+                self.entered_group = None;
+                cmds.push(Cmd::LoadProbes {
+                    probes: probes.iter().map(|p| (p.id, p.pos)).collect(),
+                    quantity: crate::sim::ProbeQuantity::ALL
+                        [scene.probe_quantity.min(3) as usize],
+                    show_plot: scene.probe_show_plot && !probes.is_empty(),
+                });
                 self.domain_width_m = sane_f32(scene.domain_width_m, 0.01, 10_000.0, 1.0);
                 self.fluid_nu = sane_f32(scene.fluid_nu, 1e-9, 1.0, 1.5e-5);
                 self.fluid_rho = sane_f32(scene.fluid_rho, 1e-3, 1e5, 1.2);
@@ -1882,6 +2424,44 @@ fn object_is_sane(o: &SketchObject) -> bool {
                 && (1e-3..=1e3).contains(scale)
                 && angle.is_finite()
         }
+        Shape::Group { t, rot, scale } => {
+            finite2(t) && rot.is_finite() && (1e-3..=1e3).contains(scale)
+        }
+    }
+}
+
+/// Repair the parent links of a loaded object set: a dangling parent, a
+/// parent that is not a group, or a parent CYCLE (a crafted file can
+/// write one; the live model can't — reparent refuses them) resolves to
+/// the root rather than poisoning every ancestor walk.
+fn sanitize_parents(objects: &mut [SketchObject]) {
+    use std::collections::HashMap;
+    let groups: HashMap<u64, usize> = objects
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| matches!(o.shape, Shape::Group { .. }))
+        .map(|(i, o)| (o.id, i))
+        .collect();
+    for i in 0..objects.len() {
+        if let Some(p) = objects[i].parent {
+            if !groups.contains_key(&p) || p == objects[i].id {
+                objects[i].parent = None;
+            }
+        }
+    }
+    // Break cycles: walk each chain with a visited set; on revisiting a
+    // node, detach the walk's starting object.
+    for i in 0..objects.len() {
+        let mut seen = vec![objects[i].id];
+        let mut cur = objects[i].parent;
+        while let Some(pid) = cur {
+            if seen.contains(&pid) {
+                objects[i].parent = None;
+                break;
+            }
+            seen.push(pid);
+            cur = groups.get(&pid).and_then(|&pi| objects[pi].parent);
+        }
     }
 }
 
@@ -1930,16 +2510,18 @@ mod scene_tests {
         let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         assert_eq!(version, SCENE_V5);
         let back = bincode::deserialize::<SceneV4>(&bytes).unwrap();
-        let obj: SketchObject = back.objects.into_iter().next().unwrap().into();
+        let v7: SketchObjectV7 = back.objects.into_iter().next().unwrap().into();
+        let obj: SketchObject = v7.into();
         assert_eq!(obj.id, 7);
         assert!(!obj.locked && !obj.hidden);
+        assert_eq!(obj.parent, None);
         assert_eq!(obj.fan_mult, 1.5);
     }
 
     /// v6 round-trips lock/hide, and its version peek reads 6.
     #[test]
     fn v6_roundtrip_persists_lock_hide() {
-        let mut obj: SketchObject = v5_obj(3).into();
+        let mut obj: SketchObjectV7 = v5_obj(3).into();
         obj.locked = true;
         obj.hidden = true;
         let scene = SceneV6 {
@@ -2025,5 +2607,132 @@ mod scene_tests {
         assert_eq!(back.ranges[RenderMode::Speed as usize].map, 0);
         assert_eq!(back.ranges[RenderMode::Vorticity as usize].map, 1);
         assert_eq!(back.ranges[RenderMode::Pressure as usize].map, 1);
+    }
+
+    /// A v7 file (written by the track-merge code) converts to v8 with
+    /// root-only objects and an empty probe set.
+    #[test]
+    fn v7_bytes_convert_to_v8_rootonly_no_probes() {
+        let scene = SceneV7 {
+            version: SCENE_V7,
+            objects: vec![v5_obj(11).into()],
+            wind_tunnel: true,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 0,
+            mach: 1.6,
+            fluid_a: 343.0,
+            ranges: crate::sim::FIELD_RANGE_DEFAULTS.map(SceneRange::from),
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        let back = SceneV8::from_v7(bincode::deserialize::<SceneV7>(&bytes).unwrap());
+        assert_eq!(back.objects[0].parent, None);
+        assert!(back.probes.is_empty());
+        assert!(!back.probe_show_plot);
+    }
+
+    /// v8 round-trips the U3 payload: a Group node, a parent link, and
+    /// the probe set with the plot preferences.
+    #[test]
+    fn v8_roundtrip_persists_groups_and_probes() {
+        let group = SketchObject {
+            id: 20,
+            shape: Shape::Group { t: [3.0, 4.0], rot: 0.5, scale: 2.0 },
+            material: ObjMaterial::Wall,
+            thickness: 1.0,
+            filled: false,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: None,
+        };
+        let mut child: SketchObject = SketchObjectV7::from(v5_obj(21)).into();
+        child.parent = Some(20);
+        let scene = SceneV8 {
+            version: SCENE_V8,
+            objects: vec![child, group],
+            wind_tunnel: true,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 1,
+            mach: 1.6,
+            fluid_a: 343.0,
+            ranges: crate::sim::FIELD_RANGE_DEFAULTS.map(SceneRange::from),
+            probes: vec![SceneProbe { id: 3, pos: [120.0, 240.0] }],
+            probe_quantity: 2,
+            probe_show_plot: true,
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(version, SCENE_V8);
+        let back = bincode::deserialize::<SceneV8>(&bytes).unwrap();
+        assert_eq!(back.objects[0].parent, Some(20));
+        assert!(matches!(
+            back.objects[1].shape,
+            Shape::Group { t: [3.0, 4.0], rot, scale } if rot == 0.5 && scale == 2.0
+        ));
+        assert_eq!(back.probes.len(), 1);
+        assert_eq!(back.probes[0].pos, [120.0, 240.0]);
+        assert_eq!(back.probe_quantity, 2);
+        assert!(back.probe_show_plot);
+    }
+
+    /// Loader repair: a crafted file with a parent cycle or a dangling
+    /// parent gets detached to the root instead of poisoning every
+    /// ancestor walk.
+    #[test]
+    fn sanitize_parents_breaks_cycles_and_dangles() {
+        let g = |id: u64, parent: Option<u64>| SketchObject {
+            id,
+            shape: Shape::Group { t: [0.0, 0.0], rot: 0.0, scale: 1.0 },
+            material: ObjMaterial::Wall,
+            thickness: 1.0,
+            filled: false,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent,
+        };
+        // 1 → 2 → 1 is a cycle; 3 dangles; 4 parents a non-group leaf.
+        let mut leaf: SketchObject = SketchObjectV7::from(v5_obj(5)).into();
+        leaf.parent = Some(99); // dangling
+        let mut leaf2: SketchObject = SketchObjectV7::from(v5_obj(6)).into();
+        leaf2.parent = Some(5); // a leaf, not a group
+        let mut objects = vec![g(1, Some(2)), g(2, Some(1)), g(3, Some(42)), leaf, leaf2];
+        sanitize_parents(&mut objects);
+        // The cycle is broken (at least one of the pair detached) …
+        let p1 = objects[0].parent;
+        let p2 = objects[1].parent;
+        assert!(p1.is_none() || p2.is_none());
+        // … and every remaining chain terminates.
+        for o in &objects {
+            let mut cur = o.parent;
+            let mut hops = 0;
+            while let Some(p) = cur {
+                cur = objects.iter().find(|x| x.id == p).and_then(|x| x.parent);
+                hops += 1;
+                assert!(hops < 16, "unterminated chain from #{}", o.id);
+            }
+        }
+        assert_eq!(objects[2].parent, None); // dangling cleared
+        assert_eq!(objects[4].parent, None); // non-group parent cleared
     }
 }

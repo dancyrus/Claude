@@ -31,7 +31,66 @@ impl ObjMaterial {
     }
 }
 
-/// Shape geometry, in visible-canvas cells.
+/// A similarity transform: translate + rotate + UNIFORM scale — the
+/// only transform family that composes through nested groups without
+/// producing shear the shape set cannot represent (a rotated Rect has
+/// no shear parameter). Maps a group's local space into its parent's
+/// space. Transform COMPOSITION ORDER (see CLAUDE.md): an object's own
+/// stored geometry/transform applies first, then each ancestor outward
+/// — world = T_root ∘ … ∘ T_parent (stored).
+#[derive(Clone, Copy, PartialEq)]
+pub struct Sim2 {
+    pub t: [f32; 2],
+    pub rot: f32,
+    pub s: f32,
+}
+
+impl Sim2 {
+    pub const IDENTITY: Sim2 = Sim2 { t: [0.0, 0.0], rot: 0.0, s: 1.0 };
+
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    pub fn apply(&self, p: [f32; 2]) -> [f32; 2] {
+        let v = self.apply_vec(p);
+        [self.t[0] + v[0], self.t[1] + v[1]]
+    }
+
+    /// Rotate+scale only — for direction/delta vectors.
+    pub fn apply_vec(&self, v: [f32; 2]) -> [f32; 2] {
+        let (sn, cs) = self.rot.sin_cos();
+        [
+            (v[0] * cs - v[1] * sn) * self.s,
+            (v[0] * sn + v[1] * cs) * self.s,
+        ]
+    }
+
+    /// `self ∘ other`: apply `other` first, then `self`.
+    pub fn compose(&self, other: Sim2) -> Sim2 {
+        Sim2 {
+            t: self.apply(other.t),
+            rot: self.rot + other.rot,
+            s: self.s * other.s,
+        }
+    }
+
+    pub fn inverse(&self) -> Sim2 {
+        let s = 1.0 / self.s.max(1e-9);
+        let (sn, cs) = (-self.rot).sin_cos();
+        Sim2 {
+            t: [
+                -(self.t[0] * cs - self.t[1] * sn) * s,
+                -(self.t[0] * sn + self.t[1] * cs) * s,
+            ],
+            rot: -self.rot,
+            s,
+        }
+    }
+}
+
+/// Shape geometry, in visible-canvas cells (an object's coordinates are
+/// expressed in its PARENT's space — world when `parent` is None).
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum Shape {
     /// Straight segment.
@@ -43,7 +102,24 @@ pub enum Shape {
     /// Rotatable ellipse: centre, radii, angle (radians).
     Ellipse { c: [f32; 2], r: [f32; 2], angle: f32 },
     /// Raster payload (generator output), with its own transform.
+    /// `scale` is deliberately a single f32: non-uniform scaling of a
+    /// raster stamp is out of scope (the inspector's tooltip says so).
     Stamp { raster: GeoRegion, c: [f32; 2], scale: f32, angle: f32 },
+    /// A group node (U3): no geometry of its own, just the similarity
+    /// transform mapping its local space into its parent's space.
+    /// Children reference it via `SketchObject::parent`. NOTE: appended
+    /// last so bincode variant indices of older scene files hold.
+    Group { t: [f32; 2], rot: f32, scale: f32 },
+}
+
+impl Shape {
+    /// A group's transform as a `Sim2` (identity for non-groups).
+    pub fn group_sim(&self) -> Sim2 {
+        match self {
+            Shape::Group { t, rot, scale } => Sim2 { t: *t, rot: *rot, s: *scale },
+            _ => Sim2::IDENTITY,
+        }
+    }
 }
 
 /// One sketch object: shape + physical properties.
@@ -66,20 +142,39 @@ pub struct SketchObject {
     /// Smoke color (used when material == Smoke, and for fan smoke).
     pub smoke_rgb: [f32; 3],
     /// Not click-selectable and not editable (tree-managed; persists).
+    /// Effective state includes ancestors — see `SketchModel::eff_locked`.
     pub locked: bool,
     /// Not rasterized and not click-selectable (tree-managed; persists).
+    /// Effective state includes ancestors — see `SketchModel::eff_hidden`.
     pub hidden: bool,
+    /// Enclosing group id (U3, scene v8+). None = a root object whose
+    /// coordinates are world coordinates. NOTE: appended last so bincode
+    /// stays positional-compatible via the SketchObjectV7 mirror.
+    pub parent: Option<u64>,
 }
 
 impl SketchObject {
     /// Axis-aligned bounds in visible cells, including thickness.
+    /// Stored (parent-space) coordinates; for the world footprint of an
+    /// object inside groups use `bounds_under(parent_abs)`.
     pub fn bounds(&self) -> GridRect {
-        let pad = (self.thickness * 0.5 + 2.0).ceil();
+        self.bounds_under(Sim2::IDENTITY)
+    }
+
+    /// Bounds under an outer similarity `m` (the ancestor composition),
+    /// computed on the transformed parameters so rotated shapes keep a
+    /// tight AABB — no raster clone for stamps.
+    pub fn bounds_under(&self, m: Sim2) -> GridRect {
+        let pad = (self.thickness * m.s * 0.5 + 2.0).ceil();
         let (min, max) = match &self.shape {
-            Shape::Line { a, b } => (
-                [a[0].min(b[0]), a[1].min(b[1])],
-                [a[0].max(b[0]), a[1].max(b[1])],
-            ),
+            Shape::Line { a, b } => {
+                let a = m.apply(*a);
+                let b = m.apply(*b);
+                (
+                    [a[0].min(b[0]), a[1].min(b[1])],
+                    [a[0].max(b[0]), a[1].max(b[1])],
+                )
+            }
             Shape::Poly { pts, .. } => {
                 // A zero-point poly (corrupt file) must yield an empty
                 // rect, not a fold over f32::MAX that overflows the casts.
@@ -89,6 +184,7 @@ impl SketchObject {
                 let mut min = [f32::MAX, f32::MAX];
                 let mut max = [f32::MIN, f32::MIN];
                 for p in pts {
+                    let p = m.apply(*p);
                     min[0] = min[0].min(p[0]);
                     min[1] = min[1].min(p[1]);
                     max[0] = max[0].max(p[0]);
@@ -97,20 +193,26 @@ impl SketchObject {
                 (min, max)
             }
             Shape::Rect { c, half, angle } | Shape::Ellipse { c, r: half, angle } => {
-                let (s, co) = angle.sin_cos();
+                let c = m.apply(*c);
+                let (s, co) = (angle + m.rot).sin_cos();
+                let half = [half[0] * m.s, half[1] * m.s];
                 let ex = (half[0] * co).abs() + (half[1] * s).abs();
                 let ey = (half[0] * s).abs() + (half[1] * co).abs();
                 ([c[0] - ex, c[1] - ey], [c[0] + ex, c[1] + ey])
             }
             Shape::Stamp { raster, c, scale, angle } => {
+                let c = m.apply(*c);
                 let (w, h) = raster_dims(raster);
-                let hx = w as f32 * 0.5 * scale;
-                let hy = h as f32 * 0.5 * scale;
-                let (s, co) = angle.sin_cos();
+                let hx = w as f32 * 0.5 * scale * m.s;
+                let hy = h as f32 * 0.5 * scale * m.s;
+                let (s, co) = (angle + m.rot).sin_cos();
                 let ex = (hx * co).abs() + (hy * s).abs();
                 let ey = (hx * s).abs() + (hy * co).abs();
                 ([c[0] - ex, c[1] - ey], [c[0] + ex, c[1] + ey])
             }
+            // A group has no geometry; its world footprint is the
+            // subtree's (SketchModel::world_bounds).
+            Shape::Group { .. } => return GridRect { x0: 0, y0: 0, x1: 0, y1: 0 },
         };
         GridRect {
             x0: (min[0] - pad) as i32,
@@ -120,7 +222,8 @@ impl SketchObject {
         }
     }
 
-    /// Object centre (translation origin, rotation pivot).
+    /// Object centre in STORED (parent-space) coordinates (translation
+    /// origin, default rotation pivot).
     pub fn center(&self) -> [f32; 2] {
         match &self.shape {
             Shape::Line { a, b } => [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5],
@@ -136,6 +239,7 @@ impl SketchObject {
                 [c[0] / pts.len() as f32, c[1] / pts.len() as f32]
             }
             Shape::Rect { c, .. } | Shape::Ellipse { c, .. } | Shape::Stamp { c, .. } => *c,
+            Shape::Group { t, .. } => *t,
         }
     }
 
@@ -157,18 +261,28 @@ impl SketchObject {
                 c[0] += d[0];
                 c[1] += d[1];
             }
+            Shape::Group { t, .. } => {
+                t[0] += d[0];
+                t[1] += d[1];
+            }
         }
     }
 
     /// Rotate by `da` radians about the centre (baked for point shapes).
     pub fn rotate_by(&mut self, da: f32) {
-        let ctr = self.center();
+        self.rotate_about(self.center(), da);
+    }
+
+    /// Rotate by `da` radians about an arbitrary pivot (stored/parent
+    /// space). Groups fold it into their transform — O(1), the subtree
+    /// follows through composition.
+    pub fn rotate_about(&mut self, pivot: [f32; 2], da: f32) {
         let (s, co) = da.sin_cos();
         let rot = |p: &mut [f32; 2]| {
-            let dx = p[0] - ctr[0];
-            let dy = p[1] - ctr[1];
-            p[0] = ctr[0] + dx * co - dy * s;
-            p[1] = ctr[1] + dx * s + dy * co;
+            let dx = p[0] - pivot[0];
+            let dy = p[1] - pivot[1];
+            p[0] = pivot[0] + dx * co - dy * s;
+            p[1] = pivot[1] + dx * s + dy * co;
         };
         match &mut self.shape {
             Shape::Line { a, b } => {
@@ -180,9 +294,16 @@ impl SketchObject {
                     rot(p);
                 }
             }
-            Shape::Rect { angle, .. }
-            | Shape::Ellipse { angle, .. }
-            | Shape::Stamp { angle, .. } => *angle += da,
+            Shape::Rect { c, angle, .. }
+            | Shape::Ellipse { c, angle, .. }
+            | Shape::Stamp { c, angle, .. } => {
+                rot(c);
+                *angle += da;
+            }
+            Shape::Group { t, rot: g_rot, .. } => {
+                rot(t);
+                *g_rot += da;
+            }
         }
         self.fan_angle += da;
     }
@@ -202,13 +323,20 @@ impl SketchObject {
             .map(|(_, d)| [d[0], d[1], d[2]])
     }
 
-    /// Scale about the centre.
+    /// Scale about the centre (uniform).
     pub fn scale_by(&mut self, f: f32) {
+        self.scale_about(self.center(), f);
+    }
+
+    /// Uniform scale about an arbitrary pivot (stored/parent space).
+    /// Like `scale_by`, outline thickness is deliberately NOT scaled for
+    /// leaf shapes; a group's transform scale does thin its subtree's
+    /// strokes, because composition applies to everything inside.
+    pub fn scale_about(&mut self, pivot: [f32; 2], f: f32) {
         let f = f.clamp(0.05, 50.0);
-        let ctr = self.center();
         let sc = |p: &mut [f32; 2]| {
-            p[0] = ctr[0] + (p[0] - ctr[0]) * f;
-            p[1] = ctr[1] + (p[1] - ctr[1]) * f;
+            p[0] = pivot[0] + (p[0] - pivot[0]) * f;
+            p[1] = pivot[1] + (p[1] - pivot[1]) * f;
         };
         match &mut self.shape {
             Shape::Line { a, b } => {
@@ -220,12 +348,67 @@ impl SketchObject {
                     sc(p);
                 }
             }
-            Shape::Rect { half, .. } | Shape::Ellipse { r: half, .. } => {
+            Shape::Rect { c, half, .. } | Shape::Ellipse { c, r: half, .. } => {
+                sc(c);
                 half[0] *= f;
                 half[1] *= f;
             }
-            Shape::Stamp { scale, .. } => *scale *= f,
+            Shape::Stamp { c, scale, .. } => {
+                sc(c);
+                *scale *= f;
+            }
+            Shape::Group { t, scale, .. } => {
+                sc(t);
+                *scale = (*scale * f).clamp(1e-3, 1e3);
+            }
         }
+    }
+
+    /// Bake an outer similarity into the stored geometry (flattening an
+    /// object out of its group chain, or re-expressing it into another
+    /// parent space). Unlike the interactive scale ops this DOES scale
+    /// thickness — it converts between coordinate spaces, so everything
+    /// world-visible must map.
+    pub fn apply_sim(&mut self, m: Sim2) {
+        if m.is_identity() {
+            return;
+        }
+        match &mut self.shape {
+            Shape::Line { a, b } => {
+                *a = m.apply(*a);
+                *b = m.apply(*b);
+            }
+            Shape::Poly { pts, .. } => {
+                for p in pts {
+                    *p = m.apply(*p);
+                }
+            }
+            Shape::Rect { c, half, angle } | Shape::Ellipse { c, r: half, angle } => {
+                *c = m.apply(*c);
+                *angle += m.rot;
+                half[0] *= m.s;
+                half[1] *= m.s;
+            }
+            Shape::Stamp { c, scale, angle, .. } => {
+                *c = m.apply(*c);
+                *angle += m.rot;
+                *scale *= m.s;
+            }
+            Shape::Group { t, rot, scale } => {
+                *t = m.apply(*t);
+                *rot += m.rot;
+                *scale *= m.s;
+            }
+        }
+        self.thickness *= m.s;
+        self.fan_angle += m.rot;
+    }
+
+    /// Re-express the stored geometry from one parent space into
+    /// another so the world-space result is unchanged (reparenting,
+    /// grouping, ungrouping).
+    pub fn reexpress(&mut self, old_abs: Sim2, new_abs: Sim2) {
+        self.apply_sim(new_abs.inverse().compose(old_abs));
     }
 
     /// Uniformly rescale everything (resolution switches).
@@ -258,6 +441,11 @@ impl SketchObject {
                 sc(c);
                 *scale *= f;
             }
+            // A group's rotation and scale are ratios; only its
+            // translation is a length. Child coordinates rescale in
+            // their own objects, so the composed world result scales
+            // uniformly as intended.
+            Shape::Group { t, .. } => sc(t),
         }
         self.thickness *= f;
     }
@@ -311,7 +499,21 @@ impl SketchObject {
                 let i = (sy as usize) * w + sx as usize;
                 raster.cell[i] != CELL_FLUID || raster.dye_src[i][3] > 0.0
             }
+            // Groups are picked through their members (the model's
+            // hit_test maps a member hit to its outermost group).
+            Shape::Group { .. } => false,
         }
+    }
+
+    /// Hit test with the query point given in WORLD coordinates and the
+    /// ancestor composition `m`: the point maps into stored space, the
+    /// slop divides by the composed scale (thickness compares happen in
+    /// stored units).
+    pub fn hit_under(&self, p: [f32; 2], slop: f32, m: Sim2) -> bool {
+        if m.is_identity() {
+            return self.hit(p, slop);
+        }
+        self.hit(m.inverse().apply(p), slop / m.s.max(1e-9))
     }
 
     /// Editable handles (visible cells).
@@ -330,7 +532,8 @@ impl SketchObject {
                     })
                     .collect()
             }
-            Shape::Stamp { .. } => Vec::new(), // move/rotate/scale via panel
+            // Stamps and groups: move/rotate/scale via panel or gizmo.
+            Shape::Stamp { .. } | Shape::Group { .. } => Vec::new(),
         }
     }
 
@@ -375,7 +578,7 @@ impl SketchObject {
                 ];
                 *half = new_half;
             }
-            Shape::Stamp { .. } => {}
+            Shape::Stamp { .. } | Shape::Group { .. } => {}
         }
     }
 
@@ -384,6 +587,10 @@ impl SketchObject {
     /// (visible cells) or either wholly contains the other. Thin open
     /// geometry dominates FlowPaint scenes, so touching the band selects.
     pub fn intersects_rect(&self, min: [f32; 2], max: [f32; 2]) -> bool {
+        if matches!(self.shape, Shape::Group { .. }) {
+            // Groups band-select through their members (app-level walk).
+            return false;
+        }
         let seg_hits = |a: [f32; 2], b: [f32; 2]| seg_intersects_aabb(a, b, min, max);
         let outline_hits = match &self.shape {
             Shape::Line { a, b } => seg_hits(*a, *b),
@@ -410,6 +617,7 @@ impl SketchObject {
                 };
                 (0..n).any(|i| seg_hits(pt(i), pt((i + 1) % n)))
             }
+            Shape::Group { .. } => false, // early-returned above
         };
         // Containment fallbacks: band inside a filled shape, or shape
         // centre inside a band larger than the outline sampling caught.
@@ -564,18 +772,242 @@ impl SketchModel {
         self.objects.iter().position(|o| o.id == id)
     }
 
-    /// Topmost click-selectable object hit at `p` (locked and hidden
-    /// objects are skipped — they are tree-managed).
+    // --- Nested groups (U3) -------------------------------------------
+    // An object's stored coordinates live in its parent group's space.
+    // TRANSFORM COMPOSITION ORDER (fixed once, see CLAUDE.md): the
+    // child's own transform applies first, then each ancestor outward:
+    // world = T_root ∘ … ∘ T_parent (stored). Every walk below is
+    // hop-capped so a corrupt file's parent cycle cannot hang the app
+    // (loads also break cycles outright — see load_scene).
+
+    const MAX_DEPTH: usize = 256;
+
+    /// The composed ancestor transform of `id`: stored (parent-space)
+    /// coordinates → world coordinates. Identity for root objects.
+    pub fn parent_abs(&self, id: u64) -> Sim2 {
+        let Some(i) = self.find(id) else { return Sim2::IDENTITY };
+        self.abs_of(self.objects[i].parent)
+    }
+
+    /// The composed transform of a group chain starting at `parent`
+    /// (that group's local space → world).
+    pub fn abs_of(&self, parent: Option<u64>) -> Sim2 {
+        let mut acc = Sim2::IDENTITY;
+        let mut cur = parent;
+        for _ in 0..Self::MAX_DEPTH {
+            let Some(pid) = cur else { return acc };
+            let Some(pi) = self.find(pid) else { return acc };
+            // Walking inward→outward while left-composing yields
+            // T_outer ∘ … ∘ T_inner — child first, ancestors outward.
+            acc = self.objects[pi].shape.group_sim().compose(acc);
+            cur = self.objects[pi].parent;
+        }
+        acc
+    }
+
+    /// True when `id` sits somewhere below `ancestor` in the tree.
+    pub fn is_descendant(&self, id: u64, ancestor: u64) -> bool {
+        let Some(mut i) = self.find(id) else { return false };
+        for _ in 0..Self::MAX_DEPTH {
+            match self.objects[i].parent {
+                Some(p) if p == ancestor => return true,
+                Some(p) => match self.find(p) {
+                    Some(pi) => i = pi,
+                    None => return false,
+                },
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Nesting depth: 0 for roots, 1 for direct group members, …
+    pub fn depth(&self, id: u64) -> usize {
+        let Some(mut i) = self.find(id) else { return 0 };
+        let mut d = 0;
+        for _ in 0..Self::MAX_DEPTH {
+            match self.objects[i].parent.and_then(|p| self.find(p)) {
+                Some(pi) => {
+                    d += 1;
+                    i = pi;
+                }
+                None => return d,
+            }
+        }
+        d
+    }
+
+    /// Direct children of a group, in model (z) order.
+    pub fn children_of(&self, id: u64) -> Vec<u64> {
+        self.objects
+            .iter()
+            .filter(|o| o.parent == Some(id))
+            .map(|o| o.id)
+            .collect()
+    }
+
+    /// `id` plus every descendant, in model (z) order.
+    pub fn subtree_ids(&self, id: u64) -> Vec<u64> {
+        self.objects
+            .iter()
+            .filter(|o| o.id == id || self.is_descendant(o.id, id))
+            .map(|o| o.id)
+            .collect()
+    }
+
+    /// Effective hidden state: the object's own flag or any ancestor's.
+    pub fn eff_hidden(&self, id: u64) -> bool {
+        self.eff_flag(id, |o| o.hidden)
+    }
+
+    /// Effective locked state: the object's own flag or any ancestor's.
+    pub fn eff_locked(&self, id: u64) -> bool {
+        self.eff_flag(id, |o| o.locked)
+    }
+
+    fn eff_flag(&self, id: u64, f: impl Fn(&SketchObject) -> bool) -> bool {
+        let Some(mut i) = self.find(id) else { return false };
+        for _ in 0..Self::MAX_DEPTH {
+            if f(&self.objects[i]) {
+                return true;
+            }
+            match self.objects[i].parent.and_then(|p| self.find(p)) {
+                Some(pi) => i = pi,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// World-space AABB of an object — a leaf's transformed bounds, a
+    /// group's subtree union. None for an empty group.
+    pub fn world_bounds(&self, id: u64) -> Option<GridRect> {
+        let i = self.find(id)?;
+        if matches!(self.objects[i].shape, Shape::Group { .. }) {
+            let mut acc: Option<GridRect> = None;
+            for sid in self.subtree_ids(id) {
+                let si = self.find(sid)?;
+                if matches!(self.objects[si].shape, Shape::Group { .. }) {
+                    continue;
+                }
+                let b = self.objects[si].bounds_under(self.parent_abs(sid));
+                acc = Some(match acc {
+                    Some(u) => u.union(b),
+                    None => b,
+                });
+            }
+            acc
+        } else {
+            Some(self.objects[i].bounds_under(self.parent_abs(id)))
+        }
+    }
+
+    /// Object centre in WORLD coordinates. (Exercised by the U3
+    /// composition tests; panels compute it from their staged copy.)
+    #[allow(dead_code)]
+    pub fn world_center(&self, id: u64) -> Option<[f32; 2]> {
+        let i = self.find(id)?;
+        Some(self.parent_abs(id).apply(self.objects[i].center()))
+    }
+
+    /// Damage-mark an object's WORLD footprint (stored bounds are
+    /// parent-space, so ancestor transforms apply first). Falls back to
+    /// a full-grid mark when the world footprint can't be resolved.
+    pub fn mark_world_dirty(&mut self, id: u64) {
+        let Some(i) = self.find(id) else { return };
+        let b = if matches!(self.objects[i].shape, Shape::Group { .. }) {
+            self.world_bounds(id)
+        } else {
+            Some(self.objects[i].bounds_under(self.parent_abs(id)))
+        };
+        match b {
+            Some(b) => self.mark_dirty(b),
+            None => {} // empty group: nothing rasterized, nothing dirty
+        }
+    }
+
+    /// World-footprint damage for an object VALUE that may no longer be
+    /// (or not yet be) in the list (undo/redo replay): resolve its
+    /// ancestor chain against the current list; a broken chain marks
+    /// the whole grid — correctness over precision during replays.
+    fn mark_value_world_dirty(&mut self, o: &SketchObject) {
+        if matches!(o.shape, Shape::Group { .. }) {
+            // Its subtree members mark themselves in the same replay
+            // batch; a group node alone has no raster footprint.
+            return;
+        }
+        let mut acc = Sim2::IDENTITY;
+        let mut cur = o.parent;
+        for _ in 0..Self::MAX_DEPTH {
+            let Some(pid) = cur else {
+                let b = o.bounds_under(acc);
+                self.mark_dirty(b);
+                return;
+            };
+            match self.find(pid) {
+                Some(pi) => {
+                    acc = self.objects[pi].shape.group_sim().compose(acc);
+                    cur = self.objects[pi].parent;
+                }
+                None => break, // chain broken mid-replay: be conservative
+            }
+        }
+        self.mark_all_dirty();
+    }
+
+    /// Translate by a WORLD delta, converted into the object's stored
+    /// space. No undo record (gesture-live semantics); marks damage.
+    pub fn translate_world(&mut self, id: u64, d: [f32; 2]) {
+        let dl = self.parent_abs(id).inverse().apply_vec(d);
+        self.mark_world_dirty(id);
+        if let Some(i) = self.find(id) {
+            self.objects[i].translate(dl);
+        }
+        self.mark_world_dirty(id);
+    }
+
+    /// Rotate by `da` about a WORLD pivot. A similarity conjugates a
+    /// rotation to a rotation of the same angle, so the stored-space
+    /// rotation is also `da`, about the mapped pivot. Marks damage; no
+    /// undo record.
+    pub fn rotate_world(&mut self, id: u64, pivot_world: [f32; 2], da: f32) {
+        let pivot = self.parent_abs(id).inverse().apply(pivot_world);
+        self.mark_world_dirty(id);
+        if let Some(i) = self.find(id) {
+            self.objects[i].rotate_about(pivot, da);
+        }
+        self.mark_world_dirty(id);
+    }
+
+    /// Uniform scale by `f` about a WORLD pivot (same conjugation
+    /// argument as `rotate_world`). Marks damage; no undo record.
+    pub fn scale_world(&mut self, id: u64, pivot_world: [f32; 2], f: f32) {
+        let pivot = self.parent_abs(id).inverse().apply(pivot_world);
+        self.mark_world_dirty(id);
+        if let Some(i) = self.find(id) {
+            self.objects[i].scale_about(pivot, f);
+        }
+        self.mark_world_dirty(id);
+    }
+
+    /// Topmost click-selectable object hit at `p` (world cells). Locked
+    /// and hidden subtrees are skipped — they are tree-managed. Returns
+    /// the LEAF id; the app maps it to a group scope for selection.
     pub fn hit_test(&self, p: [f32; 2], slop: f32) -> Option<u64> {
         self.objects
             .iter()
             .rev()
-            .find(|o| !o.locked && !o.hidden && o.hit(p, slop))
+            .find(|o| {
+                !matches!(o.shape, Shape::Group { .. })
+                    && !self.eff_locked(o.id)
+                    && !self.eff_hidden(o.id)
+                    && o.hit_under(p, slop, self.parent_abs(o.id))
+            })
             .map(|o| o.id)
     }
 
     pub fn add(&mut self, obj: SketchObject) {
-        self.mark_dirty(obj.bounds());
+        self.mark_value_world_dirty(&obj);
         self.undo.push(ModelOp::Add(obj.clone()));
         self.redo.clear();
         self.objects.push(obj);
@@ -588,7 +1020,7 @@ impl SketchModel {
         }
         let mut ops = Vec::with_capacity(objs.len());
         for obj in objs {
-            self.mark_dirty(obj.bounds());
+            self.mark_value_world_dirty(&obj);
             ops.push(ModelOp::Add(obj.clone()));
             self.objects.push(obj);
         }
@@ -603,8 +1035,10 @@ impl SketchModel {
         let mut ops = Vec::new();
         for &id in ids {
             if let Some(i) = self.find(id) {
+                // Mark while the ancestor chain is still intact, then
+                // remove (a subtree delete removes parents too).
+                self.mark_world_dirty(id);
                 let obj = self.objects.remove(i);
-                self.mark_dirty(obj.bounds());
                 ops.push(ModelOp::Remove(i, obj));
             }
         }
@@ -623,7 +1057,8 @@ impl SketchModel {
                 return;
             }
             let after = self.objects[i].clone();
-            self.mark_dirty(before.bounds().union(after.bounds()));
+            self.mark_value_world_dirty(&before);
+            self.mark_world_dirty(id);
             self.undo.push(ModelOp::Modify { i, before, after, coalesce: false });
             self.redo.clear();
         }
@@ -640,7 +1075,8 @@ impl SketchModel {
             return;
         }
         let after = self.objects[i].clone();
-        self.mark_dirty(before.bounds().union(after.bounds()));
+        self.mark_value_world_dirty(&before);
+        self.mark_world_dirty(id);
         self.redo.clear();
         if let Some(ModelOp::Modify { i: j, after: top_after, coalesce: true, .. }) =
             self.undo.last_mut()
@@ -717,7 +1153,8 @@ impl SketchModel {
                     continue;
                 }
                 let after = self.objects[i].clone();
-                self.mark_dirty(before.bounds().union(after.bounds()));
+                self.mark_value_world_dirty(before);
+                self.mark_world_dirty(*id);
                 ops.push(ModelOp::Modify {
                     i,
                     before: before.clone(),
@@ -763,21 +1200,154 @@ impl SketchModel {
         if new.len() != self.objects.len() {
             return false;
         }
-        for (i, o) in new.iter().enumerate() {
-            if self.objects[i].id != o.id {
-                self.mark_dirty(o.bounds());
+        let moved: Vec<u64> = new
+            .iter()
+            .enumerate()
+            .filter(|(i, o)| self.objects[*i].id != o.id)
+            .map(|(_, o)| o.id)
+            .collect();
+        self.objects = new;
+        for id in moved {
+            self.mark_world_dirty(id);
+        }
+        true
+    }
+
+    // --- Group / ungroup / reparent (U3): one undo entry each ---------
+
+    /// Group the given objects under a fresh Group node — ONE undo
+    /// entry; returns the new group's id. Callers pass OUTERMOST ids
+    /// only (no id may be a descendant of another). The group's parent
+    /// is the members' common parent when they agree, else the root;
+    /// members changing parent space are re-expressed so nothing moves
+    /// on screen.
+    pub fn group_objects(&mut self, ids: &[u64]) -> Option<u64> {
+        let ids: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|&id| self.find(id).is_some())
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        let first_parent = self.objects[self.find(ids[0])?].parent;
+        let common = if ids
+            .iter()
+            .all(|&id| self.objects[self.find(id).unwrap()].parent == first_parent)
+        {
+            first_parent
+        } else {
+            None
+        };
+        let gid = self.fresh_id();
+        let group = SketchObject {
+            id: gid,
+            // Identity transform: the group's space IS its parent's, so
+            // members already under `common` keep their coordinates.
+            shape: Shape::Group { t: [0.0, 0.0], rot: 0.0, scale: 1.0 },
+            material: ObjMaterial::Wall,
+            thickness: 1.0,
+            filled: false,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: common,
+        };
+        let mut ops = Vec::with_capacity(ids.len() + 1);
+        self.objects.push(group.clone());
+        ops.push(ModelOp::Add(group));
+        for &id in &ids {
+            let i = self.find(id).unwrap();
+            let before = self.objects[i].clone();
+            let old_abs = self.parent_abs(id);
+            self.objects[i].parent = Some(gid);
+            let new_abs = self.parent_abs(id);
+            self.objects[i].reexpress(old_abs, new_abs);
+            let after = self.objects[i].clone();
+            // World geometry is unchanged by construction: no damage.
+            ops.push(ModelOp::Modify { i, before, after, coalesce: false });
+        }
+        self.undo.push(ModelOp::Group { ops, coalesce: false });
+        self.redo.clear();
+        Some(gid)
+    }
+
+    /// Dissolve a group: its direct children move to its parent (world
+    /// geometry unchanged), the node itself is removed — ONE undo entry.
+    pub fn ungroup(&mut self, gid: u64) -> bool {
+        let Some(gi) = self.find(gid) else { return false };
+        if !matches!(self.objects[gi].shape, Shape::Group { .. }) {
+            return false;
+        }
+        let gparent = self.objects[gi].parent;
+        let mut ops = Vec::new();
+        for id in self.children_of(gid) {
+            let i = self.find(id).unwrap();
+            let before = self.objects[i].clone();
+            let old_abs = self.parent_abs(id);
+            self.objects[i].parent = gparent;
+            let new_abs = self.parent_abs(id);
+            self.objects[i].reexpress(old_abs, new_abs);
+            let after = self.objects[i].clone();
+            ops.push(ModelOp::Modify { i, before, after, coalesce: false });
+        }
+        // Remove the node last: the member Modify indices above were
+        // captured with it present, and the group's reverse-order undo
+        // reinserts it first, so they stay valid both ways.
+        let gi = self.find(gid).unwrap();
+        let node = self.objects.remove(gi);
+        ops.push(ModelOp::Remove(gi, node));
+        self.undo.push(ModelOp::Group { ops, coalesce: false });
+        self.redo.clear();
+        true
+    }
+
+    /// Move `id` under `new_parent` (None = root), re-expressed so its
+    /// world geometry holds — one undo entry. CYCLE PREVENTION: a group
+    /// can never become its own descendant (or its own parent); such
+    /// reparents are refused.
+    pub fn reparent(&mut self, id: u64, new_parent: Option<u64>) -> Result<(), &'static str> {
+        let Some(i) = self.find(id) else {
+            return Err("no such object");
+        };
+        if let Some(np) = new_parent {
+            if np == id {
+                return Err("a group can't be moved into itself");
+            }
+            let Some(pi) = self.find(np) else {
+                return Err("no such group");
+            };
+            if !matches!(self.objects[pi].shape, Shape::Group { .. }) {
+                return Err("target is not a group");
+            }
+            if self.is_descendant(np, id) {
+                return Err("a group can't be moved into its own subtree");
             }
         }
-        self.objects = new;
-        true
+        if self.objects[i].parent == new_parent {
+            return Ok(()); // no-op, no undo entry
+        }
+        let before = self.objects[i].clone();
+        let old_abs = self.parent_abs(id);
+        self.objects[i].parent = new_parent;
+        let new_abs = self.parent_abs(id);
+        self.objects[i].reexpress(old_abs, new_abs);
+        let after = self.objects[i].clone();
+        self.undo.push(ModelOp::Modify { i, before, after, coalesce: false });
+        self.redo.clear();
+        Ok(())
     }
 
     /// Remove an object added by the in-flight gesture along with its
     /// undo record, as if it was never drawn (Esc / degenerate shapes).
     pub fn cancel_last_add(&mut self, id: u64) {
         if let Some(i) = self.find(id) {
-            let obj = self.objects.remove(i);
-            self.mark_dirty(obj.bounds());
+            self.mark_world_dirty(id);
+            self.objects.remove(i);
         }
         if matches!(self.undo.last(), Some(ModelOp::Add(o)) if o.id == id) {
             self.undo.pop();
@@ -838,19 +1408,23 @@ impl SketchModel {
         match op {
             ModelOp::Add(o) => {
                 if let Some(i) = self.find(o.id) {
-                    self.mark_dirty(self.objects[i].bounds());
+                    self.mark_world_dirty(o.id);
                     self.objects.remove(i);
                 }
             }
             ModelOp::Remove(i, o) => {
-                self.mark_dirty(o.bounds());
                 self.objects.insert((*i).min(self.objects.len()), o.clone());
+                self.mark_world_dirty(o.id);
             }
-            ModelOp::Modify { i, before, after, .. } => {
+            ModelOp::Modify { i, before, .. } => {
+                // Mark both states' WORLD footprints (a group's covers
+                // its subtree), with the list state that holds each.
+                let id = before.id;
+                self.mark_world_dirty(id);
                 if let Some(slot) = self.objects.get_mut(*i) {
                     *slot = before.clone();
                 }
-                self.mark_dirty(before.bounds().union(after.bounds()));
+                self.mark_world_dirty(id);
             }
             ModelOp::Replace(old, _new) => {
                 self.objects = old.clone();
@@ -872,22 +1446,24 @@ impl SketchModel {
     fn apply_redo(&mut self, op: &ModelOp) {
         match op {
             ModelOp::Add(o) => {
-                self.mark_dirty(o.bounds());
                 self.objects.push(o.clone());
+                self.mark_world_dirty(o.id);
             }
             ModelOp::Remove(i, o) => {
-                self.mark_dirty(o.bounds());
+                self.mark_world_dirty(o.id);
                 if *i < self.objects.len() {
                     self.objects.remove(*i);
                 } else {
                     self.objects.pop();
                 }
             }
-            ModelOp::Modify { i, before, after, .. } => {
+            ModelOp::Modify { i, after, .. } => {
+                let id = after.id;
+                self.mark_world_dirty(id);
                 if let Some(slot) = self.objects.get_mut(*i) {
                     *slot = after.clone();
                 }
-                self.mark_dirty(before.bounds().union(after.bounds()));
+                self.mark_world_dirty(id);
             }
             ModelOp::Replace(_old, new) => {
                 self.objects = new.clone();
@@ -980,10 +1556,26 @@ impl SketchModel {
             y1: clip.y1 - m,
         };
         for o in &self.objects {
-            if o.hidden || o.bounds().intersect(region_for_test).is_empty() {
+            // Group nodes have no raster footprint; hiding one hides
+            // its whole subtree (eff_hidden walks the ancestor chain).
+            if matches!(o.shape, Shape::Group { .. }) || self.eff_hidden(o.id) {
                 continue;
             }
-            rasterize_object(geo, o, clip, m);
+            let abs = self.parent_abs(o.id);
+            if o.bounds_under(abs).intersect(region_for_test).is_empty() {
+                continue;
+            }
+            if abs.is_identity() {
+                rasterize_object(geo, o, clip, m);
+            } else {
+                // Bake the ancestor transforms into a world-space clone
+                // so the shape rasterizers stay world-space-only. (For
+                // stamps this clones the raster; the damage region
+                // bounds how often it happens.)
+                let mut flat = o.clone();
+                flat.apply_sim(abs);
+                rasterize_object(geo, &flat, clip, m);
+            }
         }
         geo.touch(clip);
     }
@@ -1083,6 +1675,7 @@ fn rasterize_object(geo: &mut Geometry, obj: &SketchObject, clip: GridRect, m: i
     let mf = m as f32;
     let t_r = (obj.thickness * 0.5).max(0.6);
     match &obj.shape {
+        Shape::Group { .. } => {} // no geometry (filtered by the caller)
         Shape::Line { a, b } => {
             rasterize_capsule(
                 geo,
@@ -1290,6 +1883,7 @@ mod tests {
             smoke_rgb: [0.0; 3],
             locked: false,
             hidden: false,
+            parent: None,
         });
         id
     }
@@ -1388,6 +1982,136 @@ mod tests {
         assert_eq!(m.hit_test([0.0, 0.0], 1.0), None);
     }
 
+    // --- U3: nested groups and transform composition ------------------
+
+    /// Two nested groups, both rotated: the composed transform is the
+    /// child's stored geometry first, then each ancestor OUTWARD (see
+    /// CLAUDE.md). Getting the order wrong flips the sign of the
+    /// off-pivot displacement, which this asserts against.
+    #[test]
+    fn composition_is_child_then_ancestors_outward() {
+        let mut m = SketchModel::default();
+        let leaf = obj(&mut m, [10.0, 0.0]);
+        let inner = m.group_objects(&[leaf]).unwrap();
+        let outer = m.group_objects(&[inner]).unwrap();
+        // Inner rotates +90° about the world origin; outer translates
+        // by (100, 0). Child-then-outward: (10,0) → rot → (0,10) →
+        // translate → (100,10). The wrong order (ancestors first)
+        // would rotate the translation too and land at (-10, 100).
+        let ii = m.find(inner).unwrap();
+        m.objects[ii].rotate_about([0.0, 0.0], std::f32::consts::FRAC_PI_2);
+        let oi = m.find(outer).unwrap();
+        m.objects[oi].translate([100.0, 0.0]);
+        let c = m.world_center(leaf).unwrap();
+        assert!((c[0] - 100.0).abs() < 1e-3, "x = {}", c[0]);
+        assert!((c[1] - 10.0).abs() < 1e-3, "y = {}", c[1]);
+    }
+
+    /// Grouping and ungrouping never move world geometry, even when the
+    /// enclosing chain carries rotation and scale.
+    #[test]
+    fn group_ungroup_round_trip_holds_world_geometry() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [40.0, 20.0]);
+        let g = m.group_objects(&[a]).unwrap();
+        let gi = m.find(g).unwrap();
+        m.objects[gi].rotate_about([0.0, 0.0], 0.7);
+        m.objects[gi].scale_about([5.0, 5.0], 2.0);
+        let before = m.world_center(a).unwrap();
+        // Group the (already transformed) group again, then dissolve
+        // both: the leaf must not move.
+        let outer = m.group_objects(&[g]).unwrap();
+        let mid = m.world_center(a).unwrap();
+        assert!((before[0] - mid[0]).abs() < 1e-2 && (before[1] - mid[1]).abs() < 1e-2);
+        assert!(m.ungroup(outer));
+        assert!(m.ungroup(g));
+        let after = m.world_center(a).unwrap();
+        assert!(
+            (before[0] - after[0]).abs() < 1e-2 && (before[1] - after[1]).abs() < 1e-2,
+            "world centre moved: {before:?} → {after:?}"
+        );
+        // Fully dissolved: the leaf is a root object again.
+        let ai = m.find(a).unwrap();
+        assert_eq!(m.objects[ai].parent, None);
+    }
+
+    /// CYCLE PREVENTION on reparent: a group can never become its own
+    /// descendant (or its own parent) — such reparents are refused and
+    /// leave the model untouched.
+    #[test]
+    fn reparent_refuses_cycles() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        let b = obj(&mut m, [50.0, 0.0]);
+        let inner = m.group_objects(&[a]).unwrap();
+        let outer = m.group_objects(&[inner]).unwrap();
+        // Self-parenting.
+        assert!(m.reparent(outer, Some(outer)).is_err());
+        // Direct child.
+        assert!(m.reparent(outer, Some(inner)).is_err());
+        // Deeper descendant: make one more level below inner.
+        let deepest = m.group_objects(&[b]).unwrap();
+        m.reparent(deepest, Some(inner)).unwrap();
+        assert!(m.reparent(outer, Some(deepest)).is_err());
+        // Structure is intact after the refusals.
+        assert_eq!(m.objects[m.find(inner).unwrap()].parent, Some(outer));
+        assert_eq!(m.objects[m.find(outer).unwrap()].parent, None);
+        // Reparenting to a NON-group is refused too.
+        assert!(m.reparent(inner, Some(a)).is_err());
+        // A legal reparent round-trips through undo.
+        m.reparent(deepest, None).unwrap();
+        assert_eq!(m.objects[m.find(deepest).unwrap()].parent, None);
+        m.undo();
+        assert_eq!(m.objects[m.find(deepest).unwrap()].parent, Some(inner));
+    }
+
+    /// Grouping is one undo entry; undoing it restores parents and
+    /// removes the node.
+    #[test]
+    fn group_is_one_undo_entry() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        let b = obj(&mut m, [50.0, 0.0]);
+        let g = m.group_objects(&[a, b]).unwrap();
+        assert_eq!(m.objects[m.find(a).unwrap()].parent, Some(g));
+        m.undo();
+        assert!(m.find(g).is_none());
+        assert_eq!(m.objects[m.find(a).unwrap()].parent, None);
+        m.redo();
+        assert_eq!(m.objects[m.find(b).unwrap()].parent, Some(g));
+    }
+
+    /// Locking or hiding a group takes effect for the whole subtree
+    /// (hit tests skip it), while the members' own flags stay clear.
+    #[test]
+    fn group_flags_apply_to_subtree() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        let g = m.group_objects(&[a]).unwrap();
+        assert_eq!(m.hit_test([0.0, 0.0], 1.0), Some(a));
+        let gi = m.find(g).unwrap();
+        m.objects[gi].locked = true;
+        assert!(m.eff_locked(a));
+        assert_eq!(m.hit_test([0.0, 0.0], 1.0), None);
+        m.objects[gi].locked = false;
+        m.objects[gi].hidden = true;
+        assert!(m.eff_hidden(a));
+        assert_eq!(m.hit_test([0.0, 0.0], 1.0), None);
+    }
+
+    /// Hit tests resolve through a transformed chain: after rotating a
+    /// group, the member is hit at its NEW world position only.
+    #[test]
+    fn hit_test_through_transformed_group() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [40.0, 0.0]);
+        let g = m.group_objects(&[a]).unwrap();
+        let gi = m.find(g).unwrap();
+        m.objects[gi].rotate_about([0.0, 0.0], std::f32::consts::FRAC_PI_2);
+        assert_eq!(m.hit_test([0.0, 40.0], 1.0), Some(a));
+        assert_eq!(m.hit_test([40.0, 0.0], 1.0), None);
+    }
+
     #[test]
     fn rubber_band_intersect_semantics() {
         let line = SketchObject {
@@ -1403,6 +2127,7 @@ mod tests {
             smoke_rgb: [0.0; 3],
             locked: false,
             hidden: false,
+            parent: None,
         };
         // Band crossing the segment: selected (INTERSECT, not contain).
         assert!(line.intersects_rect([40.0, 40.0], [60.0, 60.0]));

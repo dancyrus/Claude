@@ -1,12 +1,17 @@
 //! The graphics window: the wgpu paint callback, the pointer gesture
-//! state machine, and the selection/snap overlays.
+//! state machine, the selection/snap overlays, and (U3) the transform
+//! gizmo — corner handles scale, the rotate handle above the box
+//! rotates, the pivot marker drags. All gizmo edits go through the
+//! model's world-space ops, so they compose correctly through nested
+//! groups (transform order: child first, then each ancestor outward —
+//! see CLAUDE.md).
 
 use crate::app::{Cmd, FlowPaintApp, Gesture, Tool, ViewRequest};
-use crate::model::{Shape, SketchObject};
+use crate::model::{Shape, Sim2, SketchObject};
 use crate::sim::{GpuSim, ViewportMapping};
 use eframe::egui;
 
-use super::units::{fmt_angle, fmt_len};
+use super::units::{fmt_angle, fmt_factor, fmt_len};
 
 // Free-zoom bounds: view_zoom is a multiplier over the letterbox fit
 // scale, additionally capped in absolute framebuffer px per cell; the
@@ -17,6 +22,20 @@ const MAX_PX_PER_CELL: f32 = 512.0;
 const MIN_VISIBLE_PX: f32 = 64.0;
 /// Wheel-zoom rate per scroll point (factor = exp(rate * delta)).
 const ZOOM_WHEEL_RATE: f32 = 0.005;
+
+// Gizmo geometry, in screen points (constant size at every zoom).
+const GIZMO_PAD_PT: f32 = 10.0;
+const GIZMO_ROT_OFF_PT: f32 = 20.0;
+const GIZMO_HANDLE_PT: f32 = 8.0;
+
+/// The gizmo's interactive points, in world cells for one frame.
+pub(in crate::app) struct GizmoLayout {
+    pub box_min: [f32; 2],
+    pub box_max: [f32; 2],
+    pub corners: [[f32; 2]; 4],
+    pub rotate: [f32; 2],
+    pub pivot: [f32; 2],
+}
 
 impl FlowPaintApp {
     pub(in crate::app) fn canvas(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
@@ -54,9 +73,12 @@ impl FlowPaintApp {
                 let pan_mode = self.view_nav(ctx, &response, &fit, ppp);
                 let mapping = self.view_mapping(&fit, gw, gh);
                 self.view_px_per_cell = mapping.px_per_cell;
+                // The pushed mapping is also what status.rs draws probe
+                // markers with — the canvas owns the view transform.
+                self.canvas_mapping = Some(mapping);
                 cmds.push(Cmd::SetMapping(mapping));
 
-                self.canvas_interaction(&response, mapping, ppp, pan_mode);
+                self.canvas_interaction(&response, mapping, ppp, pan_mode, cmds);
 
                 // The simulation paints itself via the wgpu callback.
                 ui.painter().add(egui_wgpu::Callback::new_paint_callback(
@@ -89,18 +111,9 @@ impl FlowPaintApp {
                 self.view_fit = false;
             }
             ViewRequest::Selection => {
-                // Union of the whole selection's bounds.
-                let mut b: Option<crate::geometry::GridRect> = None;
-                for &id in &self.selected {
-                    if let Some(i) = self.model.find(id) {
-                        let ob = self.model.objects[i].bounds();
-                        b = Some(match b {
-                            Some(u) => u.union(ob),
-                            None => ob,
-                        });
-                    }
-                }
-                let Some(b) = b else { return };
+                // Union of the whole selection's WORLD bounds (groups
+                // and grouped members resolve their ancestor chain).
+                let Some(b) = self.selection_world_bounds() else { return };
                 let bw = (b.x1 - b.x0).max(1) as f32;
                 let bh = (b.y1 - b.y0).max(1) as f32;
                 // ~10% padding on each side of the object's bounds.
@@ -315,6 +328,7 @@ impl FlowPaintApp {
         mapping: ViewportMapping,
         ppp: f32,
         pan_mode: bool,
+        cmds: &mut Vec<Cmd>,
     ) {
         let to_cell = |pos: egui::Pos2| -> [f32; 2] {
             mapping.px_to_cell([pos.x * ppp, pos.y * ppp])
@@ -328,9 +342,62 @@ impl FlowPaintApp {
         // radius at high zoom (2 cells at 64 px/cell is 128 px).
         let handle_r = 8.0 * ppp / px_per_cell;
         let click_slop = 4.0 * ppp / px_per_cell;
+        let pt_per_cell = px_per_cell / ppp;
         let (shift, alt) =
             response.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
         let pointer = response.interact_pointer_pos();
+
+        // Armed probe placement (from the tree) claims the next click
+        // over the field outright — it must not also select or draw.
+        if self.probe_arming && !pan_mode {
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(pos) = pointer {
+                    let c = to_cell(pos);
+                    let (vw, vh) = self.stats_grid;
+                    if c[0] >= 0.0 && c[1] >= 0.0 && c[0] < vw as f32 && c[1] < vh as f32
+                    {
+                        cmds.push(Cmd::AddProbe(c));
+                        self.probe_arming = false;
+                    }
+                    // Over the letterbox: stay armed.
+                }
+            }
+            return;
+        }
+
+        // Double-click enters a group: subsequent clicks select one
+        // level below it ("selecting a group selects its subtree;
+        // entering it allows selecting a child individually").
+        if !pan_mode
+            && self.tool == Tool::Select
+            && response
+                .ctx
+                .input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary))
+        {
+            if let Some(pos) = response.hover_pos() {
+                let p = to_cell(pos);
+                if let Some(leaf) = self.model.hit_test(p, click_slop) {
+                    let target = self.pick_target(leaf);
+                    let is_group = self
+                        .model
+                        .find(target)
+                        .map(|i| matches!(self.model.objects[i].shape, Shape::Group { .. }))
+                        .unwrap_or(false);
+                    if is_group && target != leaf {
+                        // The second press started a move gesture on the
+                        // group — cancel it, enter, select the child.
+                        self.gesture = Gesture::None;
+                        self.entered_group = Some(target);
+                        let child = self.child_toward(target, leaf);
+                        self.select_only(child);
+                        self.status =
+                            "Entered the group — clicks now select its members \
+                             (Esc leaves)."
+                                .into();
+                    }
+                }
+            }
+        }
 
         // Live polyline rubber vertex follows the cursor between clicks.
         if let Gesture::DrawPoly { id } = &self.gesture {
@@ -384,7 +451,9 @@ impl FlowPaintApp {
             if let Some(pos) = pointer {
                 let raw = to_cell(pos);
                 match self.tool {
-                    Tool::Select => self.select_press(raw, handle_r, click_slop, shift),
+                    Tool::Select => {
+                        self.select_press(raw, handle_r, click_slop, shift, pt_per_cell)
+                    }
                     Tool::Line => {
                         self.finish_gesture();
                         let a = self.snap_point(raw);
@@ -470,7 +539,10 @@ impl FlowPaintApp {
                     let d = [eff[0] - last[0], eff[1] - last[1]];
                     if d != [0.0; 2] {
                         for id in ids {
-                            self.mutate_live(id, |o| o.translate(d));
+                            // World-space delta through the ancestor
+                            // chain — a member of a rotated group moves
+                            // with the cursor, not along its local axes.
+                            self.model.translate_world(id, d);
                         }
                         if let Gesture::MoveSel { last, .. } = &mut self.gesture {
                             *last = eff;
@@ -497,7 +569,33 @@ impl FlowPaintApp {
                     } else {
                         self.snap_point(raw)
                     };
-                    self.mutate_live(id, |o| o.set_handle(idx, p));
+                    // Handles are grabbed in world space; the stored
+                    // shape lives in its parent group's space.
+                    let p_local = self.model.parent_abs(id).inverse().apply(p);
+                    self.mutate_live(id, |o| o.set_handle(idx, p_local));
+                } else if let Gesture::GizmoRotate { pivot, start_ang, .. } = &self.gesture
+                {
+                    let (pivot, start_ang) = (*pivot, *start_ang);
+                    let ang = (raw[1] - pivot[1]).atan2(raw[0] - pivot[0]);
+                    let mut total = ang - start_ang;
+                    if shift {
+                        // The angle-snap increment constrains gizmo
+                        // rotation, like the draw tools.
+                        let step =
+                            self.snap_angle_deg.clamp(1.0, 90.0).to_radians();
+                        total = (total / step).round() * step;
+                    }
+                    self.gizmo_apply_rotate(total);
+                } else if let Gesture::GizmoScale { pivot, start_dist, .. } = &self.gesture
+                {
+                    let (pivot, start_dist) = (*pivot, *start_dist);
+                    let d = Self::dist(raw, pivot).max(1e-3);
+                    let total = (d / start_dist.max(1e-3)).clamp(0.05, 50.0);
+                    self.gizmo_apply_scale(total);
+                } else if matches!(self.gesture, Gesture::GizmoPivot) {
+                    let p = self.snap_point(raw);
+                    self.gizmo_pivot = Some(p);
+                    self.gizmo_pivot_sel = self.selected.clone();
                 }
             }
         }
@@ -518,53 +616,221 @@ impl FlowPaintApp {
                     | Gesture::DrawShape { .. }
                     | Gesture::DrawPencil { .. }
                     | Gesture::RubberBand { .. }
+                    | Gesture::GizmoRotate { .. }
+                    | Gesture::GizmoScale { .. }
+                    | Gesture::GizmoPivot
             )
         {
             self.finish_gesture();
         }
     }
 
-    /// A press with the Select tool. In order: grab a handle of the
-    /// single selected object; Shift-click toggles set membership;
-    /// plain click picks (and starts moving the whole selection, or
-    /// just the hit object after reselecting); empty space starts a
+    /// Restore-and-reapply for the gizmo rotate drag: the model returns
+    /// to the gesture-start state, then the accumulated angle applies
+    /// about the pivot in one step (no per-frame error compounding).
+    fn gizmo_apply_rotate(&mut self, total: f32) {
+        let (before, pivot) = match &self.gesture {
+            Gesture::GizmoRotate { before, pivot, .. } => (before.clone(), *pivot),
+            _ => return,
+        };
+        self.restore_before(&before);
+        for (id, _) in &before {
+            self.model.rotate_world(*id, pivot, total);
+        }
+        if let Gesture::GizmoRotate { total: t, .. } = &mut self.gesture {
+            *t = total;
+        }
+    }
+
+    /// Restore-and-reapply for the gizmo scale drag (uniform — see the
+    /// inspector tooltip: similarity transforms are the only family
+    /// that survives nested rotated groups without shear).
+    fn gizmo_apply_scale(&mut self, total: f32) {
+        let (before, pivot) = match &self.gesture {
+            Gesture::GizmoScale { before, pivot, .. } => (before.clone(), *pivot),
+            _ => return,
+        };
+        self.restore_before(&before);
+        for (id, _) in &before {
+            self.model.scale_world(*id, pivot, total);
+        }
+        if let Gesture::GizmoScale { total: t, .. } = &mut self.gesture {
+            *t = total;
+        }
+    }
+
+    /// The ancestor chain of `leaf`, leaf first, root last.
+    fn ancestor_chain(&self, leaf: u64) -> Vec<u64> {
+        let mut chain = vec![leaf];
+        let mut cur = leaf;
+        for _ in 0..64 {
+            match self.model.find(cur).and_then(|i| self.model.objects[i].parent) {
+                Some(p) => {
+                    chain.push(p);
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        chain
+    }
+
+    /// Map a hit LEAF to what a click selects: something already
+    /// selected on its chain (so a second click drags the group, not a
+    /// member), else one level below the entered group, else the
+    /// outermost group.
+    fn pick_target(&self, leaf: u64) -> u64 {
+        let chain = self.ancestor_chain(leaf);
+        if let Some(&sel) = chain.iter().find(|&&c| self.sel_contains(c)) {
+            return sel;
+        }
+        if let Some(e) = self.entered_group {
+            if let Some(pos) = chain.iter().position(|&c| c == e) {
+                if pos > 0 {
+                    return chain[pos - 1];
+                }
+            }
+        }
+        *chain.last().unwrap_or(&leaf)
+    }
+
+    /// The direct child of `group` on the way down to `leaf`.
+    fn child_toward(&self, group: u64, leaf: u64) -> u64 {
+        let chain = self.ancestor_chain(leaf);
+        chain
+            .iter()
+            .position(|&c| c == group)
+            .and_then(|pos| pos.checked_sub(1))
+            .map(|i| chain[i])
+            .unwrap_or(leaf)
+    }
+
+    /// Band-select scope for a leaf: below the entered group when
+    /// applicable, else the outermost ancestor.
+    fn band_scope(&self, leaf: u64) -> u64 {
+        let chain = self.ancestor_chain(leaf);
+        if let Some(e) = self.entered_group {
+            if let Some(pos) = chain.iter().position(|&c| c == e) {
+                if pos > 0 {
+                    return chain[pos - 1];
+                }
+            }
+        }
+        *chain.last().unwrap_or(&leaf)
+    }
+
+    /// A press with the Select tool. In order: grab a gizmo handle
+    /// (pivot, rotate, corner scale) or a vertex handle of the single
+    /// selected object — whichever is nearest; Shift-click toggles set
+    /// membership; plain click picks (groups pick as a whole; a second
+    /// click inside the selection moves it); empty space starts a
     /// rubber band — additive with Shift, replacing without.
-    fn select_press(&mut self, p: [f32; 2], handle_r: f32, click_slop: f32, shift: bool) {
+    fn select_press(
+        &mut self,
+        p: [f32; 2],
+        handle_r: f32,
+        click_slop: f32,
+        shift: bool,
+        pt_per_cell: f32,
+    ) {
         self.finish_gesture();
-        // Handle grab: single selection only (handles aren't drawn for
-        // multi-selections), and never on a locked object.
+
+        // Candidate handles: the single object's vertex handles (world
+        // space) and the selection gizmo's — nearest within reach wins.
+        enum Grab {
+            Vertex(usize),
+            Corner,
+            Rotate,
+            Pivot,
+        }
+        let mut best: Option<(Grab, f32)> = None;
+        let mut consider = |g: Grab, at: [f32; 2], p: [f32; 2], r: f32| {
+            let d = Self::dist(p, at);
+            if d <= r {
+                if best.as_ref().map(|(_, bd)| d < *bd).unwrap_or(true) {
+                    best = Some((g, d));
+                }
+            }
+        };
         if let Some(id) = self.single_sel() {
             if let Some(i) = self.model.find(id) {
-                if !self.model.objects[i].locked {
-                    let handles = self.model.objects[i].handles();
-                    let mut best: Option<(usize, f32)> = None;
-                    for (idx, h) in handles.iter().enumerate() {
-                        let d = Self::dist(p, *h);
-                        if d <= handle_r && best.map(|(_, bd)| d < bd).unwrap_or(true)
-                        {
-                            best = Some((idx, d));
-                        }
-                    }
-                    if let Some((idx, _)) = best {
-                        let before = self.model.objects[i].clone();
-                        self.gesture = Gesture::HandleDrag { id, idx, before };
-                        return;
+                if !self.model.eff_locked(id) {
+                    let abs = self.model.parent_abs(id);
+                    for (idx, h) in self.model.objects[i].handles().iter().enumerate() {
+                        consider(Grab::Vertex(idx), abs.apply(*h), p, handle_r);
                     }
                 }
             }
         }
+        if let Some(giz) = self.gizmo_layout(pt_per_cell) {
+            consider(Grab::Pivot, giz.pivot, p, handle_r);
+            consider(Grab::Rotate, giz.rotate, p, handle_r);
+            for c in giz.corners {
+                consider(Grab::Corner, c, p, handle_r);
+            }
+        }
+        match best.map(|(g, _)| g) {
+            Some(Grab::Vertex(idx)) => {
+                let id = self.single_sel().unwrap();
+                if let Some(i) = self.model.find(id) {
+                    let before = self.model.objects[i].clone();
+                    self.gesture = Gesture::HandleDrag { id, idx, before };
+                }
+                return;
+            }
+            Some(Grab::Pivot) => {
+                self.gesture = Gesture::GizmoPivot;
+                return;
+            }
+            Some(grab @ (Grab::Rotate | Grab::Corner)) => {
+                let Some(pivot) = self.transform_pivot() else { return };
+                let before: Vec<(u64, SketchObject)> = self
+                    .transform_targets()
+                    .iter()
+                    .filter_map(|&sid| {
+                        self.model
+                            .find(sid)
+                            .map(|i| (sid, self.model.objects[i].clone()))
+                    })
+                    .collect();
+                if before.is_empty() {
+                    return;
+                }
+                self.gesture = match grab {
+                    Grab::Rotate => Gesture::GizmoRotate {
+                        before,
+                        pivot,
+                        start_ang: (p[1] - pivot[1]).atan2(p[0] - pivot[0]),
+                        total: 0.0,
+                    },
+                    _ => Gesture::GizmoScale {
+                        before,
+                        pivot,
+                        start_dist: Self::dist(p, pivot).max(1e-3),
+                        total: 1.0,
+                    },
+                };
+                return;
+            }
+            None => {}
+        }
+
         match self.model.hit_test(p, click_slop) {
-            Some(id) if shift => {
-                // Shift-click adds/removes; no move gesture either way.
+            Some(leaf) if shift => {
+                // Shift-click adds/removes the picked scope; no move
+                // gesture either way.
+                let id = self.pick_target(leaf);
                 self.select_toggle(id);
             }
-            Some(id) => {
+            Some(leaf) => {
+                let id = self.pick_target(leaf);
                 if !self.sel_contains(id) {
                     self.select_only(id);
                 }
-                // Move every editable member of the selection as a unit.
+                // Move the selection's outermost editable members as a
+                // unit (a selected group moves; its members follow).
                 let before: Vec<(u64, SketchObject)> = self
-                    .editable_selection()
+                    .transform_targets()
                     .iter()
                     .filter_map(|&sid| {
                         self.model.find(sid).map(|i| (sid, self.model.objects[i].clone()))
@@ -577,6 +843,7 @@ impl FlowPaintApp {
                 }
             }
             None => {
+                self.entered_group = None;
                 let base = if shift {
                     self.selected.clone()
                 } else {
@@ -592,8 +859,9 @@ impl FlowPaintApp {
         }
     }
 
-    /// Live rubber-band update: selection = base ∪ (band hits), INTERSECT
-    /// semantics (see CLAUDE.md), skipping locked and hidden objects.
+    /// Live rubber-band update: selection = base ∪ (band hits mapped to
+    /// their group scope), INTERSECT semantics (see CLAUDE.md),
+    /// skipping locked and hidden subtrees.
     fn rubber_band_update(&mut self, corner: [f32; 2]) {
         let Gesture::RubberBand { anchor, corner: c, base, .. } = &mut self.gesture
         else {
@@ -608,11 +876,31 @@ impl FlowPaintApp {
             .model
             .objects
             .iter()
-            .filter(|o| !o.locked && !o.hidden && o.intersects_rect(min, max))
+            .filter(|o| {
+                !matches!(o.shape, Shape::Group { .. })
+                    && !self.model.eff_locked(o.id)
+                    && !self.model.eff_hidden(o.id)
+                    && self.band_hits(o, min, max)
+            })
             .map(|o| o.id)
             .collect();
-        for id in hits {
+        for leaf in hits {
+            let id = self.band_scope(leaf);
             self.select_add(id);
+        }
+    }
+
+    /// Band test through the ancestor chain: identity chains test the
+    /// stored geometry directly; transformed ones test a flattened
+    /// clone (band drags are frame-rate work, the clone is accepted).
+    fn band_hits(&self, o: &SketchObject, min: [f32; 2], max: [f32; 2]) -> bool {
+        let abs = self.model.parent_abs(o.id);
+        if abs.is_identity() {
+            o.intersects_rect(min, max)
+        } else {
+            let mut flat = o.clone();
+            flat.apply_sim(abs);
+            flat.intersects_rect(min, max)
         }
     }
 
@@ -791,26 +1079,45 @@ impl FlowPaintApp {
             | Gesture::DrawPoly { id }
             | Gesture::DrawPencil { id }
             | Gesture::HandleDrag { id, .. } => vec![*id],
-            Gesture::MoveSel { .. } | Gesture::RubberBand { .. } | Gesture::None => {
-                self.selected.clone()
-            }
+            _ => self.selected.clone(),
         };
         let accent = super::theme::SEL;
         let stroke = egui::Stroke::new(1.5, accent);
         for &id in &ids {
             let Some(i) = self.model.find(id) else { continue };
-            self.draw_outline(painter, &self.model.objects[i], stroke, &to_screen);
+            if matches!(self.model.objects[i].shape, Shape::Group { .. }) {
+                // A group outlines every leaf of its subtree.
+                for sid in self.model.subtree_ids(id) {
+                    let Some(si) = self.model.find(sid) else { continue };
+                    let so = &self.model.objects[si];
+                    if !matches!(so.shape, Shape::Group { .. }) {
+                        let abs = self.model.parent_abs(sid);
+                        self.draw_outline(painter, so, abs, stroke, &to_screen);
+                    }
+                }
+            } else {
+                let abs = self.model.parent_abs(id);
+                self.draw_outline(painter, &self.model.objects[i], abs, stroke, &to_screen);
+            }
         }
+
+        // The transform gizmo (U3): padded selection box with corner
+        // scale handles, the rotate handle above, the pivot marker.
+        let pt_per_cell = mapping.px_per_cell / ppp;
+        self.draw_gizmo(ui, painter, pt_per_cell, &to_screen);
+
         if ids.len() != 1 {
             return;
         }
         let Some(i) = self.model.find(ids[0]) else { return };
         let obj = &self.model.objects[i];
+        let abs = self.model.parent_abs(ids[0]);
 
-        // Vertex handles (not on locked objects — they aren't editable).
-        if !obj.locked {
+        // Vertex handles (not on locked objects — they aren't editable;
+        // shown at their WORLD positions).
+        if !self.model.eff_locked(ids[0]) {
             for h in obj.handles() {
-                let pos = to_screen(h);
+                let pos = to_screen(abs.apply(h));
                 let r = egui::Rect::from_center_size(pos, egui::vec2(7.0, 7.0));
                 painter.rect_filled(r, 1.0, super::theme::HANDLE_FILL);
                 painter.rect_stroke(
@@ -821,12 +1128,16 @@ impl FlowPaintApp {
             }
         }
 
-        // Dimensions in physical units.
+        // Dimensions in physical units (world lengths — the ancestor
+        // scale applies).
         let ps = self.phys_cache;
+        let s = abs.s;
         let dims = match &obj.shape {
             Shape::Line { a, b } => {
-                let l = Self::dist(*a, *b);
-                let ang = -(b[1] - a[1]).atan2(b[0] - a[0]).to_degrees();
+                let aw = abs.apply(*a);
+                let bw = abs.apply(*b);
+                let l = Self::dist(aw, bw);
+                let ang = -(bw[1] - aw[1]).atan2(bw[0] - aw[0]).to_degrees();
                 format!("L {}   ∠ {}", fmt_len(ps.len_m(l)), fmt_angle(ang))
             }
             Shape::Poly { pts, closed } => {
@@ -836,25 +1147,29 @@ impl FlowPaintApp {
                 for k in 0..segs {
                     l += Self::dist(pts[k], pts[(k + 1) % n]);
                 }
-                format!("{n} pts   L {}", fmt_len(ps.len_m(l)))
+                format!("{n} pts   L {}", fmt_len(ps.len_m(l * s)))
             }
             Shape::Rect { half, .. } => format!(
                 "{} × {}",
-                fmt_len(ps.len_m(half[0] * 2.0)),
-                fmt_len(ps.len_m(half[1] * 2.0))
+                fmt_len(ps.len_m(half[0] * 2.0 * s)),
+                fmt_len(ps.len_m(half[1] * 2.0 * s))
             ),
             Shape::Ellipse { r, .. } => format!(
                 "⌀ {} × {}",
-                fmt_len(ps.len_m(r[0] * 2.0)),
-                fmt_len(ps.len_m(r[1] * 2.0))
+                fmt_len(ps.len_m(r[0] * 2.0 * s)),
+                fmt_len(ps.len_m(r[1] * 2.0 * s))
             ),
             Shape::Stamp { raster, scale, .. } => format!(
                 "{} × {}",
-                fmt_len(ps.len_m((raster.rect.2 - raster.rect.0) as f32 * scale)),
-                fmt_len(ps.len_m((raster.rect.3 - raster.rect.1) as f32 * scale))
+                fmt_len(ps.len_m((raster.rect.2 - raster.rect.0) as f32 * scale * s)),
+                fmt_len(ps.len_m((raster.rect.3 - raster.rect.1) as f32 * scale * s))
             ),
+            Shape::Group { .. } => String::new(),
         };
-        let b = obj.bounds();
+        if dims.is_empty() {
+            return;
+        }
+        let b = obj.bounds_under(abs);
         let pos = to_screen([b.x0 as f32, b.y0 as f32]) - egui::vec2(0.0, 4.0);
         painter.text(
             pos,
@@ -865,15 +1180,123 @@ impl FlowPaintApp {
         );
     }
 
-    /// One object's selection outline (shared by the single- and
-    /// multi-selection overlay paths).
+    /// The gizmo's world-cell geometry for this frame: the padded
+    /// selection box, corner scale handles, the rotate handle above the
+    /// top edge, and the transform pivot. None when the Select tool is
+    /// inactive, the selection is empty or uneditable, or a non-gizmo
+    /// gesture is running.
+    fn gizmo_layout(&mut self, pt_per_cell: f32) -> Option<GizmoLayout> {
+        if self.tool != Tool::Select {
+            return None;
+        }
+        if !matches!(
+            self.gesture,
+            Gesture::None
+                | Gesture::GizmoRotate { .. }
+                | Gesture::GizmoScale { .. }
+                | Gesture::GizmoPivot
+        ) {
+            return None;
+        }
+        if self.transform_targets().is_empty() {
+            return None;
+        }
+        let b = self.selection_world_bounds()?;
+        let k = pt_per_cell.max(1e-6);
+        let pad = GIZMO_PAD_PT / k;
+        let box_min = [b.x0 as f32 - pad, b.y0 as f32 - pad];
+        let box_max = [b.x1 as f32 + pad, b.y1 as f32 + pad];
+        let corners = [
+            [box_min[0], box_min[1]],
+            [box_max[0], box_min[1]],
+            [box_max[0], box_max[1]],
+            [box_min[0], box_max[1]],
+        ];
+        let rotate = [
+            (box_min[0] + box_max[0]) * 0.5,
+            box_min[1] - GIZMO_ROT_OFF_PT / k,
+        ];
+        // Mid-gesture the pivot is the gesture's (the live bounds move
+        // under a rotation; the pivot must not).
+        let pivot = match &self.gesture {
+            Gesture::GizmoRotate { pivot, .. } | Gesture::GizmoScale { pivot, .. } => {
+                *pivot
+            }
+            _ => self.transform_pivot()?,
+        };
+        Some(GizmoLayout { box_min, box_max, corners, rotate, pivot })
+    }
+
+    /// Draw the gizmo and, mid-drag, the live numeric readout.
+    fn draw_gizmo(
+        &mut self,
+        ui: &egui::Ui,
+        painter: &egui::Painter,
+        pt_per_cell: f32,
+        to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
+    ) {
+        let Some(giz) = self.gizmo_layout(pt_per_cell) else { return };
+        let accent = super::theme::SEL;
+        let thin = egui::Stroke::new(1.0, accent);
+        let box_rect =
+            egui::Rect::from_two_pos(to_screen(giz.box_min), to_screen(giz.box_max));
+        painter.rect_stroke(box_rect, 0.0, thin);
+        // Corner scale handles.
+        for c in giz.corners {
+            let r = egui::Rect::from_center_size(
+                to_screen(c),
+                egui::vec2(GIZMO_HANDLE_PT, GIZMO_HANDLE_PT),
+            );
+            painter.rect_filled(r, 1.0, super::theme::HANDLE_FILL);
+            painter.rect_stroke(r, 1.0, egui::Stroke::new(1.0, accent));
+        }
+        // Rotate handle: a lollipop above the top edge.
+        let rot_pos = to_screen(giz.rotate);
+        painter.line_segment(
+            [egui::pos2(box_rect.center().x, box_rect.min.y), rot_pos],
+            thin,
+        );
+        painter.circle_filled(rot_pos, GIZMO_HANDLE_PT * 0.5, super::theme::HANDLE_FILL);
+        painter.circle_stroke(rot_pos, GIZMO_HANDLE_PT * 0.5, egui::Stroke::new(1.0, accent));
+        // Pivot: crosshair circle.
+        let piv = to_screen(giz.pivot);
+        painter.circle_stroke(piv, 5.0, thin);
+        painter.line_segment([piv - egui::vec2(8.0, 0.0), piv + egui::vec2(8.0, 0.0)], thin);
+        painter.line_segment([piv - egui::vec2(0.0, 8.0), piv + egui::vec2(0.0, 8.0)], thin);
+
+        // Live readout while a gizmo drag runs (through ui/units.rs).
+        let readout = match &self.gesture {
+            Gesture::GizmoRotate { total, .. } => {
+                Some(fmt_angle(-total.to_degrees()))
+            }
+            Gesture::GizmoScale { total, .. } => Some(fmt_factor(*total)),
+            _ => None,
+        };
+        if let Some(text) = readout {
+            painter.text(
+                rot_pos - egui::vec2(0.0, 12.0),
+                egui::Align2::CENTER_BOTTOM,
+                text,
+                egui::TextStyle::Monospace.resolve(ui.style()),
+                accent,
+            );
+        }
+    }
+
+    /// One object's selection outline under its ancestor transform
+    /// (shared by the single- and multi-selection overlay paths). All
+    /// outline points are generated in stored space and mapped through
+    /// `abs` — a similarity keeps rects rects and ellipses ellipses, so
+    /// no shape needs a raster-heavy flatten here.
     fn draw_outline(
         &self,
         painter: &egui::Painter,
         obj: &SketchObject,
+        abs: Sim2,
         stroke: egui::Stroke,
-        to_screen: &impl Fn([f32; 2]) -> egui::Pos2,
+        screen: &impl Fn([f32; 2]) -> egui::Pos2,
     ) {
+        let to_screen = |p: [f32; 2]| screen(abs.apply(p));
         match &obj.shape {
             Shape::Line { a, b } => {
                 painter.line_segment([to_screen(*a), to_screen(*b)], stroke);
@@ -923,6 +1346,7 @@ impl FlowPaintApp {
                 .collect();
                 painter.add(egui::Shape::closed_line(path, stroke));
             }
+            Shape::Group { .. } => {} // outlined via its subtree leaves
         }
     }
 }

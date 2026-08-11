@@ -34,14 +34,13 @@ pub const PARTICLE_CHOICES: [(&str, u32); 4] = [
 ];
 pub const MAX_PARTICLES: u64 = 2_000_000;
 
-// --- Probes (plan v4.1, T2-B) -----------------------------------------
+// --- Probes (plan v4.1, T2-B; folded into Settings at U3) --------------
 //
-// Persistent point probes: positions, sample history and the plot-panel
-// preferences live behind a process-wide handle for the same reason the
-// T2-A color-range state does — the UI panels never hold `&mut GpuSim`
-// (it lives in egui-wgpu's `CallbackResources`) and app.rs
-// (`Cmd`/`UiSnapshot`) is frozen while Track 1 runs. Fold into app
-// state at the track merge. The sampling itself is sim machinery: a
+// Persistent point probes. Track-era note: this state sat behind a
+// process-wide `Mutex` (`sim::probes()`) while app.rs was frozen for
+// Track 1; U3 folded it into `Settings.probes` with edits arriving
+// through `Cmd` like every other setting (the T2-A precedent), and v8
+// persists the probe positions. The sampling itself is sim machinery: a
 // tiny per-frame GPU copy into a mapped-ring staging buffer, drained a
 // couple of frames later without ever blocking a frame.
 
@@ -76,8 +75,9 @@ pub struct Probe {
 }
 
 /// Which quantity the plot panel draws (a UI preference).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProbeQuantity {
+    #[default]
     Speed,
     Vorticity,
     Pressure,
@@ -101,39 +101,25 @@ impl ProbeQuantity {
     }
 }
 
-/// The canvas view transform, published by the sim every frame so the
-/// UI can draw probe markers over the canvas without owning the canvas
-/// (framebuffer px, same convention as `ViewportMapping`).
-#[derive(Clone, Copy)]
-pub struct ProbeView {
-    pub vp_origin: [f32; 2],
-    pub vp_size: [f32; 2],
-    pub lb_origin: [f32; 2],
-    pub px_per_cell: f32,
-}
-
+/// The probe store: part of `Settings` since U3 (no globals). The UI
+/// reads a per-frame snapshot and edits through `Cmd`; the sampling
+/// machinery reads it directly (it owns `&mut GpuSim`).
 pub struct ProbeSet {
     pub probes: Vec<Probe>,
     pub next_id: u32,
-    /// UI: the next canvas click places a probe while this is set.
-    pub arming: bool,
     pub show_plot: bool,
     pub quantity: ProbeQuantity,
-    pub view: Option<ProbeView>,
 }
 
-static PROBES: Mutex<ProbeSet> = Mutex::new(ProbeSet {
-    probes: Vec::new(),
-    next_id: 1,
-    arming: false,
-    show_plot: false,
-    quantity: ProbeQuantity::Speed,
-    view: None,
-});
-
-/// Shared probe state (see the module note above `MAX_PROBES`).
-pub fn probes() -> &'static Mutex<ProbeSet> {
-    &PROBES
+impl Default for ProbeSet {
+    fn default() -> Self {
+        ProbeSet {
+            probes: Vec::new(),
+            next_id: 1,
+            show_plot: false,
+            quantity: ProbeQuantity::Speed,
+        }
+    }
 }
 
 /// One probe-readback staging buffer and where it is in the copy → map
@@ -295,6 +281,8 @@ pub struct Settings {
     /// `RenderMode as usize`. The UI keeps the render/physical twins in
     /// sync every frame; edits arrive through `Cmd` like any setting.
     pub ranges: [FieldRange; 4],
+    /// Persistent point probes (T2-B; folded here at U3, persisted v8+).
+    pub probes: ProbeSet,
 }
 
 impl Default for Settings {
@@ -317,6 +305,7 @@ impl Default for Settings {
             particle_brightness: 0.3,
             sponge_strength: 0.08,
             ranges: FIELD_RANGE_DEFAULTS,
+            probes: ProbeSet::default(),
         }
     }
 }
@@ -1095,7 +1084,7 @@ impl GpuSim {
         self.pending_clear_dye = true;
         self.total_steps = 0.0;
         self.probe_generation = self.probe_generation.wrapping_add(1);
-        for p in probes().lock().unwrap().probes.iter_mut() {
+        for p in self.settings.probes.probes.iter_mut() {
             p.samples.clear();
         }
     }
@@ -1204,7 +1193,7 @@ impl GpuSim {
         // grid the same way the sketch model rescales its objects.
         let scale = vis_w as f32 / self.vis_w.max(1) as f32;
         if (scale - 1.0).abs() > 1e-6 {
-            for p in probes().lock().unwrap().probes.iter_mut() {
+            for p in self.settings.probes.probes.iter_mut() {
                 p.pos[0] *= scale;
                 p.pos[1] *= scale;
             }
@@ -1459,7 +1448,7 @@ impl GpuSim {
     /// GPU only stalls the ring, never the frame.
     fn encode_probe_copies(&mut self, encoder: &mut wgpu::CommandEncoder, steps: u32) {
         if self.probe_stages.iter().all(|s| matches!(s.state, ProbeStageState::Free))
-            && (steps == 0 || probes().lock().unwrap().probes.is_empty())
+            && (steps == 0 || self.settings.probes.probes.is_empty())
         {
             return;
         }
@@ -1473,7 +1462,7 @@ impl GpuSim {
                         Some(Ok(())) => {
                             if st.generation == self.probe_generation {
                                 let data = st.buf.slice(..).get_mapped_range();
-                                let mut pr = probes().lock().unwrap();
+                                let pr = &mut self.settings.probes;
                                 for (slot, id) in st.ids.iter().enumerate() {
                                     let base = slot * PROBE_SLOT_BYTES as usize;
                                     let f = |off: usize| -> f32 {
@@ -1532,8 +1521,7 @@ impl GpuSim {
         if steps == 0 {
             return; // paused: time does not advance, so no new sample
         }
-        let pr = probes().lock().unwrap();
-        if pr.probes.is_empty() {
+        if self.settings.probes.probes.is_empty() {
             return;
         }
         let Some(stage_idx) = self
@@ -1547,6 +1535,7 @@ impl GpuSim {
         let dye_buf =
             if self.bufs.dye_side == 0 { &self.bufs.dye_a } else { &self.bufs.dye_b };
         let mut ids = Vec::new();
+        let pr = &self.settings.probes;
         for (slot, p) in pr.probes.iter().take(MAX_PROBES).enumerate() {
             // Clamp one cell in from the visible edge so the curl
             // stencil stays in bounds even with no margin.
@@ -1567,7 +1556,6 @@ impl GpuSim {
             encoder.copy_buffer_to_buffer(dye_buf, c * 16, &st.buf, dst + 48, 16);
             ids.push(p.id);
         }
-        drop(pr);
         let st = &mut self.probe_stages[stage_idx];
         st.ids = ids;
         st.stamp = self.total_steps as f32;
@@ -1595,14 +1583,6 @@ impl GpuSim {
             particle_brightness: self.settings.particle_brightness,
         };
         self.queue.write_buffer(&self.render_uniform, 0, bytemuck::bytes_of(&p));
-        // Publish the canvas view so the UI can draw probe markers over
-        // the field without owning the canvas (T2-B).
-        probes().lock().unwrap().view = Some(ProbeView {
-            vp_origin: self.mapping.vp_origin,
-            vp_size: self.mapping.vp_size,
-            lb_origin: self.mapping.lb_origin,
-            px_per_cell: self.mapping.px_per_cell,
-        });
     }
 
     /// Draw the field (and particles) into the current render pass. The

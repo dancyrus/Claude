@@ -31,6 +31,16 @@ impl FlowPaintApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        let is_group = self
+                            .single_sel()
+                            .and_then(|id| self.model.find(id))
+                            .map(|i| {
+                                matches!(
+                                    self.model.objects[i].shape,
+                                    crate::model::Shape::Group { .. }
+                                )
+                            })
+                            .unwrap_or(false);
                         if !self.selected.is_empty()
                             && !matches!(self.gesture, Gesture::None)
                         {
@@ -42,6 +52,8 @@ impl FlowPaintApp {
                             );
                         } else if self.selected.len() > 1 {
                             self.multi_panel(ui, cmds);
+                        } else if is_group {
+                            self.group_panel(ui, snap);
                         } else if let Some(id) = self.single_sel() {
                             self.object_panel(ui, id, snap, cmds);
                         } else {
@@ -64,17 +76,18 @@ impl FlowPaintApp {
             self.deselect_all();
             return;
         };
-        if self.model.objects[i].locked {
+        if self.model.eff_locked(id) {
             ui.label(super::theme::heading("Object — locked"));
             ui.label(
                 egui::RichText::new(
-                    "Locked objects can't be edited or moved. Unlock from \
+                    "Locked objects can't be edited or moved (a locked \
+                     enclosing group locks its members too). Unlock from \
                      the model tree (or below).",
                 )
                 .small()
                 .weak(),
             );
-            if ui.button("Unlock").clicked() {
+            if self.model.objects[i].locked && ui.button("Unlock").clicked() {
                 let before = self.model.objects[i].clone();
                 self.model.objects[i].locked = false;
                 self.model.record_modify(id, before);
@@ -92,6 +105,7 @@ impl FlowPaintApp {
             Shape::Rect { .. } => "Rectangle",
             Shape::Ellipse { .. } => "Ellipse",
             Shape::Stamp { .. } => "Generated part",
+            Shape::Group { .. } => "Group", // routed to group_panel
         };
         ui.label(super::theme::heading(format!("Object — {kind}")));
 
@@ -209,9 +223,10 @@ impl FlowPaintApp {
         // has no single intrinsic angle or size, so an absolute angle
         // field cannot extend to multi-selections rotating about a common
         // pivot (U3). Only the change since the last frame is applied.
-        let (_, mut stage_rot, mut stage_scale) = match self.inspector_stage {
-            Some(s) if s.0 == id => s,
-            _ => (id, 0.0, 100.0),
+        let key = vec![id];
+        let (mut stage_rot, mut stage_scale) = match &self.inspector_stage {
+            Some((k, r, s)) if *k == key => (*r, *s),
+            _ => (0.0, 100.0),
         };
         ui.horizontal(|ui| {
             ui.label("Rotate");
@@ -246,14 +261,45 @@ impl FlowPaintApp {
                         .speed(1.0)
                         .suffix(" %"),
                 )
-                .on_hover_text("Scale the object about its center.")
+                .on_hover_text(if is_stamp {
+                    // The plan's explicit tooltip: honesty over a
+                    // silently dropped axis.
+                    "Scale the stamp about its center. Scaling is uniform: \
+                     non-uniform scaling of a raster stamp is out of scope."
+                } else {
+                    "Scale the object about its center (uniform; reshape \
+                     with the canvas handles for per-axis edits)."
+                })
                 .changed()
             {
                 obj.scale_by(stage_scale / p_old);
                 changed = true;
             }
         });
-        self.inspector_stage = Some((id, stage_rot, stage_scale));
+        self.inspector_stage = Some((key, stage_rot, stage_scale));
+        // Center X/Y: the object's WORLD centre in cells (the canonical
+        // grid coordinate; metres on the derived line).
+        let abs = self.model.parent_abs(id);
+        let c0 = abs.apply(obj.center());
+        let mut cw = c0;
+        ui.horizontal(|ui| {
+            ui.label("Center");
+            let cx = ui
+                .add(egui::DragValue::new(&mut cw[0]).speed(0.5).suffix(" X"))
+                .changed();
+            let cy = ui
+                .add(egui::DragValue::new(&mut cw[1]).speed(0.5).suffix(" Y"))
+                .changed();
+            if cx || cy {
+                let d = abs.inverse().apply_vec([cw[0] - c0[0], cw[1] - c0[1]]);
+                obj.translate(d);
+                changed = true;
+            }
+        });
+        super::theme::derived(
+            ui,
+            format!("= {} , {}", fmt_len(ps.len_m(cw[0])), fmt_len(ps.len_m(cw[1]))),
+        );
 
         ui.horizontal(|ui| {
             if ui.button("Duplicate (Ctrl+D)").clicked() {
@@ -296,7 +342,7 @@ impl FlowPaintApp {
         ui.label(super::theme::heading(format!("Objects — {} selected", objs.len())));
         let locked_n = objs
             .iter()
-            .filter(|&&i| self.model.objects[i].locked)
+            .filter(|&&i| self.model.eff_locked(self.model.objects[i].id))
             .count();
         if locked_n > 0 {
             super::theme::derived(
@@ -384,8 +430,14 @@ impl FlowPaintApp {
             }
         }
 
+        // Rotate/scale/centre about the common pivot (U3).
+        self.selection_transform_rows(ui);
+
         ui.separator();
         ui.horizontal(|ui| {
+            if ui.button("Group (Ctrl+G)").clicked() {
+                self.group_selected();
+            }
             if ui.button("Duplicate (Ctrl+D)").clicked() {
                 self.duplicate_selected();
             }
@@ -411,8 +463,169 @@ impl FlowPaintApp {
         ui.label(
             egui::RichText::new(
                 "Drag any selected object to move the set; arrows nudge \
-                 (Shift = coarse). Rotate/scale of a multi-selection \
-                 arrives with U3.",
+                 (Shift = coarse). On the canvas: corner handles scale, \
+                 the top handle rotates, drag the crosshair to move the \
+                 pivot.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+
+    /// Rotate / scale / centre for the whole selection about the common
+    /// pivot (the gizmo's crosshair; selection-bounds centre until it
+    /// is dragged). Staged deltas — a selection has no single intrinsic
+    /// angle — applied to the OUTERMOST editable members as one
+    /// coalesced undo entry. Scaling is uniform by design: a similarity
+    /// is the only transform that survives nested rotated groups
+    /// without shear, and raster stamps only carry a single scale.
+    fn selection_transform_rows(&mut self, ui: &mut egui::Ui) {
+        let Some(pivot) = self.transform_pivot() else { return };
+        let key = self.selected.clone();
+        let (mut stage_rot, mut stage_scale) = match &self.inspector_stage {
+            Some((k, r, s)) if *k == key => (*r, *s),
+            _ => (0.0, 100.0),
+        };
+        ui.horizontal(|ui| {
+            ui.label("Rotate");
+            let r_old = stage_rot;
+            let mut da = 0.0f32;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut stage_rot)
+                        .range(-3600.0..=3600.0)
+                        .speed(1.0)
+                        .suffix("°"),
+                )
+                .on_hover_text("Rotate the selection about the pivot.")
+                .changed()
+            {
+                da = (stage_rot - r_old).to_radians();
+            }
+            if ui.small_button("+90°").clicked() {
+                da = 90.0f32.to_radians();
+                stage_rot += 90.0;
+            }
+            if da != 0.0 {
+                self.transform_selection_world(|m, id| m.rotate_world(id, pivot, da));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Scale");
+            let p_old = stage_scale;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut stage_scale)
+                        .range(5.0..=2000.0)
+                        .speed(1.0)
+                        .suffix(" %"),
+                )
+                .on_hover_text(
+                    "Scale the selection about the pivot. Scaling is uniform: \
+                     non-uniform scaling of a raster stamp is out of scope.",
+                )
+                .changed()
+            {
+                let f = stage_scale / p_old;
+                self.transform_selection_world(|m, id| m.scale_world(id, pivot, f));
+            }
+        });
+        self.inspector_stage = Some((key, stage_rot, stage_scale));
+        // Centre of the selection's world bounds, in cells.
+        if let Some(b) = self.selection_world_bounds() {
+            let c0 = [(b.x0 + b.x1) as f32 * 0.5, (b.y0 + b.y1) as f32 * 0.5];
+            let mut cw = c0;
+            ui.horizontal(|ui| {
+                ui.label("Center");
+                let cx = ui
+                    .add(egui::DragValue::new(&mut cw[0]).speed(0.5).suffix(" X"))
+                    .changed();
+                let cy = ui
+                    .add(egui::DragValue::new(&mut cw[1]).speed(0.5).suffix(" Y"))
+                    .changed();
+                if cx || cy {
+                    let d = [cw[0] - c0[0], cw[1] - c0[1]];
+                    self.transform_selection_world(|m, id| m.translate_world(id, d));
+                }
+            });
+            let ps = self.phys_cache;
+            super::theme::derived(
+                ui,
+                format!(
+                    "= {} , {}",
+                    fmt_len(ps.len_m(cw[0])),
+                    fmt_len(ps.len_m(cw[1]))
+                ),
+            );
+        }
+    }
+
+    /// The panel for a single selected GROUP: subtree summary, the
+    /// common-pivot transforms, the Engine block when the group is a
+    /// generated engine (a Fan child driving a stamp child — the parent
+    /// link replaces the old raster inspection), and ungroup.
+    fn group_panel(&mut self, ui: &mut egui::Ui, snap: UiSnapshot) {
+        let Some(gid) = self.single_sel() else { return };
+        let n = self.model.subtree_ids(gid).len() - 1;
+        ui.label(super::theme::heading(format!("Group — {n} objects")));
+        if self.model.eff_locked(gid) {
+            ui.label(
+                egui::RichText::new(
+                    "Locked groups can't be edited or moved. Unlock from \
+                     the model tree.",
+                )
+                .small()
+                .weak(),
+            );
+            return;
+        }
+
+        // Engine block: a Fan-material child powering a stamp child.
+        let fan_child = self.model.children_of(gid).into_iter().find(|&c| {
+            self.model
+                .find(c)
+                .map(|i| {
+                    self.model.objects[i].material == ObjMaterial::Fan
+                        && !matches!(self.model.objects[i].shape, Shape::Group { .. })
+                })
+                .unwrap_or(false)
+        });
+        let has_stamp_child = self.model.children_of(gid).into_iter().any(|c| {
+            self.model
+                .find(c)
+                .map(|i| matches!(self.model.objects[i].shape, Shape::Stamp { .. }))
+                .unwrap_or(false)
+        });
+        if let (Some(fan_id), true) = (fan_child, has_stamp_child) {
+            if let Some(fi) = self.model.find(fan_id) {
+                let before = self.model.objects[fi].clone();
+                let mut fan = before.clone();
+                let drive = self.engine_group(ui, snap, &mut fan, 1.0);
+                if drive {
+                    self.model.objects[fi] = fan;
+                    self.model.record_modify_coalesced(fan_id, before);
+                }
+            }
+        }
+
+        self.selection_transform_rows(ui);
+
+        ui.horizontal(|ui| {
+            if ui.button("Ungroup (Ctrl+Shift+G)").clicked() {
+                self.ungroup_selected();
+            }
+            if ui.button("Duplicate (Ctrl+D)").clicked() {
+                self.duplicate_selected();
+            }
+            if ui.button("Delete (Del)").clicked() {
+                self.delete_selected();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Double-click a member on the canvas to enter the group \
+                 and edit it alone (Esc leaves). Deleting the group \
+                 deletes everything inside — one undo restores it.",
             )
             .small()
             .weak(),

@@ -55,6 +55,72 @@ unit status and pointers here.
   applies to the whole editable selection (never silently seeded
   from the first object). Rotate/scale of a set is deferred to U3.
 
+## U3 (transforms + nested groups)
+
+- **Composition order (the one U3 decision that must never drift):
+  child transform first, then each ancestor outward** — world =
+  `T_root ∘ … ∘ T_parent`(stored). Stored coordinates are PARENT-space;
+  `SketchModel::abs_of` walks inner→outer, left-composing. Also stated
+  in CLAUDE.md, per the plan.
+- A group is an object: `Shape::Group { t, rot, scale }` (appended
+  enum variant + appended `parent: Option<u64>` field keep bincode
+  positional compatibility; pre-v8 objects decode via the
+  `SketchObjectV7` mirror). Group transforms are **similarities**
+  (uniform scale only): the only family closed under composition that
+  the shape set can represent — non-uniform world scaling of a rotated
+  nest is shear, which Rect/Ellipse/Stamp cannot store. Hence gizmo
+  and panel scaling are uniform; per-axis reshaping stays on the
+  single-object vertex handles, and the stamp tooltip declares
+  non-uniform stamp scaling out of scope (plan requirement).
+- Group nodes carry no z-slot semantics (they never rasterize) and
+  subtrees are NOT kept contiguous in `model.objects` — flat list
+  order stays the z-order; the tree nests by `parent` walk. Z-order
+  ops expand to whole subtrees.
+- Transforming a group is O(1) (its node's transform edits); members
+  follow through composition. World-space edits go through
+  `translate_world`/`rotate_world`/`scale_world` — a similarity
+  conjugates a rotation/uniform-scale to the same rotation/scale about
+  the mapped pivot, so gestures apply world deltas in stored space
+  exactly. Gizmo drags restore `before` and re-apply the accumulated
+  total each frame (no per-frame error compounding).
+- Interactive `scale_about` does not scale leaf `thickness` (U1/U2
+  precedent); flattening through a scaled GROUP does (`apply_sim`) —
+  a scaled-down group renders proportionally thinner strokes. Known,
+  deliberate asymmetry.
+- **Cycle prevention is mandatory and double-layered**: live
+  `reparent` refuses self/descendant targets (tested in model.rs);
+  `sanitize_parents` (app.rs) repairs crafted files — dangling or
+  non-group parents detach, cycles break. Every ancestor walk is
+  hop-capped besides.
+- Selection: click picks the OUTERMOST group; double-click enters a
+  group (`entered_group`) so clicks pick one level below; Esc leaves,
+  then deselects. When an ancestor and its descendant are both
+  selected, only the ancestor transforms (`transform_targets`).
+  Lock/hide are effective through the chain (`eff_locked/eff_hidden`).
+- Copy flattens copied roots to world space (paste is scene-load
+  robust); duplicate keeps copies as siblings inside their group.
+  Delete removes whole subtrees child-first as one undo entry.
+- The gizmo rotate handle snaps to `snap_angle_deg` while Shift is
+  held (the draw-tool convention); corner scale is uniform, so plan
+  v4.1's "Shift constrains scale to uniform" is trivially satisfied.
+- Scene **v8**: `parent` + `Group` nodes + probes (positions,
+  quantity, show_plot) persisted; loads v3–v7 (T2-C takes v9).
+- T2-B debt closed: `sim::probes()` static Mutex removed. Store =
+  `Settings.probes`, edits = `Cmd::{AddProbe,RemoveProbe,
+  SetProbeQuantity,SetProbePlot,ClearProbeSamples,LoadProbes}`, read =
+  per-frame `ProbeUi` snapshot (sample series cloned only while the
+  plot shows). Probe markers draw from the canvas's own mapping
+  (`canvas_mapping`) — the sim no longer publishes a view transform;
+  probe placement is a real canvas interaction now (`probe_arming`).
+  The plot/legend conversion unification into `ui/units.rs` remains
+  open (tracked under T2-B's notes below).
+- Nozzle free win: `generate_nozzle` emits walls only;
+  `nozzle_fan_layout` mirrors its layout math for the chamber-fan
+  rect, inserted as a real Fan child in an Engine group (one
+  `add_many` undo entry). The Engine inspector keys off the parent
+  link (Fan child + stamp child); the raster-scan path survives ONLY
+  for pre-v8 scenes with baked fan cells.
+
 ## T2-A (locked color range + colormap)
 
 Full write-up: `docs/t2a-color-range.md`.

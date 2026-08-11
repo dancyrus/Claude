@@ -4,7 +4,7 @@
 //! floating selection, so the user can position/rotate it before
 //! committing.
 
-use crate::geometry::{GeoRegion, CELL_FLUID, CELL_INLET, CELL_WALL};
+use crate::geometry::{GeoRegion, CELL_FLUID, CELL_WALL};
 
 // --- Airfoils --------------------------------------------------------
 
@@ -220,8 +220,31 @@ fn nozzle_half_width(p: &NozzleParams, conv_len: f32, div_len: f32, x: f32) -> f
     }
 }
 
-/// Rasterize a nozzle into a stamp, axis along +x (flow left to right:
-/// chamber on the left, bell exit on the right).
+/// The chamber-fan rectangle of a nozzle, as (centre offset from the
+/// stamp's centre, half-extents), both in stamp cells. Mirrors the
+/// layout math in `generate_nozzle`: the strip spans axial [0, 3) cells
+/// at the chamber entrance, full chamber height. Since U3 the fan is a
+/// REAL child object (a filled Fan rect grouped with the bell) instead
+/// of baked `CELL_INLET` cells — the Engine panel keys off the parent
+/// link, not raster inspection.
+pub fn nozzle_fan_layout(p: &NozzleParams) -> ([f32; 2], [f32; 2]) {
+    let rt = p.throat_cells * 0.5;
+    let conv_len = p.conv_ratio * p.throat_cells;
+    let div_len = p.div_ratio * p.throat_cells;
+    let rc = rt * p.chamber_ratio;
+    let chamber_len = (rc * 1.2).max(p.throat_cells);
+    let total_len = chamber_len + conv_len + div_len;
+    let back_wall = p.wall_cells.ceil();
+    let w = (total_len + back_wall).ceil() as usize + 4;
+    // The strip is vertically centred (dy = 0); its cell centres run
+    // x+0.5 ∈ [2 + back_wall, 5 + back_wall).
+    let cx = 3.5 + back_wall;
+    ([cx - w as f32 * 0.5, 0.0], [1.5, rc])
+}
+
+/// Rasterize a nozzle's WALLS into a stamp, axis along +x (flow left to
+/// right: chamber on the left, bell exit on the right). The chamber fan
+/// is not baked in — see `nozzle_fan_layout`.
 pub fn generate_nozzle(p: &NozzleParams) -> GeoRegion {
     let rt = p.throat_cells * 0.5;
     let conv_len = p.conv_ratio * p.throat_cells;
@@ -238,8 +261,8 @@ pub fn generate_nozzle(p: &NozzleParams) -> GeoRegion {
     let cy = h as f32 * 0.5;
 
     let mut cell = vec![CELL_FLUID; w * h];
-    let mut fan = vec![[0.0f32; 4]; w * h];
-    let mut dye_src = vec![[0.0f32; 4]; w * h];
+    let fan = vec![[0.0f32; 4]; w * h];
+    let dye_src = vec![[0.0f32; 4]; w * h];
 
     // Inner half-width at any axial position (clamped into the nozzle).
     let half_at = |ax: f32| -> f32 {
@@ -279,13 +302,6 @@ pub fn generate_nozzle(p: &NozzleParams) -> GeoRegion {
             let hmax = h0.max(h1).max(h2);
             if ay > hmin && ay <= hmax + p.wall_cells {
                 cell[i] = CELL_WALL;
-            } else if ay <= h1 && p.chamber_fan && ax < 3.0 {
-                // Fan strip across the chamber entrance, blowing +x at
-                // the preset-scaled speed, with a little smoke so the
-                // plume is visible immediately.
-                cell[i] = CELL_INLET;
-                fan[i] = [p.fan_mult.clamp(0.2, 2.0), 0.0, 0.0, 0.0];
-                dye_src[i] = [0.95, 0.85, 0.55, 0.85];
             }
         }
     }

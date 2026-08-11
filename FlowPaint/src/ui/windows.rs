@@ -53,12 +53,15 @@ impl FlowPaintApp {
                         ("Del", "delete the selection"),
                         ("Ctrl+D", "duplicate the selection"),
                         ("Ctrl+C / Ctrl+V", "copy / paste (Shift+V in place)"),
+                        ("Ctrl+G / Ctrl+Shift+G", "group / ungroup the selection"),
+                        ("Double-click a member", "enter its group (Esc leaves)"),
                         ("Ctrl+] / Ctrl+[", "raise / lower (+Shift: front / back)"),
                         ("Arrows (+Shift for coarse)", "nudge the selection"),
+                        ("Shift on the rotate handle", "snap to the angle-snap step"),
                         ("Shift while drawing", "angle-snapped lines · squares · circles"),
                         ("Alt while drawing", "rect/ellipse from centre"),
                         ("Enter / right-click", "finish the polyline"),
-                        ("Esc", "cancel gesture / deselect"),
+                        ("Esc", "cancel gesture / leave group / deselect"),
                     ] {
                         ui.label(k);
                         ui.label(v);

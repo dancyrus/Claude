@@ -210,8 +210,8 @@ impl FlowPaintApp {
                 };
                 ui.label(egui::RichText::new(solver_note).small().weak());
                 if ui.button("Insert into scene").clicked() {
-                    let stamp = gen::generate_nozzle(p);
-                    self.insert_stamp_object(stamp);
+                    let params = *p;
+                    self.insert_nozzle_object(params);
                 }
             });
         self.show_nozzle_gen = show;
