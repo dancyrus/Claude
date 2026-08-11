@@ -142,3 +142,25 @@ T2-A's range sync (a 3-entry loop of scalar math per frame) and T2-B's
 probe sampling (no probes placed → no GPU copies) add nothing
 measurable; the solver path is untouched by the merge except T2-A's
 render.wgsl flags-bit branch, which is uniform per frame.
+
+## Post-U3 measurement (transforms + nested groups, canvas rewrite)
+
+Paired back-to-back A/B in one session (same container, no other load;
+lavapipe, so relative comparison only), run in both orders:
+
+```
+A = merged tip 6127fff, B = U3 (groups/gizmo/v8/probe fold)   mean       p99
+pair 1 (A first): A 1080.97 / 1247.74   B 1077.31 / 1267.35
+pair 2 (B first): B 1071.67 / 1231.64   A 1089.61 / 1484.24
+```
+
+Order-independent result: mean −0.3 % / −1.6 %, p99 +1.6 % / −17 % —
+inside run-to-run noise in both orders; no regression. Expected: the
+bench scene has no groups, so every per-object `parent_abs` walk
+short-circuits at `parent: None` and rasterization takes the identity
+fast path (no flatten clones); the gizmo only draws with a selection
+and the Select tool active (the bench selects nothing); no probes are
+placed, so the probe fold changes nothing on the hot path. The solver
+path (`sim.rs` compute + shaders) is untouched by U3 except the removal
+of the probe store's Mutex locking, which if anything is a hair
+cheaper.
