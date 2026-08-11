@@ -267,10 +267,194 @@ pub const FIELD_RANGE_DEFAULTS: [FieldRange; 4] = [
     field_range_default(ColorMap::Coolwarm), // Pressure
 ];
 
+// --- Per-edge boundary conditions (plan v4.1, T2-C) -------------------
+//
+// Each of the four domain edges carries one of the kinds below. Far
+// field is the pre-T2-C open edge exactly: no cells painted, the
+// solvers' zero-gradient handling plus the margin sponge. Inlet, outlet
+// and wall bake 2-cell bands of the existing per-cell types at the true
+// grid edges — the same bands the legacy wind-tunnel rasterizer paints —
+// so neither shader learned anything new.
+
+/// What one domain edge does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EdgeKind {
+    /// Open far field: nothing painted — the zero-gradient edge plus the
+    /// sponge toward the freestream (what every edge did before T2-C).
+    FarField,
+    /// A 2-cell inlet band blowing straight into the domain at the
+    /// global inlet speed (LBM flow_speed / Euler Mach).
+    Inlet,
+    /// A 2-cell pressure-outlet band.
+    Outlet,
+    /// A 2-cell wall band (LBM bounce-back / Euler slip mirror).
+    Wall,
+    /// RESERVED (scene v9 discriminant 4, not selectable): periodic wrap
+    /// needs the streaming/stencil indexing changed in BOTH kernels,
+    /// which the shader freeze blocks. Treated as far field if a future
+    /// file carries it, so adding it later needs no format bump.
+    Periodic,
+}
+
+impl EdgeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            EdgeKind::FarField => "Far field",
+            EdgeKind::Inlet => "Inlet",
+            EdgeKind::Outlet => "Outlet",
+            EdgeKind::Wall => "Wall",
+            EdgeKind::Periodic => "Periodic",
+        }
+    }
+    /// Compact form for the ribbon summary line.
+    pub fn short(self) -> &'static str {
+        match self {
+            EdgeKind::FarField => "far",
+            EdgeKind::Inlet => "in",
+            EdgeKind::Outlet => "out",
+            EdgeKind::Wall => "wall",
+            EdgeKind::Periodic => "per",
+        }
+    }
+}
+
+/// Display names for the `EdgeBcs` array order. Top = grid row 0, which
+/// is the top of the screen (cell y grows downward).
+pub const EDGE_NAMES: [&str; 4] = ["Left", "Right", "Top", "Bottom"];
+
+/// The four edges' kinds, ordered left, right, top, bottom.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EdgeBcs(pub [EdgeKind; 4]);
+
+impl EdgeBcs {
+    /// Every edge open — legacy `wind_tunnel: false`.
+    pub const OPEN: EdgeBcs = EdgeBcs([EdgeKind::FarField; 4]);
+    /// The wind-tunnel preset — legacy `wind_tunnel: true`: the exact
+    /// bands the model rasterizer has always painted (left inlet, right
+    /// outlet), with far-field top and bottom.
+    pub const WIND_TUNNEL: EdgeBcs = EdgeBcs([
+        EdgeKind::Inlet,
+        EdgeKind::Outlet,
+        EdgeKind::FarField,
+        EdgeKind::FarField,
+    ]);
+
+    /// The edge set a pre-v9 scene's `wind_tunnel` flag implies.
+    pub fn legacy(wind_tunnel: bool) -> EdgeBcs {
+        if wind_tunnel { Self::WIND_TUNNEL } else { Self::OPEN }
+    }
+
+    /// The preset keeps the model rasterizer's own tunnel-band painting
+    /// (byte-identical to pre-T2-C output); every other set goes through
+    /// `paint_edge_bcs`.
+    pub fn is_tunnel_preset(self) -> bool {
+        self == Self::WIND_TUNNEL
+    }
+
+    /// A sponged wall is not a wall: the sponge relaxes near-edge cells
+    /// toward the freestream, silently overriding the no-slip condition
+    /// — so any wall edge turns the sponge off (width 0, CPU-side; the
+    /// sponge cannot be per-edge without a shader change). Inlet and
+    /// outlet edges KEEP the sponge: that is the legacy wind-tunnel
+    /// combination, and dropping it would change existing scenes.
+    pub fn disables_sponge(self) -> bool {
+        self.0.iter().any(|k| matches!(k, EdgeKind::Wall))
+    }
+}
+
+/// Bake the non-preset edge bands into the geometry layers, clipped to
+/// the region the rasterizer just repainted (writing outside it would
+/// grow the dirty rect to the whole perimeter and force full-grid
+/// re-uploads on every damage event). Runs after the object pass, so
+/// inside the 2-cell bands the domain boundary wins over objects. Band
+/// style matches the legacy tunnel bands (model.rs `rasterize_region`):
+/// inlets seed 2-of-12 dye stripes so the flow reads on the smoke view.
+pub fn paint_edge_bcs(
+    geo: &mut Geometry,
+    edges: EdgeBcs,
+    region_vis: GridRect,
+    margin: usize,
+) {
+    use crate::geometry::{CELL_INLET, CELL_OUTLET, CELL_WALL};
+    // The preset's bands are the rasterizer's own; all-far-field paints
+    // nothing (Periodic acts as far field until it lands post-freeze).
+    if edges.is_tunnel_preset()
+        || !edges
+            .0
+            .iter()
+            .any(|k| matches!(k, EdgeKind::Inlet | EdgeKind::Outlet | EdgeKind::Wall))
+    {
+        return;
+    }
+    let m = margin as i32;
+    let clip = GridRect {
+        x0: region_vis.x0.saturating_add(m),
+        y0: region_vis.y0.saturating_add(m),
+        x1: region_vis.x1.saturating_add(m),
+        y1: region_vis.y1.saturating_add(m),
+    }
+    .clampped(geo.w, geo.h);
+    if clip.is_empty() {
+        return;
+    }
+    const BAND: i32 = 2; // legacy tunnel-band depth
+    let (gw, gh) = (geo.w as i32, geo.h as i32);
+    // Each edge's band rect (full-grid coords) and inward unit normal,
+    // in EDGE_NAMES order.
+    let strips = [
+        (GridRect { x0: 0, y0: 0, x1: BAND.min(gw), y1: gh }, [1.0, 0.0]),
+        (GridRect { x0: (gw - BAND).max(0), y0: 0, x1: gw, y1: gh }, [-1.0, 0.0]),
+        (GridRect { x0: 0, y0: 0, x1: gw, y1: BAND.min(gh) }, [0.0, 1.0]),
+        (GridRect { x0: 0, y0: (gh - BAND).max(0), x1: gw, y1: gh }, [0.0, -1.0]),
+    ];
+    // Two passes so walls win the corners where bands overlap: a wall
+    // edge stays sealed no matter what its neighbour is.
+    for wall_pass in [false, true] {
+        for (i, (strip, inward)) in strips.iter().enumerate() {
+            let kind = edges.0[i];
+            if (kind == EdgeKind::Wall) != wall_pass {
+                continue;
+            }
+            let (cell, fan, seed_dye) = match kind {
+                EdgeKind::FarField | EdgeKind::Periodic => continue,
+                EdgeKind::Inlet => {
+                    (CELL_INLET, [inward[0], inward[1], 0.0, 0.0], true)
+                }
+                EdgeKind::Outlet => (CELL_OUTLET, [0.0; 4], false),
+                EdgeKind::Wall => (CELL_WALL, [0.0; 4], false),
+            };
+            let r = strip.intersect(clip);
+            if r.is_empty() {
+                continue;
+            }
+            for y in r.y0..r.y1 {
+                for x in r.x0..r.x1 {
+                    let idx = y as usize * geo.w + x as usize;
+                    geo.cell[idx] = cell;
+                    geo.fan[idx] = fan;
+                    // Dye seed stripes run along the edge: the legacy
+                    // 2-of-12 pattern in the coordinate the band spans.
+                    let along = if inward[0] != 0.0 { y } else { x };
+                    geo.dye_src[idx] = if seed_dye && (along % 12) < 2 {
+                        [0.92, 0.94, 1.0, 0.9]
+                    } else {
+                        [0.0; 4]
+                    };
+                }
+            }
+        }
+    }
+}
+
 /// Simulation settings mirrored by the UI.
 pub struct Settings {
     pub paused: bool,
+    /// The freestream switch: far-field edges (sponge target `free_u`)
+    /// and the reset state carry the tunnel inflow while this is on.
+    /// `Cmd::SetWindTunnel` also re-arms the legacy edge preset.
     pub wind_tunnel: bool,
+    /// Per-edge boundary conditions (T2-C).
+    pub edges: EdgeBcs,
     pub solver: SolverMode,
     /// Euler mode: inlet Mach number (freestream speed / sound speed).
     pub mach: f32,
@@ -302,6 +486,7 @@ impl Default for Settings {
         Self {
             paused: false,
             wind_tunnel: true,
+            edges: EdgeBcs::WIND_TUNNEL,
             solver: SolverMode::Lbm,
             mach: 1.6,
             flow_speed: 0.09,
@@ -1172,7 +1357,29 @@ impl GpuSim {
 
     pub fn set_wind_tunnel(&mut self, on: bool) {
         self.settings.wind_tunnel = on;
-        // The model rasterizer paints or clears the tunnel bands.
+        // The tunnel toggle is the edge preset: it re-arms the legacy
+        // edge set along with the freestream (the model rasterizer
+        // paints or clears the tunnel bands).
+        self.settings.edges = EdgeBcs::legacy(on);
+    }
+
+    /// Bake the per-edge boundary bands after a model repaint. A no-op
+    /// for the wind-tunnel preset, whose bands the rasterizer itself
+    /// paints (byte-identical to pre-T2-C output).
+    pub fn apply_edge_bcs(&mut self, region_vis: GridRect) {
+        paint_edge_bcs(&mut self.geo, self.settings.edges, region_vis, self.margin);
+    }
+
+    /// The sponge thickness the shaders see this frame. Any wall edge
+    /// turns the absorbing layer off entirely (see
+    /// `EdgeBcs::disables_sponge`); per-edge sponge control would need
+    /// a shader change.
+    fn sponge_width_cells(&self) -> f32 {
+        if self.settings.edges.disables_sponge() {
+            0.0
+        } else {
+            self.margin.min(96) as f32
+        }
     }
 
 
@@ -1304,7 +1511,7 @@ impl GpuSim {
             inlet_speed: self.settings.flow_speed,
             dye_dt: steps as f32,
             dye_decay: if self.settings.paused { 1.0 } else { self.settings.dye_fade },
-            sponge_width: (self.margin.min(96)) as f32,
+            sponge_width: self.sponge_width_cells(),
             sponge_strength: self.settings.sponge_strength,
             free_u: if self.settings.wind_tunnel {
                 [self.settings.flow_speed, 0.0]
@@ -1344,7 +1551,7 @@ impl GpuSim {
                 mach: self.settings.mach,
                 dt: dt_e,
                 blend: 0.0,
-                sponge_width: (self.margin.min(96)) as f32,
+                sponge_width: self.sponge_width_cells(),
                 sponge_strength: self.settings.sponge_strength,
                 free_u,
                 time: time_now,
@@ -1743,5 +1950,121 @@ impl GpuSim {
     pub fn reynolds_estimate(&self) -> u32 {
         let l = 0.16 * self.vis_h as f32;
         (self.settings.flow_speed * l / self.settings.viscosity.max(1e-5)) as u32
+    }
+}
+
+#[cfg(test)]
+mod edge_bc_tests {
+    use super::*;
+    use crate::geometry::{CELL_FLUID, CELL_INLET, CELL_OUTLET, CELL_WALL};
+
+    fn fresh_geo(w: usize, h: usize) -> Geometry {
+        Geometry::new(w, h)
+    }
+
+    /// The acceptance property: for both legacy edge sets (tunnel on and
+    /// off) the painter is a strict no-op, so a pre-v9 scene's geometry
+    /// layers are byte-identical to what the rasterizer alone produced.
+    #[test]
+    fn legacy_edge_sets_paint_nothing() {
+        for edges in [EdgeBcs::WIND_TUNNEL, EdgeBcs::OPEN] {
+            let mut geo = fresh_geo(40, 20);
+            // Scatter sentinel content the painter must not disturb.
+            geo.cell[0] = CELL_WALL;
+            geo.fan[41] = [0.5, 0.5, 0.1, 0.2];
+            geo.dye_src[7] = [1.0, 0.0, 0.0, 1.0];
+            let before = (geo.cell.clone(), geo.fan.clone(), geo.dye_src.clone());
+            paint_edge_bcs(&mut geo, edges, GridRect::full(40, 20), 0);
+            assert_eq!(geo.cell, before.0);
+            assert_eq!(geo.fan, before.1);
+            assert_eq!(geo.dye_src, before.2);
+        }
+    }
+
+    /// A custom set paints 2-cell bands at the true grid edges with the
+    /// legacy band style: inlet fan = inward unit normal, 2-of-12 dye
+    /// seed stripes; outlet and far-field edges as expected.
+    #[test]
+    fn custom_edges_paint_bands() {
+        let (w, h) = (40usize, 20usize);
+        let mut geo = fresh_geo(w, h);
+        let edges = EdgeBcs([
+            EdgeKind::Inlet,    // left
+            EdgeKind::Outlet,   // right
+            EdgeKind::Wall,     // top
+            EdgeKind::FarField, // bottom
+        ]);
+        paint_edge_bcs(&mut geo, edges, GridRect::full(w, h), 0);
+        // Left inlet band (below the top wall band, which wins corners).
+        let i = 5 * w; // row 5, col 0
+        assert_eq!(geo.cell[i], CELL_INLET);
+        assert_eq!(geo.fan[i], [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(geo.cell[i + 1], CELL_INLET);
+        assert_eq!(geo.cell[i + 2], CELL_FLUID);
+        // Dye seed stripes: rows 0/1 of each 12 seed, the rest don't —
+        // but rows 0/1 are the wall band here, so check rows 12/13 vs 5.
+        assert_eq!(geo.dye_src[12 * w], [0.92, 0.94, 1.0, 0.9]);
+        assert_eq!(geo.dye_src[13 * w], [0.92, 0.94, 1.0, 0.9]);
+        assert_eq!(geo.dye_src[5 * w], [0.0; 4]);
+        // Right outlet band.
+        assert_eq!(geo.cell[5 * w + (w - 1)], CELL_OUTLET);
+        assert_eq!(geo.cell[5 * w + (w - 2)], CELL_OUTLET);
+        assert_eq!(geo.cell[5 * w + (w - 3)], CELL_FLUID);
+        // Top wall band, and it wins the corner over the left inlet.
+        assert_eq!(geo.cell[0], CELL_WALL);
+        assert_eq!(geo.cell[w + 1], CELL_WALL);
+        assert_eq!(geo.cell[5], CELL_WALL);
+        // Bottom far field: untouched fluid.
+        assert_eq!(geo.cell[(h - 1) * w + 5], CELL_FLUID);
+        assert_eq!(geo.cell[(h - 2) * w + 5], CELL_FLUID);
+    }
+
+    /// The painter clips to the repainted region: cells outside it (and
+    /// the dirty rect) stay untouched, so damage-region uploads never
+    /// balloon to the full perimeter.
+    #[test]
+    fn painting_clips_to_region() {
+        let (w, h) = (40usize, 20usize);
+        let mut geo = fresh_geo(w, h);
+        let edges = EdgeBcs([
+            EdgeKind::Wall,
+            EdgeKind::FarField,
+            EdgeKind::FarField,
+            EdgeKind::FarField,
+        ]);
+        geo.dirty = None;
+        // Repaint rows 4..8 of a region that spans the margin too
+        // (visible coords, margin 2 -> grid rows 6..10, all columns).
+        // A region that does NOT reach x = -margin never touches the
+        // left band — partial object-drag repaints leave edge bands to
+        // the earlier full paint, exactly like the legacy tunnel bands.
+        let region = GridRect { x0: -2, y0: 4, x1: 40, y1: 8 };
+        paint_edge_bcs(&mut geo, edges, region, 2);
+        assert_eq!(geo.cell[6 * w], CELL_WALL);
+        assert_eq!(geo.cell[9 * w], CELL_WALL);
+        assert_eq!(geo.cell[5 * w], CELL_FLUID); // above the clip
+        assert_eq!(geo.cell[10 * w], CELL_FLUID); // below the clip
+        // Painting inside the already-dirty region must not re-dirty.
+        assert!(geo.dirty.is_none());
+    }
+
+    /// The sponge rule: only a wall edge disables the sponge. The legacy
+    /// tunnel preset (inlet + outlet edges) keeps it — that pairing is
+    /// the shipped pre-T2-C behavior.
+    #[test]
+    fn sponge_disabled_only_by_walls() {
+        assert!(!EdgeBcs::OPEN.disables_sponge());
+        assert!(!EdgeBcs::WIND_TUNNEL.disables_sponge());
+        let mut e = EdgeBcs::WIND_TUNNEL;
+        e.0[3] = EdgeKind::Wall;
+        assert!(e.disables_sponge());
+        assert!(!EdgeBcs([EdgeKind::Inlet; 4]).disables_sponge());
+    }
+
+    /// Legacy flag mapping used by every pre-v9 load path.
+    #[test]
+    fn legacy_mapping() {
+        assert!(EdgeBcs::legacy(true).is_tunnel_preset());
+        assert_eq!(EdgeBcs::legacy(false), EdgeBcs::OPEN);
     }
 }

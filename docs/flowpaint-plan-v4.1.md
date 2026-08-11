@@ -304,8 +304,12 @@ solver rather than a sandbox. Today it is one `wind_tunnel: bool` (`sim.rs:72`).
 - `wind_tunnel: true` becomes the preset "left inlet, right outlet, top and bottom wall", so
   existing scenes load unchanged.
 - Both solvers need the edge handling. **Check what the existing inlet and outlet paths
-  (`sim.rs:126`, `sim.rs:182`) already support before designing, and report if either solver
-  cannot express a case without a shader change.**
+  already support before designing, and report if either solver cannot express a case
+  without a shader change.** Those paths are the per-cell `CELL_INLET`/`CELL_OUTLET` arms
+  in `lbm.wgsl` and `euler.wgsl`, plus the 2-cell tunnel bands the rasterizer paints at
+  the grid edges when `wind_tunnel` is on (`model.rs`, `rasterize_region`). (This bullet
+  used to cite `sim.rs:126`/`sim.rs:182` — line numbers from a pre-overhaul revision that
+  had gone stale and pointed at nothing relevant.)
 - Scene format bump, earlier load paths retained. Coordinate the version number with U2 and
   U3 — whichever track lands second takes the higher number.
 

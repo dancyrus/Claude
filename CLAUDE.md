@@ -31,13 +31,21 @@ Per-unit decisions later units must not re-derive live in
   unimplemented (needs a per-mode offset in `render.wgsl`).
 - **T2-B (probes + Re input): done**, branch
   `claude/flowpaint-v4.1-t2b-probes` (off the U1 tip).
-- Scene format: **v7** current, loads v3+ (v3 lacks solver fields;
+- **T2-C (per-edge boundary conditions): done**, branch
+  `claude/t2-c-boundary-conditions-s0iupf` (off the T2+U2 integration
+  merge tip). Kinds: far field / inlet / outlet / wall; **periodic is
+  reserved** (scene discriminant 4, greyed in the UI) — it needs both
+  kernels' streaming/stencil indexing changed, blocked by the shader
+  freeze. Read `docs/unit-decisions.md` §T2-C before touching edges,
+  the sponge, or the tunnel preset.
+- Scene format: **v9** current, loads v3+ (v3 lacks solver fields;
   v4/v5 share a layout; v6 appends per-object `locked`/`hidden`, so
   pre-v6 objects decode via the `SketchObjectV5` mirror; v7 appends
-  the color ranges + colormap picks, defaulted for older files — see
-  `SceneV3`/`SceneV4`/`SceneV6`/`SceneV7` in `app.rs`). U3 and T2-C:
-  the next bump is **v8** (plan v4.1's version numbers run one low —
-  do not repeat the off-by-one).
+  the color ranges + colormap picks; **v8 is U3's**, concurrent — its
+  fields and decode arm fold into `SceneV9` at the track merge, a
+  planned app.rs seam; v9 appends the four edge kinds, derived from
+  `wind_tunnel` for older files — see `SceneV3`…`SceneV9` in
+  `app.rs`).
 - The track merge folded T2-A's color-range state out of the sim.rs
   Mutex into `Settings.ranges` + `Cmd`, and persists it in scene v7
   (U5's PNG export needs a locked range to survive a save). T2-B's
@@ -97,6 +105,18 @@ shaders: **LBM `MAX_LATTICE_SPEED = 0.3` binds almost always**
 (lbm.wgsl); Euler's Mach-8 sanity clamp effectively never (euler.wgsl).
 The "(speed-capped)" label is an incompressible-mode artifact. The cap
 is a *readout*, not a field — the binding constants live in shaders.
+
+## Edge BCs and the sponge (T2-C coupling)
+
+`Settings.edges` holds the four edge kinds; non-preset sets are baked
+as 2-cell bands by `sim::paint_edge_bcs` after the object pass. The
+wind-tunnel preset {left inlet, right outlet, top/bottom far field}
+instead keeps the model rasterizer's legacy band painting byte-for-byte
+(`rasterize_region`'s `wind_tunnel` flag = "edges == preset"). **Any
+WALL edge forces the absorbing sponge to width 0** (a sponged wall is
+not a wall); inlet/outlet edges keep the sponge — that pairing is the
+legacy tunnel and must not change. `wind_tunnel` remains the freestream
+switch; toggling it re-arms the preset.
 
 ## Frame-time baseline (plan working rules)
 

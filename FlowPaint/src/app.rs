@@ -6,8 +6,8 @@
 
 use crate::model::{ObjMaterial, Shape, SketchModel, SketchObject};
 use crate::sim::{
-    ColorMap, FieldRange, GpuSim, RangeMode, RenderMode, SolverMode,
-    ViewportMapping, DEFAULT_MARGIN_INDEX, RESOLUTIONS,
+    ColorMap, EdgeBcs, EdgeKind, FieldRange, GpuSim, RangeMode, RenderMode,
+    SolverMode, ViewportMapping, DEFAULT_MARGIN_INDEX, RESOLUTIONS,
 };
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -269,11 +269,92 @@ impl From<FieldRange> for SceneRange {
     }
 }
 
+/// Scene file (version 9): the v7 layout plus the four per-edge boundary
+/// kinds (T2-C). v8 belongs to U3 (concurrent track); the version numbers
+/// are coordinated so v9 is strictly newer.
+///
+/// MERGE SEAM (planned app.rs conflict): at the track merge, fold U3's
+/// v8 fields into this struct ABOVE `edges` (append-only layout, like
+/// every earlier bump) and route the v8 decode arm through U3's struct.
+#[derive(Serialize, Deserialize)]
+struct SceneV9 {
+    version: u32,
+    objects: Vec<SketchObject>,
+    wind_tunnel: bool,
+    flow_speed: f32,
+    viscosity: f32,
+    steps_per_frame: u32,
+    domain_width_m: f32,
+    fluid_nu: f32,
+    fluid_rho: f32,
+    ref_width: u32,
+    /// 0 = LBM (incompressible), 1 = Euler (compressible).
+    solver: u32,
+    mach: f32,
+    fluid_a: f32,
+    /// Indexed by `RenderMode as usize`; the Dye entry is unused.
+    ranges: [SceneRange; 4],
+    /// Edge kinds in `EDGE_NAMES` order (left, right, top, bottom):
+    /// 0 = far field, 1 = inlet, 2 = outlet, 3 = wall, 4 = RESERVED for
+    /// periodic (blocked by the shader freeze; loads as far field).
+    edges: [u32; 4],
+}
+
+impl SceneV9 {
+    /// A pre-v9 scene: the edge set its `wind_tunnel` flag implies.
+    fn from_v7(s: SceneV7) -> Self {
+        SceneV9 {
+            version: s.version,
+            objects: s.objects,
+            wind_tunnel: s.wind_tunnel,
+            flow_speed: s.flow_speed,
+            viscosity: s.viscosity,
+            steps_per_frame: s.steps_per_frame,
+            domain_width_m: s.domain_width_m,
+            fluid_nu: s.fluid_nu,
+            fluid_rho: s.fluid_rho,
+            ref_width: s.ref_width,
+            solver: s.solver,
+            mach: s.mach,
+            fluid_a: s.fluid_a,
+            ranges: s.ranges,
+            edges: EdgeBcs::legacy(s.wind_tunnel).0.map(edge_kind_to_u32),
+        }
+    }
+}
+
+fn edge_kind_to_u32(k: EdgeKind) -> u32 {
+    match k {
+        EdgeKind::FarField => 0,
+        EdgeKind::Inlet => 1,
+        EdgeKind::Outlet => 2,
+        EdgeKind::Wall => 3,
+        EdgeKind::Periodic => 4,
+    }
+}
+
+/// Unknown discriminants (a newer file) fall back to far field — the
+/// only kind that is always safe. 4 stays mapped to the reserved
+/// periodic variant, which paints nothing until it ships post-freeze.
+fn edge_kind_from_u32(v: u32) -> EdgeKind {
+    match v {
+        1 => EdgeKind::Inlet,
+        2 => EdgeKind::Outlet,
+        3 => EdgeKind::Wall,
+        4 => EdgeKind::Periodic,
+        _ => EdgeKind::FarField,
+    }
+}
+
 const SCENE_V3: u32 = 3;
 const SCENE_V4: u32 = 4;
 const SCENE_V5: u32 = 5;
 const SCENE_V6: u32 = 6;
 const SCENE_V7: u32 = 7;
+/// Owned by U3 (concurrent track); its decode arm lands at the track
+/// merge. Until then no v8 file can exist in this branch's lineage.
+const SCENE_V8: u32 = 8;
+const SCENE_V9: u32 = 9;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -443,6 +524,8 @@ struct UiSnapshot {
     fade: f32,
     paused: bool,
     tunnel: bool,
+    /// Per-edge boundary kinds (T2-C).
+    edges: EdgeBcs,
     tints: bool,
     mode: RenderMode,
     solver: SolverMode,
@@ -472,6 +555,10 @@ enum Cmd {
     SetSolver(SolverMode),
     SetMach(f32),
     SetWindTunnel(bool),
+    /// Set one edge's boundary kind (T2-C; index in `EDGE_NAMES` order).
+    SetEdgeBc(usize, EdgeKind),
+    /// Replace the whole edge set (scene load / dialog presets).
+    SetEdgeBcs(EdgeBcs),
     SetResolution(usize),
     SetMarginFrac(f32),
     SetParticles(u32),
@@ -541,6 +628,8 @@ pub struct FlowPaintApp {
     ribbon_tab: RibbonTab,
     show_about: bool,
     show_shortcuts: bool,
+    /// The per-edge boundary-conditions window (T2-C).
+    show_edges: bool,
     show_legend: bool,
     res_index: usize,
     /// Tracer particles on/off; `particle_index` keeps the last count so
@@ -662,6 +751,7 @@ impl FlowPaintApp {
             ribbon_tab: RibbonTab::Home,
             show_about: false,
             show_shortcuts: false,
+            show_edges: false,
             show_legend: true,
             res_index,
             particles_on: false, // Settings::default starts with no tracers
@@ -1023,6 +1113,7 @@ impl eframe::App for FlowPaintApp {
                 fade: sim.settings.dye_fade,
                 paused: sim.settings.paused,
                 tunnel: sim.settings.wind_tunnel,
+                edges: sim.settings.edges,
                 tints: sim.settings.boundary_tints,
                 mode: sim.settings.render_mode,
                 solver: sim.settings.solver,
@@ -1066,8 +1157,14 @@ impl eframe::App for FlowPaintApp {
             apply_cmd(sim, cmd, self);
         }
         if let Some(region) = self.model.take_dirty() {
-            let (margin, tunnel) = (sim.margin(), sim.settings.wind_tunnel);
-            self.model.rasterize_region(&mut sim.geo, region, margin, tunnel);
+            // The wind-tunnel preset keeps the rasterizer's own band
+            // painting (byte-identical to pre-T2-C scenes); custom edge
+            // sets paint their bands after the object pass instead.
+            let (margin, tunnel_bands) =
+                (sim.margin(), sim.settings.edges.is_tunnel_preset());
+            self.model
+                .rasterize_region(&mut sim.geo, region, margin, tunnel_bands);
+            sim.apply_edge_bcs(region);
         }
         sim.flush_geometry();
 
@@ -1111,6 +1208,17 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::SetMach(v) => sim.settings.mach = v,
         Cmd::SetWindTunnel(on) => {
             sim.set_wind_tunnel(on);
+            app.model.mark_all_dirty();
+        }
+        Cmd::SetEdgeBc(i, k) => {
+            if let Some(slot) = sim.settings.edges.0.get_mut(i) {
+                *slot = k;
+                // The bands live in the geometry layers; repaint them.
+                app.model.mark_all_dirty();
+            }
+        }
+        Cmd::SetEdgeBcs(e) => {
+            sim.settings.edges = e;
             app.model.mark_all_dirty();
         }
         Cmd::SetResolution(i) => {
@@ -1650,8 +1758,8 @@ impl FlowPaintApp {
         // Commit any in-flight gesture so the file doesn't capture a
         // polyline's cursor-tracking rubber vertex.
         self.finish_gesture();
-        let scene = SceneV7 {
-            version: SCENE_V7,
+        let scene = SceneV9 {
+            version: SCENE_V9,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -1668,6 +1776,7 @@ impl FlowPaintApp {
             mach: snap.mach,
             fluid_a: self.fluid_a,
             ranges: snap.ranges.map(SceneRange::from),
+            edges: snap.edges.0.map(edge_kind_to_u32),
         };
         match bincode::serialize(&scene) {
             Ok(bytes) => {
@@ -1693,7 +1802,7 @@ impl FlowPaintApp {
         } else {
             0
         };
-        if !(SCENE_V3..=SCENE_V7).contains(&version) {
+        if !(SCENE_V3..=SCENE_V9).contains(&version) {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
@@ -1702,14 +1811,27 @@ impl FlowPaintApp {
         // A v3 file is a v4 file without the solver fields; v5 shares
         // the v4 layout; v6 appends per-object lock/hide, so pre-v6
         // objects decode via the SketchObjectV5 mirror and convert; v7
-        // appends the color ranges, defaulted for anything older.
-        let decoded = if version >= SCENE_V7 {
-            bincode::deserialize::<SceneV7>(&bytes)
+        // appends the color ranges, defaulted for anything older; v9
+        // appends the edge kinds, derived from wind_tunnel for anything
+        // older (v8 is U3's — see the arm below).
+        let decoded = if version >= SCENE_V9 {
+            bincode::deserialize::<SceneV9>(&bytes)
+        } else if version >= SCENE_V8 {
+            // MERGE SEAM (planned app.rs conflict): U3 owns the v8
+            // layout; its decode arm replaces this error at the track
+            // merge. Until then no v8 file exists in this lineage.
+            Err(Box::new(bincode::ErrorKind::Custom(
+                "scene v8 needs the U3 track merge".into(),
+            )))
+        } else if version >= SCENE_V7 {
+            bincode::deserialize::<SceneV7>(&bytes).map(SceneV9::from_v7)
         } else if version >= SCENE_V6 {
-            bincode::deserialize::<SceneV6>(&bytes).map(SceneV7::from_v6)
+            bincode::deserialize::<SceneV6>(&bytes)
+                .map(SceneV7::from_v6)
+                .map(SceneV9::from_v7)
         } else if version >= SCENE_V4 {
             bincode::deserialize::<SceneV4>(&bytes).map(|s| {
-                SceneV7::from_v6(SceneV6 {
+                SceneV9::from_v7(SceneV7::from_v6(SceneV6 {
                     version: s.version,
                     objects: s.objects.into_iter().map(Into::into).collect(),
                     wind_tunnel: s.wind_tunnel,
@@ -1723,11 +1845,11 @@ impl FlowPaintApp {
                     solver: s.solver,
                     mach: s.mach,
                     fluid_a: s.fluid_a,
-                })
+                }))
             })
         } else {
             bincode::deserialize::<SceneV3>(&bytes).map(|s| {
-                SceneV7::from_v6(SceneV6 {
+                SceneV9::from_v7(SceneV7::from_v6(SceneV6 {
                     version: s.version,
                     objects: s.objects.into_iter().map(Into::into).collect(),
                     wind_tunnel: s.wind_tunnel,
@@ -1741,7 +1863,7 @@ impl FlowPaintApp {
                     solver: 0,
                     mach: 1.6,
                     fluid_a: 343.0,
-                })
+                }))
             })
         };
         match decoded {
@@ -1801,6 +1923,12 @@ impl FlowPaintApp {
                 }));
                 cmds.push(Cmd::SetMach(sane_f32(scene.mach, 0.3, 3.0, 1.6)));
                 cmds.push(Cmd::SetWindTunnel(scene.wind_tunnel));
+                // After the tunnel preset re-arm: the saved edge set
+                // wins (v9; legacy-derived for older files, where it
+                // matches the preset exactly).
+                cmds.push(Cmd::SetEdgeBcs(EdgeBcs(
+                    scene.edges.map(edge_kind_from_u32),
+                )));
                 // Color ranges (v7; defaults for older files). Dye has
                 // no scale, so its entry stays untouched.
                 for mode in [RenderMode::Speed, RenderMode::Vorticity, RenderMode::Pressure] {
@@ -2025,5 +2153,74 @@ mod scene_tests {
         assert_eq!(back.ranges[RenderMode::Speed as usize].map, 0);
         assert_eq!(back.ranges[RenderMode::Vorticity as usize].map, 1);
         assert_eq!(back.ranges[RenderMode::Pressure as usize].map, 1);
+    }
+
+    /// v9 round-trips the per-edge boundary kinds, and its version peek
+    /// reads 9.
+    #[test]
+    fn v9_roundtrip_persists_edges() {
+        let scene = SceneV9 {
+            version: SCENE_V9,
+            objects: vec![v5_obj(11).into()],
+            wind_tunnel: false,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 0,
+            mach: 1.6,
+            fluid_a: 343.0,
+            ranges: crate::sim::FIELD_RANGE_DEFAULTS.map(SceneRange::from),
+            edges: [1, 2, 3, 0], // inlet, outlet, wall, far field
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(version, SCENE_V9);
+        let back = bincode::deserialize::<SceneV9>(&bytes).unwrap();
+        assert_eq!(back.edges, [1, 2, 3, 0]);
+        let decoded = EdgeBcs(back.edges.map(edge_kind_from_u32));
+        assert_eq!(decoded.0[0], EdgeKind::Inlet);
+        assert_eq!(decoded.0[2], EdgeKind::Wall);
+    }
+
+    /// A pre-v9 file's edge set derives from its wind_tunnel flag: the
+    /// tunnel preset for true, all far field for false — so legacy
+    /// scenes keep their exact painted bands (or lack of them).
+    #[test]
+    fn pre_v9_edges_derive_from_wind_tunnel() {
+        for (tunnel, expect) in [(true, EdgeBcs::WIND_TUNNEL), (false, EdgeBcs::OPEN)] {
+            let scene = SceneV7 {
+                version: SCENE_V7,
+                objects: vec![],
+                wind_tunnel: tunnel,
+                flow_speed: 0.09,
+                viscosity: 0.015,
+                steps_per_frame: 8,
+                domain_width_m: 1.0,
+                fluid_nu: 1.5e-5,
+                fluid_rho: 1.2,
+                ref_width: 1920,
+                solver: 0,
+                mach: 1.6,
+                fluid_a: 343.0,
+                ranges: crate::sim::FIELD_RANGE_DEFAULTS.map(SceneRange::from),
+            };
+            let v9 = SceneV9::from_v7(scene);
+            assert_eq!(EdgeBcs(v9.edges.map(edge_kind_from_u32)), expect);
+        }
+    }
+
+    /// The reserved periodic discriminant (4) and unknown future values
+    /// decode without exploding: 4 keeps its reserved variant, anything
+    /// newer falls back to far field.
+    #[test]
+    fn reserved_and_unknown_edge_kinds_decode_safely() {
+        assert_eq!(edge_kind_from_u32(4), EdgeKind::Periodic);
+        assert_eq!(edge_kind_from_u32(99), EdgeKind::FarField);
+        // Reserved discriminant survives a save round-trip unchanged.
+        assert_eq!(edge_kind_to_u32(edge_kind_from_u32(4)), 4);
     }
 }

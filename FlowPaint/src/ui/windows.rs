@@ -1,11 +1,20 @@
-//! The About and keyboard-shortcuts windows.
+//! The About, keyboard-shortcuts and domain-boundaries windows.
 
-use crate::app::{FlowPaintApp, UiSnapshot};
+use crate::app::{Cmd, FlowPaintApp, UiSnapshot};
+use crate::sim::{EdgeBcs, EdgeKind, EDGE_NAMES};
 use eframe::egui;
 
+use super::theme;
+
 impl FlowPaintApp {
-    pub(in crate::app) fn windows(&mut self, ctx: &egui::Context, snap: UiSnapshot) {
+    pub(in crate::app) fn windows(
+        &mut self,
+        ctx: &egui::Context,
+        snap: UiSnapshot,
+        cmds: &mut Vec<Cmd>,
+    ) {
         self.generator_windows(ctx, snap);
+        self.edges_window(ctx, snap, cmds);
 
         egui::Window::new("About FlowPaint V2")
             .open(&mut self.show_about)
@@ -66,5 +75,108 @@ impl FlowPaintApp {
                     }
                 });
             });
+    }
+
+    /// The per-edge boundary-conditions window (T2-C). Lives here rather
+    /// than in the ribbon so it stays up across tab switches, like the
+    /// generator dialogs.
+    fn edges_window(&mut self, ctx: &egui::Context, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
+        let mut open = self.show_edges;
+        egui::Window::new("Domain boundaries")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(
+                    "What each edge of the domain does. Far field is the \
+                     open edge every scene had before: nothing painted, \
+                     with the absorbing margin around the canvas.",
+                );
+                ui.add_space(4.0);
+                egui::Grid::new("edge_bc_grid").show(ui, |ui| {
+                    for (i, name) in EDGE_NAMES.iter().enumerate() {
+                        let cur = snap.edges.0[i];
+                        ui.label(*name);
+                        egui::ComboBox::from_id_salt(("edge_bc", i))
+                            .width(110.0)
+                            .selected_text(cur.label())
+                            .show_ui(ui, |ui| {
+                                for k in [
+                                    EdgeKind::FarField,
+                                    EdgeKind::Inlet,
+                                    EdgeKind::Outlet,
+                                    EdgeKind::Wall,
+                                ] {
+                                    if theme::toggle(ui, cur == k, k.label())
+                                        .clicked()
+                                        && cur != k
+                                    {
+                                        cmds.push(Cmd::SetEdgeBc(i, k));
+                                    }
+                                }
+                                // Greyed out on purpose: not expressible
+                                // without editing both solver kernels.
+                                ui.add_enabled_ui(false, |ui| {
+                                    theme::toggle(
+                                        ui,
+                                        cur == EdgeKind::Periodic,
+                                        EdgeKind::Periodic.label(),
+                                    )
+                                    .on_disabled_hover_text(
+                                        "Needs the streaming and stencil \
+                                         indexing changed in both solver \
+                                         kernels — blocked while the \
+                                         shader freeze holds.",
+                                    );
+                                });
+                            });
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(4.0);
+                // Decision T2-C: never ship a wall that silently is not
+                // one — any wall edge turns the absorbing sponge off.
+                if snap.edges.disables_sponge() {
+                    ui.colored_label(
+                        theme::WARN,
+                        "Wall edge set: the absorbing sponge layer is off \
+                         (a sponged wall is not a wall).",
+                    );
+                }
+                theme::derived(
+                    ui,
+                    if snap.tunnel {
+                        "Far-field edges carry the wind-tunnel freestream \
+                         (left to right)."
+                            .into()
+                    } else {
+                        "Far-field edges are still (wind tunnel off).".into()
+                    },
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Wind tunnel preset")
+                        .on_hover_text(
+                            "Left inlet, right outlet, top and bottom far \
+                             field, freestream on — the classic tunnel",
+                        )
+                        .clicked()
+                    {
+                        cmds.push(Cmd::SetWindTunnel(true));
+                    }
+                    if ui
+                        .button("All far field")
+                        .on_hover_text(
+                            "Every edge open; the freestream keeps its \
+                             current on/off state",
+                        )
+                        .clicked()
+                    {
+                        cmds.push(Cmd::SetEdgeBcs(EdgeBcs::OPEN));
+                    }
+                });
+            });
+        self.show_edges = open;
     }
 }

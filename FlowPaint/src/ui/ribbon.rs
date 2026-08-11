@@ -369,11 +369,48 @@ impl FlowPaintApp {
                 });
                 if ui
                     .checkbox(&mut tunnel, "Wind tunnel")
-                    .on_hover_text("Freestream inflow, left to right")
+                    .on_hover_text(
+                        "Freestream inflow, left to right; resets the \
+                         edges to the tunnel preset",
+                    )
                     .changed()
                 {
                     self.fluid_preset_idx = None;
                     cmds.push(Cmd::SetWindTunnel(tunnel));
+                }
+            });
+        });
+        group(ui, "Boundaries", |ui| {
+            ui.vertical(|ui| {
+                if theme::ribbon_button(
+                    ui,
+                    self.show_edges,
+                    false,
+                    ph::ARROWS_OUT_CARDINAL,
+                    "Edges…",
+                )
+                .on_hover_text(
+                    "Per-edge boundary conditions: far field, inlet, \
+                     outlet or wall",
+                )
+                .clicked()
+                {
+                    self.show_edges = !self.show_edges;
+                }
+                // Left · right · top · bottom, compact.
+                let e = snap.edges.0;
+                theme::derived(
+                    ui,
+                    format!(
+                        "{} · {} · {} · {}",
+                        e[0].short(),
+                        e[1].short(),
+                        e[2].short(),
+                        e[3].short()
+                    ),
+                );
+                if snap.edges.disables_sponge() {
+                    ui.colored_label(theme::WARN, "sponge off");
                 }
             });
         });

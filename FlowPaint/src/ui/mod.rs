@@ -33,5 +33,5 @@ pub(super) fn draw(
     app.settings_panel(ctx, snapshot, cmds);
     app.legend_panel(ctx, snapshot, cmds);
     app.canvas(ctx, cmds);
-    app.windows(ctx, snapshot);
+    app.windows(ctx, snapshot, cmds);
 }
