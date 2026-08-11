@@ -164,3 +164,25 @@ placed, so the probe fold changes nothing on the hot path. The solver
 path (`sim.rs` compute + shaders) is untouched by U3 except the removal
 of the probe store's Mutex locking, which if anything is a hair
 cheaper.
+
+## Post-second-track-merge measurement (U3 + T2-C, scene v9)
+
+Paired back-to-back A/B in one session (same container, no other load;
+lavapipe, so relative comparison only), run in both orders:
+
+```
+A = U3 tip ef1a53c, B = merged (T2-C + v9-absorbs-v8)   mean       p99
+pair 1 (A first): A 1052.69 / 1246.25   B 1065.23 / 1415.65
+pair 2 (B first): B 1032.27 / 1242.16   A 1048.76 / 1424.93
+```
+
+Order-independent result: mean +1.2 % / −1.6 %, p99 +13.6 % / −12.8 %
+— the deltas flip sign with run order (in BOTH pairs the fat p99 tail
+sits on whichever build runs second in the pair), so the differences
+are session-position noise, not a build effect; no regression.
+Expected: the bench scene is the wind-tunnel preset, so
+`paint_edge_bcs` early-returns without touching a cell
+(`is_tunnel_preset`, pinned byte-identical by
+`legacy_wind_tunnel_projection_is_unchanged`), and `apply_edge_bcs` is
+one branch per damage event — the bench has exactly one damage event
+(the preset load). The solver kernels are untouched by both units.
