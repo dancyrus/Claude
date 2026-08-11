@@ -259,3 +259,40 @@ gate's added `Tool::Mirror` arm is never entered, the mirror-line
 overlay only draws during its gesture, and the model hot paths
 (rasterize, `parent_abs`) are untouched — mirror/array code runs
 only when explicitly invoked.
+
+## Final-merge measurement (mirror/array + deferred index + U5)
+
+Paired back-to-back A/B on a fresh container (new lavapipe/Mesa
+install — absolute numbers not comparable to earlier records), both
+orders, otherwise idle host, both binaries built before measuring.
+
+First pass caught a real workload leak, not a code regression: U5's
+first-run default (100 k tracers ON) reached the bench, which pins
+scene and solver but did not pin particle state — every historical
+number was recorded under the pre-U5 no-tracer default.
+
+```
+A = main 9f40ca2, B = merge tip (tracers leaked)     mean       p99
+pair 1 (A first): A 1822.55 / 2011.34   B 1964.26 / 2152.97
+pair 2 (B first): B 1954.76 / 2130.57   A 1833.13 / 2016.30
+```
+
+Order-independent +7.2 % mean / +6.4 % p99 — the cost of advecting
+and rendering 100 k tracers, confirming U5's "touches no per-frame
+path" claim was wrong once the default flipped. Fix: `bench_tick`'s
+frame-1 determinism block now pins `Cmd::SetParticles(0)` alongside
+scene and solver (commit "Bench harness: pin tracers off"). Re-run
+with the fixed harness:
+
+```
+A = main 9f40ca2, B = merge tip + harness pin        mean       p99
+pair 1 (A first): A 1808.36 / 2073.59   B 1826.11 / 2046.74
+pair 2 (B first): B 1806.67 / 2001.50   A 1794.17 / 2023.38
+```
+
+Order-independent result: mean +1.0 % / +0.7 %, p99 −1.3 % / −1.1 %
+— mean deltas sit inside A's own run-to-run spread (1794–1833,
+2.2 %), p99 slightly better; no regression. The user-facing first-run
+default keeps its 100 k tracers — the pin only restores the bench's
+recorded workload (canvas + rasterizer + solver, no tracers), keeping
+every past and future A/B like-for-like.
