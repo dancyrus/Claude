@@ -385,3 +385,51 @@ stated in the eraser tooltip next to the stamp refusal).
   snaps, measure, extent overlay) already routes its physical
   readouts through `ui/units.rs`, so T2-D's toggle covers them with
   no call-site changes; no hardcoded unit strings entered `src/ui/`.
+
+## Mirror & linear array (deferred out of U4, landed after)
+
+- **Both ops produce INDEPENDENT deep copies, never instances** (the
+  plan's one hard requirement; the tooltips state it): fresh ids
+  minted first, then parent links remapped WITHIN each copied
+  subtree — a copied root keeps the original root's parent, staying
+  its sibling. One undo entry each via `add_many`'s Group op.
+  `SketchModel::copy_subtree_with` is the shared deep-copy;
+  `mirror_subtrees` / `array_subtrees` sit beside it in model.rs so
+  the disentanglement tests run without the app shell.
+- **A reflection is not a `Sim2`** (det −1 — the U3 similarity family
+  cannot express it), so mirroring BAKES into stored geometry per
+  shape (`Reflect2` + `SketchObject::reflect`): point shapes reflect
+  points; Rect/Ellipse/Stamp conjugate their angle (`x → 2θ − x`,
+  exact because the shapes are symmetric in local y); a stamp also
+  flips its raster rows and negates the stored fan vectors' y; a
+  Group node conjugates its transform to `M ∘ G ∘ M`. Because
+  `M ∘ G₁ ∘ G₂ ∘ leaf = (M G₁ M)(M G₂ M)(M leaf)`, the SAME
+  reflection applies at every level of a subtree; for a root nested
+  under transformed ancestors the world line first conjugates into
+  the root's parent space by mapping its two points through
+  `parent_abs⁻¹`. Do not re-derive this — it is pinned by
+  `mirror_conjugates_through_transformed_ancestors`.
+- The array translates ONLY each copy's root (world step converted
+  into the kept parent's space); subtrees follow through
+  composition. Count is TOTAL including the original (CAD
+  convention, stated in the tooltip); step is world cells with the
+  physical value on a `theme::derived` line. Zero step refuses with
+  a status message (stacked copies read as a silent no-op).
+- **Placement: the inspector's selection panels, NOT the ribbon.**
+  The Geometry tab has no horizontal room at the 900 px minimum
+  (measured: Sketch aids ends ≈890 px), and the app's established
+  home for selection ops — Duplicate/Delete/Group/z-order — is the
+  inspector, so Mirror H/V, Pick line and Array sit next to those in
+  all three selection panels (single/multi/group) via one shared
+  `mirror_array_rows`.
+- The picked mirror line is a real tool (`Tool::Mirror`, armed from
+  the inspector, deliberately NOT in `Tool::ALL` — no bare-key
+  shortcut): press–drag–release like Measure, both points
+  object-snap (U4 gate extended), Shift angle-snaps, Esc cancels,
+  commit-on-release in `finish_gesture`, then the tool disarms back
+  to Select with the copies selected. Axis buttons mirror across the
+  DOMAIN centerlines (the CFD-useful axes — a selection-centered
+  axis would land the copy on top of its source).
+- Mirror H/V of a symmetric selection about a line through its own
+  geometry can legitimately overlap the original — not a bug; the
+  copies remain distinct objects in the tree.
