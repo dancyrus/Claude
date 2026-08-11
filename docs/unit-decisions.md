@@ -192,3 +192,23 @@ Full write-up: `docs/t2a-color-range.md`.
 - `Settings.wind_tunnel` stays as the freestream switch (`free_u`,
   reset state); `Cmd::SetWindTunnel` re-arms the legacy edge preset.
   Every pre-v9 load path derives `edges` from it (`EdgeBcs::legacy`).
+
+## Second track merge (U3 + T2-C)
+
+- The planned app.rs seam resolved as designed: **v9 absorbed v8** —
+  U3's fields (`parent`/`Group` objects, probes, plot prefs) sit above
+  T2-C's appended `edges`, keeping the whole v3→v9 lineage
+  append-only. `SceneV8` remains as a DECODE-ONLY layout for files
+  written on the U3 branch pre-merge; the decode chain funnels
+  … → v7 → v8 → v9 (`SceneV8::from_v7`, `SceneV9::from_v8`). A v8
+  file's edges default from its `wind_tunnel` flag — all far field,
+  or the tunnel preset — exactly like every other pre-v9 file.
+- The two cross-unit behavioral invariants are pinned by tests:
+  `sim::edge_bc_tests::legacy_wind_tunnel_projection_is_unchanged`
+  (full geometry projection of a legacy tunnel scene is byte-identical
+  to the pre-T2-C rasterizer alone) and the v7/v8/v9 round-trip tests
+  in `app::scene_tests` (a locked color range survives every
+  conversion path; groups, probes and edges survive or default).
+- No decision from either unit moved. U3's probe fold and T2-C's edge
+  machinery compose without overlap: probes ride `Settings.probes`,
+  edges ride `Settings.edges`, and both persist in v9.

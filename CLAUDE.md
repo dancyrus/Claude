@@ -25,10 +25,9 @@ Per-unit decisions later units must not re-derive live in
 - **U2 (multi-select + tier): done**, branch
   `claude/flowpaint-u2-multi-select-kvfbsi` (off the U1 branch).
 - **U3 (transforms + nested groups): done**, branch
-  `claude/u3-transforms-nested-groups-qo5qxi` (off the track-merge
-  tip). Groups are `Shape::Group` similarity nodes + `parent` links;
-  gizmo in `ui/canvas.rs`. Decisions in `docs/unit-decisions.md` §U3.
-  Next: U4 is unblocked.
+  `claude/u3-transforms-nested-groups-qo5qxi`. Groups are
+  `Shape::Group` similarity nodes + `parent` links; gizmo in
+  `ui/canvas.rs`. Decisions in §U3. Next: U4 is unblocked.
 - **T2-A (color range + colormap): done**, branch
   `claude/t2a-color-range-opuijy` (off `34d57aa`, no U1); write-up in
   `docs/t2a-color-range.md`. Asymmetric manual min/max deliberately
@@ -53,8 +52,7 @@ Per-unit decisions later units must not re-derive live in
 - Track-era Mutex debt is fully paid: T2-A's ranges live in
   `Settings.ranges` + `Cmd` (v7+), T2-B's probes in `Settings.probes`
   + probe `Cmd`s read via the per-frame `ProbeUi` snapshot (v8+).
-  Still open: unify the plot/legend shader-inversion factors in
-  `ui/units.rs`.
+  Still open: unify plot/legend inversion factors in `ui/units.rs`.
 
 ## Transforms & nested groups (U3)
 
@@ -93,7 +91,7 @@ damage-mark through the chain.
 
 ## Structure
 
-- `src/app.rs` — state, `Cmd` dispatch, keyboard, scene IO (v3–v8
+- `src/app.rs` — state, `Cmd` dispatch, keyboard, scene IO (v3–v9
   bincode, version peek on first 4 LE bytes), `--bench` harness,
   `ViewRequest` + view state fields, selection set + clipboard.
 - `src/ui/` — one file per panel; child of `app` via `#[path]` so panel
@@ -145,8 +143,7 @@ switch; toggling it re-arms the preset.
 ## Frame-time baseline (plan working rules)
 
 `FlowPaint-V2 --bench`: Pinball preset, compressible mode, default grid
-(High, 1920×960 + margin), 10-frame warmup, 300 measured frames.
-Baseline on pre-theme code (commit 1f00ef2), **this container** (Xvfb +
-Mesa lavapipe software Vulkan — relative comparisons only, absolute
-numbers are meaningless for real GPUs): see `docs/theme.md` §baseline.
-Re-run identically after phase 3; mean and p99 must not regress.
+(High, 1920×960 + margin), 10-frame warmup, 300 measured frames — Xvfb
++ Mesa lavapipe, so relative paired A/B comparisons only (history in
+`docs/theme.md`). Re-run as a paired A/B after any unit touching the
+canvas or rasterizer; mean and p99 must not regress.
