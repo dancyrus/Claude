@@ -8,11 +8,13 @@
 //! decimal inch follows ASME drawing practice — lengths in decimal
 //! inches with no leading zero before the point (".500 in", never
 //! fractions), derived quantities in the inch–pound–second system
-//! (in/s, psi, lb/in³, in²/s). Time, angles and every dimensionless
-//! readout are identical in both systems. Canonical values everywhere
-//! else in the app stay SI — the system is applied at format time only,
-//! and input boxes keep their canonical SI value per the panel
-//! convention (canonical value in the box, unit in the label).
+//! (in/s, psi, in²/s — density deliberately lbm/ft³, see
+//! `LBFT3_PER_KGM3`). Time, angles and every dimensionless readout are
+//! identical in both systems. Canonical values everywhere else in the
+//! app stay SI — the system is applied at the UI boundary only: the
+//! formatters below on the way out, and the `InputUnit` adapters at
+//! the bottom of this file on the way in (input boxes accept and
+//! display the active unit and commit canonical SI).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,8 +45,11 @@ pub(crate) fn set_unit_system(s: UnitSystem) {
 
 const M_PER_IN: f32 = 0.0254;
 const PA_PER_PSI: f32 = 6894.757;
-/// kg/m³ → lb/in³.
-const LB_IN3_PER_KG_M3: f32 = 3.612_729e-5;
+/// kg/m³ → lbm/ft³. Density is the one deliberate mixed unit in inch
+/// mode: lb/in³ is arithmetically consistent but nobody carries gas
+/// density that way — the number an engineer recognizes for air is
+/// ≈ 0.0765 lbm/ft³, and mixed units are normal in ips practice.
+const LBFT3_PER_KGM3: f32 = 0.062_428;
 /// m²/s → in²/s.
 const IN2_PER_M2: f32 = 1.0 / (M_PER_IN * M_PER_IN);
 
@@ -173,16 +178,19 @@ pub(crate) fn fmt_cfl(c: f32) -> String {
 }
 
 /// Density: SI → kg/m³, one decimal below 10 (air is 1.2, not "1"),
-/// whole numbers above; decimal inch → lb/in³, scientific for gases
-/// (air is 4.3e-5 lb/in³ — the ips system's numbers are just like
-/// that), three decimals for anything denser.
+/// whole numbers above; decimal inch → lbm/ft³ (see LBFT3_PER_KGM3:
+/// the recognizable engineering number, air ≈ 0.0765), four decimals
+/// for gases, coarser as the number grows.
 pub(crate) fn fmt_density(rho: f32) -> String {
     if unit_system() == UnitSystem::DecimalInch {
-        let d = rho * LB_IN3_PER_KG_M3;
-        return if d.abs() < 1e-3 {
-            format!("{d:.2e} lb/in³")
+        let d = rho * LBFT3_PER_KGM3;
+        let a = d.abs();
+        return if a < 1.0 {
+            format!("{d:.4} lbm/ft³")
+        } else if a < 100.0 {
+            format!("{d:.2} lbm/ft³")
         } else {
-            format!("{d:.3} lb/in³")
+            format!("{d:.0} lbm/ft³")
         };
     }
     if rho.abs() < 10.0 {
@@ -234,6 +242,85 @@ pub(crate) fn fmt_zoom(px_per_cell: f32) -> String {
     }
 }
 
+// --- Input adapters --------------------------------------------------
+//
+// Input boxes accept and display the ACTIVE unit system; only the
+// stored value is canonical SI. Call sites wire an `InputUnit` into
+// `DragValue::custom_formatter` / `custom_parser`, so typing "24" in
+// inch mode commits 0.6096 m while the box keeps reading "24.00 in".
+// The canonical-value convention governs storage and call-site
+// formatting, not what the user types.
+
+/// One editable quantity's active display unit: display value =
+/// canonical / `canon_per_unit`. Copyable so the formatter and parser
+/// closures can each capture it.
+#[derive(Clone, Copy)]
+pub(crate) struct InputUnit {
+    pub(crate) suffix: &'static str,
+    pub(crate) canon_per_unit: f32,
+}
+
+impl InputUnit {
+    /// Format a canonical (SI) value for the edit box, in the display
+    /// unit. Plain decimal notation with adaptive precision (enough
+    /// decimals that formatting does not eat the committed value —
+    /// the round trip is pinned by test), scientific only for the
+    /// tiny gauge pressures.
+    pub(crate) fn fmt(&self, canonical: f64) -> String {
+        let x = canonical / self.canon_per_unit as f64;
+        let a = x.abs();
+        if x == 0.0 {
+            "0".into()
+        } else if a >= 1000.0 {
+            format!("{x:.0}")
+        } else if a >= 1.0 {
+            format!("{x:.2}")
+        } else if a >= 1e-3 {
+            format!("{x:.4}")
+        } else {
+            format!("{x:.2e}")
+        }
+    }
+
+    /// Parse edit-box text as a display-unit value, back to canonical
+    /// SI. Tolerates a typed-in copy of the suffix ("24 in").
+    pub(crate) fn parse(&self, text: &str) -> Option<f64> {
+        let t = text.trim();
+        let t = t.strip_suffix(self.suffix.trim()).unwrap_or(t).trim();
+        t.parse::<f64>().ok().map(|v| v * self.canon_per_unit as f64)
+    }
+}
+
+pub(crate) fn len_input_unit() -> InputUnit {
+    match unit_system() {
+        UnitSystem::Si => InputUnit { suffix: " m", canon_per_unit: 1.0 },
+        UnitSystem::DecimalInch => InputUnit { suffix: " in", canon_per_unit: M_PER_IN },
+    }
+}
+
+pub(crate) fn speed_input_unit() -> InputUnit {
+    match unit_system() {
+        UnitSystem::Si => InputUnit { suffix: " m/s", canon_per_unit: 1.0 },
+        UnitSystem::DecimalInch => InputUnit { suffix: " in/s", canon_per_unit: M_PER_IN },
+    }
+}
+
+pub(crate) fn pressure_input_unit() -> InputUnit {
+    match unit_system() {
+        UnitSystem::Si => InputUnit { suffix: " Pa", canon_per_unit: 1.0 },
+        UnitSystem::DecimalInch => InputUnit { suffix: " psi", canon_per_unit: PA_PER_PSI },
+    }
+}
+
+/// Per-second is unit-system neutral.
+pub(crate) fn omega_input_unit() -> InputUnit {
+    InputUnit { suffix: " 1/s", canon_per_unit: 1.0 }
+}
+
+pub(crate) fn dimensionless_input_unit() -> InputUnit {
+    InputUnit { suffix: "", canon_per_unit: 1.0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,11 +342,40 @@ mod tests {
         assert_eq!(fmt_len(25.4), "1000.00 in");
         assert_eq!(fmt_speed(0.0254), "1.00 in/s");
         assert_eq!(fmt_pressure(PA_PER_PSI), "1.00 psi");
-        assert_eq!(fmt_density(1.2), "4.34e-5 lb/in³");
+        // Density is deliberately lbm/ft³ (the recognizable number),
+        // not lb/in³ — see LBFT3_PER_KGM3.
+        assert_eq!(fmt_density(1.2), "0.0749 lbm/ft³");
+        assert_eq!(fmt_density(1.225), "0.0765 lbm/ft³");
+        assert_eq!(fmt_density(1000.0), "62.43 lbm/ft³");
         assert_eq!(fmt_kvisc(1.0), "1.55e3 in²/s");
         // Unit-system-neutral formatters are untouched by the toggle.
         assert_eq!(fmt_time(1.0), "1.00 s");
         assert_eq!(fmt_omega(3.26), "3.3 1/s");
+
+        // Input round trip: type 24 in, commit, switch systems, switch
+        // back — the committed canonical value must not drift and the
+        // box must keep reading exactly "24.00 in".
+        let inch = len_input_unit();
+        let c1 = inch.parse("24").expect("parse 24 in");
+        assert!((c1 - 0.6096).abs() < 1e-6);
+        assert_eq!(inch.fmt(c1), "24.00");
+        assert_eq!(inch.parse(&inch.fmt(c1)), Some(c1));
+        assert_eq!(inch.parse("24 in"), Some(c1)); // typed suffix tolerated
+        set_unit_system(UnitSystem::Si);
+        let si = len_input_unit();
+        let shown_si = si.fmt(c1);
+        assert_eq!(shown_si, "0.6096");
+        // Even a re-commit of the SI display drifts by less than a
+        // micrometre and still reads back as exactly 24.00 in.
+        let c2 = si.parse(&shown_si).expect("parse SI display");
+        assert!((c2 - c1).abs() < 1e-6);
+        set_unit_system(UnitSystem::DecimalInch);
+        assert_eq!(len_input_unit().fmt(c1), "24.00");
+        assert_eq!(len_input_unit().fmt(c2), "24.00");
+        // The other input quantities convert on the same path.
+        assert_eq!(pressure_input_unit().parse("1"), Some(PA_PER_PSI as f64));
+        assert_eq!(speed_input_unit().fmt(0.0254), "1.00");
+        assert_eq!(omega_input_unit().fmt(2.5), "2.50");
 
         set_unit_system(UnitSystem::Si);
         assert_eq!(fmt_len(0.0254), "2.5 cm");

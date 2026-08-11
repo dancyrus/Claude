@@ -217,22 +217,31 @@ Full write-up: `docs/t2a-color-range.md`.
 
 ## T2-D (SI / decimal-inch unit toggle)
 
-- The toggle is FORMAT-TIME ONLY: every canonical value in the app —
-  `Settings`, `Cmd`s, the scene format, DragValue boxes — stays SI;
-  only `ui/units.rs` converts, at render. Input boxes deliberately
-  keep their canonical SI value and unit (Physics▸Domain "width … m",
-  the legend's Manual range max in m/s / 1/s / Pa): the panel
-  convention is canonical value in the box, unit in the label, and
-  converting inputs would push unit handling into files frozen while
-  U4 runs.
+- The conversion lives at the UI BOUNDARY ONLY: every canonical value
+  in the app — `Settings`, `Cmd`s, the scene format, the value a
+  DragValue commits — stays SI; `ui/units.rs` converts on the way out
+  (the `fmt_*` formatters) and on the way in (the `InputUnit`
+  adapters). Input boxes accept and display the ACTIVE unit system:
+  Physics▸Domain width and the legend's Manual range max wire an
+  `InputUnit` into `DragValue::custom_formatter`/`custom_parser`, so
+  typing 24 in inch mode commits 0.6096 m. The canonical-value
+  convention governs storage and call-site formatting, not what the
+  user types — an inch mode you cannot type inches into would be
+  read-only, defeating the toggle. The type→commit→switch→switch-back
+  round trip is pinned by test (no float-conversion drift; the box
+  returns to exactly "24.00 in").
 - Inch mode is ASME decimal-inch practice: inches only (no feet, no
   fractions), the leading zero dropped below 1 in (".500 in"),
   precision stepping 4/3/2/1 decimals as magnitude grows. Derived
-  quantities use the inch–pound–second system: in/s, psi, lb/in³,
-  in²/s (gas density and gauge pressure go scientific — ips numbers
-  are like that: air is 4.34e-5 lb/in³). Time, angles, Mach, CFL,
-  vorticity (1/s), factors, sim rate and zoom are unit-system neutral
-  and identical in both modes.
+  quantities use the inch–pound–second system: in/s, psi, in²/s —
+  EXCEPT density, which is deliberately lbm/ft³ (air ≈ 0.0765), not
+  the dimensionally consistent lb/in³ (air 4.34e-5): nobody carries
+  gas density in pounds per cubic inch, mixed units are normal in ips
+  work, and the goal is the number an engineer recognizes. psi and
+  in²/s read fine and stay. Time, angles, Mach, CFL, vorticity (1/s),
+  factors, sim rate and zoom are unit-system neutral and identical in
+  both modes. Input boxes use plain decimal display (no ASME
+  leading-zero drop) — typing convention, not drawing convention.
 - The selector is a "units" row (theme::toggle pair SI / inch) in
   Results▸Display: that group had vertical room inside the 64 px
   group height, so the Results tab gains ZERO width at the 900 px
@@ -247,5 +256,6 @@ Full write-up: `docs/t2a-color-range.md`.
 - Bypass audit came up clean: every physical readout routes through
   `units::fmt_*` — legend, status strip, probe-plot axis labels,
   ribbon derived lines, generators, tree, canvas scale bar and drag
-  dimensions, inspector derived lines. The only hardcoded unit
-  strings in `src/ui/` are the two SI input suffixes above.
+  dimensions, inspector derived lines — and both unit-bearing input
+  boxes route through the `InputUnit` adapters; `src/ui/` carries no
+  hardcoded unit strings outside `units.rs`.

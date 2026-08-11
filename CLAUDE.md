@@ -38,9 +38,9 @@ Per-unit decisions later units must not re-derive live in
   outlet / wall; **periodic is reserved** (blocked by the shader
   freeze). Read §T2-C before touching edges, sponge, tunnel preset.
 - **T2-D (SI / decimal-inch toggle): done**, branch
-  `claude/si-decimal-inch-toggle-x17w11` (off main). Format-time only
-  (`ui/units.rs` static + Results▸Display "units" row; canonical
-  values and inputs stay SI); ASME decimal inch, ips units. §T2-D.
+  `claude/si-decimal-inch-toggle-x17w11` (off main). All conversion at
+  the UI boundary — `ui/units.rs` `fmt_*` out, `InputUnit` adapters in
+  (inputs take the active unit); canonical values stay SI. §T2-D.
 - Scene format: **v9** current (second track merge: v9 ABSORBED v8 —
   U3's `parent` links / `Group` nodes / probe set sit above T2-C's
   appended `edges`), loads v3+ (v3 lacks solver fields; v4/v5 share a

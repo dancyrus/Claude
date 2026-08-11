@@ -155,6 +155,11 @@ impl FlowPaintApp {
     }
 
     fn ribbon_physics(&mut self, ui: &mut egui::Ui, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
+        // Same squeeze as Results: the Domain width box sat flush at
+        // the 900 px minimum, and inch mode's "39.37 in" is a little
+        // wider than "1.00 m" — a slightly narrower persistence slider
+        // buys the difference (T2-D).
+        ui.spacing_mut().slider_width = 52.0;
         group(ui, "Solver", |ui| {
             for (m, icon, label, tip) in [
                 (
@@ -416,11 +421,23 @@ impl FlowPaintApp {
         group(ui, "Domain", |ui| {
             ui.vertical(|ui| {
                 row(ui, "width", |ui| {
+                    // Typed and dragged in the active unit system; the
+                    // stored value stays canonical metres (T2-D).
+                    let unit = units::len_input_unit();
+                    // A round drag step in the displayed unit either
+                    // way: 0.01 m, or 0.1 in.
+                    let speed = if unit.canon_per_unit == 1.0 {
+                        0.01
+                    } else {
+                        0.1 * unit.canon_per_unit as f64
+                    };
                     ui.add(
                         egui::DragValue::new(&mut self.domain_width_m)
                             .range(0.05..=100.0)
-                            .speed(0.01)
-                            .suffix(" m"),
+                            .speed(speed)
+                            .custom_formatter(move |v, _| unit.fmt(v))
+                            .custom_parser(move |s| unit.parse(s))
+                            .suffix(unit.suffix),
                     )
                     .on_hover_text(
                         "Physical size the canvas represents; anchors every \
