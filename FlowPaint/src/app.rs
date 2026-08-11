@@ -7,7 +7,7 @@
 use crate::model::{ObjMaterial, Shape, SketchModel, SketchObject};
 use crate::sim::{
     ColorMap, EdgeBcs, EdgeKind, FieldRange, GpuSim, RangeMode, RenderMode,
-    SolverMode, ViewportMapping, DEFAULT_MARGIN_INDEX, RESOLUTIONS,
+    SolverMode, UnitSystem, ViewportMapping, DEFAULT_MARGIN_INDEX, RESOLUTIONS,
 };
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -722,6 +722,10 @@ struct UiSnapshot {
     /// physical scaling by `sync_color_ranges` before the panels draw
     /// and written back to `Settings` when commands apply (T2-A fold).
     ranges: [FieldRange; 4],
+    /// Display unit system (T2-D fold); `update` mirrors it into
+    /// `ui::units` before the panels draw so the formatters stay
+    /// stateless.
+    unit_system: UnitSystem,
 }
 
 /// Per-frame read snapshot of the sim-owned probe store (T2-B fold):
@@ -786,6 +790,8 @@ enum Cmd {
     /// grid including the sponge margin. Pure view change — the grid,
     /// mapping and every readout stay in visible-cell coordinates.
     SetShowExtent(bool),
+    /// Display unit system (T2-D fold; not scene-persisted).
+    SetUnitSystem(UnitSystem),
 }
 
 pub struct FlowPaintApp {
@@ -1597,8 +1603,12 @@ impl eframe::App for FlowPaintApp {
                 particle_brightness: sim.settings.particle_brightness,
                 sponge_strength: sim.settings.sponge_strength,
                 ranges: sim.settings.ranges,
+                unit_system: sim.settings.unit_system,
             }
         };
+        // Mirror the unit system into the formatter layer before any
+        // panel formats a readout (T2-D fold; single writer).
+        ui::units::set_unit_system(snapshot.unit_system);
         self.phys_cache = self.phys_scale(&snapshot);
         // Reconcile the color ranges with this frame's physical scaling
         // before any panel reads them; the synced twins go back into
@@ -1793,6 +1803,7 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             sim.settings.show_extent = on;
             sim.write_render_uniform();
         }
+        Cmd::SetUnitSystem(s) => sim.settings.unit_system = s,
     }
 }
 

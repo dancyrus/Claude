@@ -210,6 +210,18 @@ pub enum ColorMap {
     Coolwarm,
 }
 
+/// The unit system every physical readout formats in and every
+/// unit-bearing input box parses in (T2-D; conversions in ui/units.rs).
+/// A per-user DISPLAY PREFERENCE: deliberately not scene-persisted — a
+/// shared scene file must not flip a colleague's units, so the scene
+/// format stays at v9 with no unit field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UnitSystem {
+    #[default]
+    Si,
+    DecimalInch,
+}
+
 impl ColorMap {
     /// The map a render mode is born with — the pre-T2-A binding, which
     /// is also what the shader draws when flags bit 1 is clear.
@@ -471,6 +483,9 @@ pub struct Settings {
     /// the sponge margin. View-only and not scene-persisted — the
     /// mapping, grid and every readout stay in visible-cell coords.
     pub show_extent: bool,
+    /// Display unit system (T2-D; folded from ui/units.rs's track-era
+    /// static at the third integration). Not scene-persisted.
+    pub unit_system: UnitSystem,
 }
 
 impl Default for Settings {
@@ -496,6 +511,7 @@ impl Default for Settings {
             ranges: FIELD_RANGE_DEFAULTS,
             probes: ProbeSet::default(),
             show_extent: false,
+            unit_system: UnitSystem::default(),
         }
     }
 }

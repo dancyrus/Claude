@@ -284,6 +284,12 @@ stated in the eraser tooltip next to the stamp refusal).
 - New theme entries: `SNAP_MARK` (amber — a snap candidate must not
   read as a teal selection), `eraser_fill()` (destructive red, α .25),
   `EXTENT_OUTLINE`/`extent_margin_fill()`.
+- **Known measurement gap: the object-snap per-frame cost is
+  unmeasured by the `--bench` harness** — the harness drives no
+  pointer and stays on the Select tool, so `compute_osnap`
+  (ui/canvas.rs) never executes in a bench run. Measuring it would
+  take an armed Line tool with the pointer over a dense scene. This is
+  a gap, not a claim that snaps are free.
 
 ## Second track merge (U3 + T2-C)
 
@@ -339,13 +345,43 @@ stated in the eraser tooltip next to the stamp refusal).
   (LBM and Euler) under Xvfb.
 - Track-era store, same precedent as T2-A/T2-B: a `static AtomicBool`
   in `ui/units.rs` behind `unit_system()`/`set_unit_system()`,
-  because `app.rs` is frozen while U4 runs concurrently. NOT
-  scene-persisted. At the merge: fold into `Settings` + a `Cmd` +
-  scene persistence (v10+), keeping the formatters as the only
-  conversion point.
+  because `app.rs` was frozen while U4 ran concurrently. (Folded at
+  the third integration — see §Third integration; the branch-era
+  forecast of scene persistence at v10 was decided AGAINST there: the
+  unit system is a display preference, not scene state.)
 - Bypass audit came up clean: every physical readout routes through
   `units::fmt_*` — legend, status strip, probe-plot axis labels,
   ribbon derived lines, generators, tree, canvas scale bar and drag
   dimensions, inspector derived lines — and both unit-bearing input
   boxes route through the `InputUnit` adapters; `src/ui/` carries no
   hardcoded unit strings outside `units.rs`.
+
+## Third integration (U4 + T2-D)
+
+- Merge order: main → U4 (`claude/eraser-design-report-fwk843`) →
+  T2-D (`claude/si-decimal-inch-toggle-x17w11`); zero conflicts, as
+  dry-run predicted.
+- **T2-D's static folded into `Settings.unit_system` + a
+  `Cmd::SetUnitSystem`** — the THIRD and LAST instance of the
+  track-era static→Settings pattern (T2-A ranges, T2-B probes, T2-D
+  units). The `UnitSystem` enum moved to sim.rs beside
+  `ColorMap`/`RangeMode`; the ribbon reads `snap.unit_system` and
+  edits via `Cmd`; `update` mirrors the setting into `ui/units.rs`
+  once per frame before any panel draws, so the ~60 `fmt_*` call
+  sites keep stateless signatures. The static remains ONLY as that
+  frame-scoped mirror — single production writer, never a store. Any
+  future unit that reaches for a process-wide static instead of
+  `Settings` + `Cmd` is re-opening a closed pattern.
+- **The unit system is a per-user display preference, NOT
+  scene-persisted** (decided here, with the format untouched at v9):
+  a scene file is shared work product, and loading a colleague's
+  file must not flip your units — the same reasoning that keeps
+  `show_extent` (U4) out of the scene. Session-scoped for now;
+  eframe-storage persistence can ride any later UI-prefs work.
+- CLAUDE.md auto-merged to 143 lines; the fold rewrote the track-debt
+  bullet (now 145 of 150) — no detail needed routing beyond what this
+  file already carries.
+- U4 formatter audit at the merge: U4's new UI (eraser, bucket,
+  snaps, measure, extent overlay) already routes its physical
+  readouts through `ui/units.rs`, so T2-D's toggle covers them with
+  no call-site changes; no hardcoded unit strings entered `src/ui/`.

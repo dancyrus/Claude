@@ -54,10 +54,12 @@ Per-unit decisions later units must not re-derive live in
   pre-v8 objects use the `SketchObjectV7` mirror; older files derive
   edges from `wind_tunnel`). Decode funnels … → v7 → v8 → v9; later
   bumps start at v10.
-- Track-era Mutex debt is fully paid: T2-A's ranges live in
-  `Settings.ranges` + `Cmd` (v7+), T2-B's probes in `Settings.probes`
-  + probe `Cmd`s read via the per-frame `ProbeUi` snapshot (v8+).
-  Still open: unify plot/legend inversion factors in `ui/units.rs`.
+- Track-era static debt is fully paid, three folds, no more: T2-A's
+  ranges (`Settings.ranges`, v7+), T2-B's probes (`Settings.probes`,
+  v8+), T2-D's unit system (`Settings.unit_system` + `Cmd`, NOT
+  scene-persisted — display preference; the `units.rs` static is now a
+  per-frame mirror only). §Third integration. Still open: unify
+  plot/legend inversion factors in `ui/units.rs`.
 
 ## Transforms & nested groups (U3)
 

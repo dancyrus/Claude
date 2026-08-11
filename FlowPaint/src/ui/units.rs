@@ -18,17 +18,19 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The two unit systems T2-D ships. `DecimalInch` is ASME decimal-inch
-/// practice, not feet-and-fractions.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum UnitSystem {
-    Si,
-    DecimalInch,
-}
+/// The two unit systems T2-D ships (`DecimalInch` is ASME decimal-inch
+/// practice, not feet-and-fractions). Defined in sim.rs because
+/// `Settings.unit_system` is the store of record — the third and LAST
+/// instance of the track-era static→Settings fold (after T2-A's ranges
+/// and T2-B's probes).
+pub(crate) use crate::sim::UnitSystem;
 
-/// Track-era store (same precedent as T2-A/T2-B): `app.rs` is frozen
-/// while U4 runs, so the mode lives here instead of `Settings`. Fold it
-/// into `Settings` + a `Cmd` + scene persistence at the track merge.
+/// Frame-scoped MIRROR of `Settings.unit_system`, nothing more: it
+/// exists so the `fmt_*` formatters keep stateless signatures at their
+/// ~60 call sites. `FlowPaintApp::update` writes it once per frame
+/// (from the snapshot, before any panel draws) and is the only
+/// production writer; edits go through `Cmd::SetUnitSystem` like every
+/// other setting. Do not use this as a store — that pattern is closed.
 static INCH_MODE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn unit_system() -> UnitSystem {
@@ -39,6 +41,7 @@ pub(crate) fn unit_system() -> UnitSystem {
     }
 }
 
+/// Sync the mirror. Called from `update` each frame (and from tests).
 pub(crate) fn set_unit_system(s: UnitSystem) {
     INCH_MODE.store(s == UnitSystem::DecimalInch, Ordering::Relaxed);
 }
