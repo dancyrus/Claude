@@ -467,6 +467,10 @@ pub struct Settings {
     pub ranges: [FieldRange; 4],
     /// Persistent point probes (T2-B; folded here at U3, persisted v8+).
     pub probes: ProbeSet,
+    /// Domain-extent view toggle (U4): render the full grid including
+    /// the sponge margin. View-only and not scene-persisted — the
+    /// mapping, grid and every readout stay in visible-cell coords.
+    pub show_extent: bool,
 }
 
 impl Default for Settings {
@@ -491,6 +495,7 @@ impl Default for Settings {
             sponge_strength: 0.08,
             ranges: FIELD_RANGE_DEFAULTS,
             probes: ProbeSet::default(),
+            show_extent: false,
         }
     }
 }
@@ -1772,6 +1777,25 @@ impl GpuSim {
 
     /// Write the render uniform for the current viewport mapping.
     pub fn write_render_uniform(&self) {
+        // Domain extent (U4): widening the render window to the full
+        // grid is a pure uniform change — vis_origin/vis_size describe
+        // the window, and shifting lb_origin by the margin keeps
+        // visible cell (0,0) at the same screen position. No shader
+        // edit, no mapping change, no readout change.
+        let (vis_origin, vis_size, lb_origin) = if self.settings.show_extent {
+            let m = self.margin as f32 * self.mapping.px_per_cell;
+            (
+                [0u32, 0u32],
+                [self.geo.w as u32, self.geo.h as u32],
+                [self.mapping.lb_origin[0] - m, self.mapping.lb_origin[1] - m],
+            )
+        } else {
+            (
+                [self.margin as u32, self.margin as u32],
+                [self.vis_w as u32, self.vis_h as u32],
+                self.mapping.lb_origin,
+            )
+        };
         let p = RenderParamsRaw {
             width: self.geo.w as u32,
             height: self.geo.h as u32,
@@ -1779,11 +1803,11 @@ impl GpuSim {
             flags: self.render_flags(),
             vp_origin: self.mapping.vp_origin,
             vp_size: self.mapping.vp_size,
-            lb_origin: self.mapping.lb_origin,
+            lb_origin,
             px_per_cell: self.mapping.px_per_cell,
             inlet_speed: self.render_inlet_speed(),
-            vis_origin: [self.margin as u32, self.margin as u32],
-            vis_size: [self.vis_w as u32, self.vis_h as u32],
+            vis_origin,
+            vis_size,
             display_gain: self.range_display_gain(),
             smoke_gain: self.settings.smoke_gain,
             particle_size: self.settings.particle_size,

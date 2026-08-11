@@ -34,6 +34,11 @@ Per-unit decisions later units must not re-derive live in
   unimplemented (needs a per-mode offset in `render.wgsl`).
 - **T2-B (probes + Re input): done**, branch
   `claude/flowpaint-v4.1-t2b-probes` (off the U1 tip).
+- **U4 (fill + eraser + snaps + domain extent): done**, branch
+  `claude/eraser-design-report-fwk843` (off the second-track-merge
+  main). Vector eraser only — stamp erase cut (approved), holes
+  refused. Decisions in §U4; design report `docs/u4-eraser-design.md`.
+  Next: U5 and mirror/array are unblocked.
 - **T2-C (per-edge boundary conditions): done**, branch
   `claude/t2-c-boundary-conditions-s0iupf` (off the T2+U2 integration
   merge tip). Kinds: far field / inlet / outlet / wall; **periodic is
@@ -58,16 +63,10 @@ Per-unit decisions later units must not re-derive live in
 
 **Transform composition order — fixed, do not re-derive: the child's
 transform applies first, then each ancestor outward** (world =
-`T_root ∘ … ∘ T_parent`(stored); `SketchModel::abs_of`). An object's
-stored coordinates live in its parent group's space; `Shape::Group`
-carries a **similarity** (translate/rotate/uniform-scale) — the only
-family that composes through rotated nests without shear, which is why
-gizmo/panel scaling is uniform (stamps keep a single `scale: f32`; the
-tooltip declares non-uniform stamp scaling out of scope). Cycle
-prevention lives in `SketchModel::reparent` (refuses; tested) and
-`sanitize_parents` (repairs crafted files on load). Edits from world
-space go through `translate_world`/`rotate_world`/`scale_world`, which
-damage-mark through the chain.
+`T_root ∘ … ∘ T_parent`(stored); `SketchModel::abs_of`). Group
+transforms are similarities (uniform scale only). Everything else —
+cycle prevention, world-space ops, why scaling is uniform — lives in
+`docs/unit-decisions.md` §U3; read it before touching transforms.
 
 ## Hard rules
 
@@ -115,30 +114,25 @@ damage-mark through the chain.
   `ViewportMapping`). `src/model.rs` — object model + undo (index-based
   ops; panel edits coalesce via `record_modify_coalesced`).
 
-## Nozzle chamber-fan speed: clamp layers
+## Nozzle engines, edge BCs, the sponge
 
-Since U3 a generated nozzle is an **Engine group**: the bell stamp is
-walls-only and the chamber fan is a real filled Fan-rect CHILD
-(`generators::nozzle_fan_layout`) — the Engine panel keys off the
-parent link, not raster inspection. Clamps: dialog/auto multiplier and
-the fan child's `fan_mult` (0.2–2.0) → runtime bounds in shaders:
-**LBM `MAX_LATTICE_SPEED = 0.3` binds almost always** (lbm.wgsl);
-Euler's Mach-8 sanity clamp effectively never (euler.wgsl). The cap is
-a *readout*, not a field — the binding constants live in shaders.
-(Pre-v8 scenes still carry fan-cell stamps; the inspector's raster-scan
-Engine path remains for them only.)
+A generated nozzle is an **Engine group** keyed off the parent link
+(clamp layers and the shader speed caps: `docs/unit-decisions.md`
+§U3). Edge BCs: **any WALL edge forces the sponge to width 0**;
+inlet/outlet keep it — that pairing IS the legacy tunnel. Full rules
+(preset band painting, `paint_edge_bcs` ordering) in
+`docs/unit-decisions.md` §T2-C; read it before touching edges, the
+sponge, or the tunnel preset.
 
-## Edge BCs and the sponge (T2-C coupling)
+## Eraser, fill, snaps (U4)
 
-`Settings.edges` holds the four edge kinds; non-preset sets are baked
-as 2-cell bands by `sim::paint_edge_bcs` after the object pass. The
-wind-tunnel preset {left inlet, right outlet, top/bottom far field}
-instead keeps the model rasterizer's legacy band painting byte-for-byte
-(`rasterize_region`'s `wind_tunnel` flag = "edges == preset"). **Any
-WALL edge forces the absorbing sponge to width 0** (a sponged wall is
-not a wall); inlet/outlet edges keep the sponge — that pairing is the
-legacy tunnel and must not change. `wind_tunnel` remains the freestream
-switch; toggling it re-arms the preset.
+The eraser is a per-object boolean subtract committed on release (one
+undo entry per stroke); the paint bucket emits a traced filled Poly;
+both share the degenerate-case guards in `src/geomops.rs`. Stamps ship
+WITHOUT erase support (approved cut — `docs/u4-eraser-design.md`);
+holes in filled polygons are refused and deferred (plan's deferred
+list). Snap priority, refusal messages, the domain-extent uniform
+trick and every other U4 decision: `docs/unit-decisions.md` §U4.
 
 ## Frame-time baseline (plan working rules)
 

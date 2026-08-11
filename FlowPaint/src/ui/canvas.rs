@@ -6,12 +6,15 @@
 //! groups (transform order: child first, then each ancestor outward —
 //! see CLAUDE.md).
 
-use crate::app::{Cmd, FlowPaintApp, Gesture, Tool, ViewRequest};
+use crate::app::{Cmd, FlowPaintApp, Gesture, OsnapHit, OsnapKind, Tool, ViewRequest};
 use crate::model::{Shape, Sim2, SketchObject};
 use crate::sim::{GpuSim, ViewportMapping};
 use eframe::egui;
 
 use super::units::{fmt_angle, fmt_factor, fmt_len};
+
+/// Object-snap radius in screen POINTS — constant across zoom (U4).
+const SNAP_RADIUS_PT: f32 = 10.0;
 
 // Free-zoom bounds: view_zoom is a multiplier over the letterbox fit
 // scale, additionally capped in absolute framebuffer px per cell; the
@@ -343,9 +346,48 @@ impl FlowPaintApp {
         let handle_r = 8.0 * ppp / px_per_cell;
         let click_slop = 4.0 * ppp / px_per_cell;
         let pt_per_cell = px_per_cell / ppp;
-        let (shift, alt) =
-            response.ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
+        let (shift, alt, ctrl) = response
+            .ctx
+            .input(|i| (i.modifiers.shift, i.modifiers.alt, i.modifiers.command));
         let pointer = response.interact_pointer_pos();
+
+        // Object snaps (U4): resolve THE frame's candidate once, from
+        // the active pointer position; every snapped coordinate this
+        // frame consumes it via snap_active. Ctrl suspends; the object
+        // being drawn is excluded so it can't snap to itself.
+        self.osnap_hit = None;
+        let osnap_tool = matches!(
+            self.tool,
+            Tool::Line | Tool::Rect | Tool::Ellipse | Tool::Polyline | Tool::Measure
+        ) || matches!(self.gesture, Gesture::HandleDrag { .. });
+        if self.osnap_enabled && osnap_tool && !ctrl && !pan_mode {
+            if let Some(pos) = pointer.or(response.hover_pos()) {
+                let cursor = to_cell(pos);
+                let radius = SNAP_RADIUS_PT * ppp / px_per_cell;
+                let exclude = match &self.gesture {
+                    Gesture::DrawShape { id, .. }
+                    | Gesture::DrawPoly { id }
+                    | Gesture::HandleDrag { id, .. } => Some(*id),
+                    _ => None,
+                };
+                let anchor = match &self.gesture {
+                    Gesture::DrawShape { anchor, .. } => Some(*anchor),
+                    Gesture::Measure { a, .. } => Some(*a),
+                    Gesture::DrawPoly { id } => {
+                        self.model.find(*id).and_then(|i| {
+                            match &self.model.objects[i].shape {
+                                Shape::Poly { pts, .. } if pts.len() >= 2 => {
+                                    Some(pts[pts.len() - 2])
+                                }
+                                _ => None,
+                            }
+                        })
+                    }
+                    _ => None,
+                };
+                self.osnap_hit = self.compute_osnap(cursor, radius, exclude, anchor);
+            }
+        }
 
         // Armed probe placement (from the tree) claims the next click
         // over the field outright — it must not also select or draw.
@@ -415,10 +457,10 @@ impl FlowPaintApp {
                 let p = if shift {
                     match prev {
                         Some(a) => self.angle_snap(a, raw),
-                        None => self.snap_point(raw),
+                        None => self.snap_active(raw),
                     }
                 } else {
-                    self.snap_point(raw)
+                    self.snap_active(raw)
                 };
                 self.mutate_live(id, |o| {
                     if let Shape::Poly { pts, .. } = &mut o.shape {
@@ -456,7 +498,7 @@ impl FlowPaintApp {
                     }
                     Tool::Line => {
                         self.finish_gesture();
-                        let a = self.snap_point(raw);
+                        let a = self.snap_active(raw);
                         let obj = self.new_object(Shape::Line { a, b: a });
                         let id = obj.id;
                         self.model.add(obj);
@@ -465,7 +507,7 @@ impl FlowPaintApp {
                     }
                     Tool::Rect | Tool::Ellipse => {
                         self.finish_gesture();
-                        let a = self.snap_point(raw);
+                        let a = self.snap_active(raw);
                         let shape = if self.tool == Tool::Rect {
                             Shape::Rect { c: a, half: [0.5, 0.5], angle: 0.0 }
                         } else {
@@ -483,7 +525,7 @@ impl FlowPaintApp {
                             self.poly_click(id, raw, shift, handle_r);
                         } else {
                             self.finish_gesture();
-                            let p = self.snap_point(raw);
+                            let p = self.snap_active(raw);
                             let obj = self.new_object(Shape::Poly {
                                 pts: vec![p, p],
                                 closed: false,
@@ -506,6 +548,21 @@ impl FlowPaintApp {
                         self.model.add(obj);
                         self.gesture = Gesture::DrawPencil { id };
                         self.select_only(id);
+                    }
+                    Tool::Bucket => {
+                        self.finish_gesture();
+                        self.bucket_fill(raw);
+                    }
+                    Tool::Eraser => {
+                        self.finish_gesture();
+                        // Raw points, no snapping: an eraser follows the
+                        // hand. The edit commits on release.
+                        self.gesture = Gesture::Erase { pts: vec![raw] };
+                    }
+                    Tool::Measure => {
+                        self.finish_gesture();
+                        let a = self.snap_active(raw);
+                        self.gesture = Gesture::Measure { a, b: a };
                     }
                 }
             }
@@ -564,10 +621,10 @@ impl FlowPaintApp {
                         });
                         match other {
                             Some(o) => self.angle_snap(o, raw),
-                            None => self.snap_point(raw),
+                            None => self.snap_active(raw),
                         }
                     } else {
-                        self.snap_point(raw)
+                        self.snap_active(raw)
                     };
                     // Handles are grabbed in world space; the stored
                     // shape lives in its parent group's space.
@@ -596,6 +653,27 @@ impl FlowPaintApp {
                     let p = self.snap_point(raw);
                     self.gizmo_pivot = Some(p);
                     self.gizmo_pivot_sel = self.selected.clone();
+                } else if let Gesture::Erase { pts } = &mut self.gesture {
+                    // Decimate to ~half the radius so capsule counts
+                    // stay bounded on slow scribbles.
+                    let min_step = (self.eraser_radius * 0.5).max(0.75);
+                    let far = pts
+                        .last()
+                        .map(|l| Self::dist(*l, raw) >= min_step)
+                        .unwrap_or(true);
+                    if far {
+                        pts.push(raw);
+                    }
+                } else if let Gesture::Measure { a, .. } = &self.gesture {
+                    let a = *a;
+                    let b = if shift {
+                        self.angle_snap(a, raw)
+                    } else {
+                        self.snap_active(raw)
+                    };
+                    if let Gesture::Measure { b: bb, .. } = &mut self.gesture {
+                        *bb = b;
+                    }
                 }
             }
         }
@@ -619,10 +697,205 @@ impl FlowPaintApp {
                     | Gesture::GizmoRotate { .. }
                     | Gesture::GizmoScale { .. }
                     | Gesture::GizmoPivot
+                    | Gesture::Erase { .. }
+                    | Gesture::Measure { .. }
             )
         {
             self.finish_gesture();
         }
+    }
+
+    /// The frame's snapped coordinate: the object-snap candidate when
+    /// one is in range (it wins over the grid — U4), else the grid snap.
+    fn snap_active(&self, raw: [f32; 2]) -> [f32; 2] {
+        match &self.osnap_hit {
+            Some(h) => h.pos,
+            None => self.snap_point(raw),
+        }
+    }
+
+    /// Find the object-snap candidate near `cursor` (world cells).
+    /// Priority: kind first (endpoint > intersection > midpoint >
+    /// center > perpendicular), then distance. Hidden objects are
+    /// skipped; LOCKED objects still snap (they're reference geometry).
+    fn compute_osnap(
+        &self,
+        cursor: [f32; 2],
+        radius: f32,
+        exclude: Option<u64>,
+        anchor: Option<[f32; 2]>,
+    ) -> Option<OsnapHit> {
+        let mut best: Option<(OsnapKind, f32, [f32; 2])> = None;
+        let mut consider = |kind: OsnapKind, p: [f32; 2]| {
+            let d = Self::dist(p, cursor);
+            if d > radius {
+                return;
+            }
+            let better = match &best {
+                Some((bk, bd, _)) => (kind, d) < (*bk, *bd),
+                None => true,
+            };
+            if better {
+                best = Some((kind, d, p));
+            }
+        };
+        // Segment pool for intersection / perpendicular candidates
+        // ((owner id, a, b) in world space), gathered from objects near
+        // the cursor only.
+        let mut pool: Vec<(u64, [f32; 2], [f32; 2])> = Vec::new();
+        const POOL_CAP: usize = 64;
+
+        for o in &self.model.objects {
+            if Some(o.id) == exclude
+                || matches!(o.shape, Shape::Group { .. })
+                || self.model.eff_hidden(o.id)
+            {
+                continue;
+            }
+            let abs = self.model.parent_abs(o.id);
+            let b = o.bounds_under(abs);
+            if cursor[0] < b.x0 as f32 - radius
+                || cursor[0] > b.x1 as f32 + radius
+                || cursor[1] < b.y0 as f32 - radius
+                || cursor[1] > b.y1 as f32 + radius
+            {
+                continue;
+            }
+            let ap = |p: [f32; 2]| abs.apply(p);
+            match &o.shape {
+                Shape::Line { a, b } => {
+                    let (aw, bw) = (ap(*a), ap(*b));
+                    consider(OsnapKind::Endpoint, aw);
+                    consider(OsnapKind::Endpoint, bw);
+                    consider(
+                        OsnapKind::Midpoint,
+                        [(aw[0] + bw[0]) * 0.5, (aw[1] + bw[1]) * 0.5],
+                    );
+                    if pool.len() < POOL_CAP {
+                        pool.push((o.id, aw, bw));
+                    }
+                }
+                Shape::Poly { pts, closed } => {
+                    let n = pts.len();
+                    let segs = if *closed { n } else { n.saturating_sub(1) };
+                    for p in pts {
+                        consider(OsnapKind::Endpoint, ap(*p));
+                    }
+                    for k in 0..segs {
+                        let aw = ap(pts[k]);
+                        let bw = ap(pts[(k + 1) % n]);
+                        consider(
+                            OsnapKind::Midpoint,
+                            [(aw[0] + bw[0]) * 0.5, (aw[1] + bw[1]) * 0.5],
+                        );
+                        if pool.len() < POOL_CAP {
+                            pool.push((o.id, aw, bw));
+                        }
+                    }
+                    if *closed {
+                        consider(OsnapKind::Center, ap(o.center()));
+                    }
+                }
+                Shape::Rect { c, half, angle } => {
+                    consider(OsnapKind::Center, ap(*c));
+                    let (s, co) = angle.sin_cos();
+                    let corner = |kx: f32, ky: f32| -> [f32; 2] {
+                        let lx = kx * half[0];
+                        let ly = ky * half[1];
+                        ap([c[0] + lx * co - ly * s, c[1] + lx * s + ly * co])
+                    };
+                    let cs = [
+                        corner(-1.0, -1.0),
+                        corner(1.0, -1.0),
+                        corner(1.0, 1.0),
+                        corner(-1.0, 1.0),
+                    ];
+                    for k in 0..4 {
+                        consider(OsnapKind::Endpoint, cs[k]);
+                        let m = [
+                            (cs[k][0] + cs[(k + 1) % 4][0]) * 0.5,
+                            (cs[k][1] + cs[(k + 1) % 4][1]) * 0.5,
+                        ];
+                        consider(OsnapKind::Midpoint, m);
+                        if pool.len() < POOL_CAP {
+                            pool.push((o.id, cs[k], cs[(k + 1) % 4]));
+                        }
+                    }
+                }
+                Shape::Ellipse { c, r, angle } => {
+                    consider(OsnapKind::Center, ap(*c));
+                    // Quadrant points, under the ellipse's rotation.
+                    let (s, co) = angle.sin_cos();
+                    for (kx, ky) in [(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+                    {
+                        let lx = kx * r[0];
+                        let ly = ky * r[1];
+                        consider(
+                            OsnapKind::Midpoint,
+                            ap([c[0] + lx * co - ly * s, c[1] + lx * s + ly * co]),
+                        );
+                    }
+                }
+                Shape::Stamp { raster, c, scale, angle } => {
+                    consider(OsnapKind::Center, ap(*c));
+                    let hx = (raster.rect.2 - raster.rect.0).max(0) as f32 * 0.5 * scale;
+                    let hy = (raster.rect.3 - raster.rect.1).max(0) as f32 * 0.5 * scale;
+                    let (s, co) = angle.sin_cos();
+                    for (kx, ky) in
+                        [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                    {
+                        let lx = kx * hx;
+                        let ly = ky * hy;
+                        consider(
+                            OsnapKind::Endpoint,
+                            ap([c[0] + lx * co - ly * s, c[1] + lx * s + ly * co]),
+                        );
+                    }
+                }
+                Shape::Group { .. } => {}
+            }
+        }
+
+        // Intersections between pooled segments of DIFFERENT objects
+        // (same-object neighbors already share snapped endpoints).
+        for i in 0..pool.len() {
+            for j in (i + 1)..pool.len() {
+                if pool[i].0 == pool[j].0 {
+                    continue;
+                }
+                if let Some((t, _)) = crate::geomops::segs_intersect(
+                    pool[i].1, pool[i].2, pool[j].1, pool[j].2,
+                ) {
+                    let a = pool[i].1;
+                    let b = pool[i].2;
+                    consider(
+                        OsnapKind::Intersection,
+                        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t],
+                    );
+                }
+            }
+        }
+
+        // Perpendicular feet from the gesture's anchor.
+        if let Some(a) = anchor {
+            for (_, s0, s1) in &pool {
+                let d = [s1[0] - s0[0], s1[1] - s0[1]];
+                let l2 = d[0] * d[0] + d[1] * d[1];
+                if l2 < 1e-9 {
+                    continue;
+                }
+                let t = ((a[0] - s0[0]) * d[0] + (a[1] - s0[1]) * d[1]) / l2;
+                if !(0.02..=0.98).contains(&t) {
+                    continue;
+                }
+                consider(
+                    OsnapKind::Perpendicular,
+                    [s0[0] + d[0] * t, s0[1] + d[1] * t],
+                );
+            }
+        }
+
+        best.map(|(kind, _, pos)| OsnapHit { pos, kind })
     }
 
     /// Restore-and-reapply for the gizmo rotate drag: the model returns
@@ -922,7 +1195,7 @@ impl FlowPaintApp {
                 return;
             }
         };
-        let p = if shift { self.angle_snap(prev, raw) } else { self.snap_point(raw) };
+        let p = if shift { self.angle_snap(prev, raw) } else { self.snap_active(raw) };
         if len >= 4 && Self::dist(p, first) <= handle_r {
             // Close the polygon: drop the rubber vertex and mark closed.
             self.gesture = Gesture::None;
@@ -965,7 +1238,7 @@ impl FlowPaintApp {
             .map(|i| matches!(self.model.objects[i].shape, Shape::Line { .. }))
             .unwrap_or(false);
         if is_line {
-            let b = if shift { self.angle_snap(anchor, raw) } else { self.snap_point(raw) };
+            let b = if shift { self.angle_snap(anchor, raw) } else { self.snap_active(raw) };
             self.mutate_live(id, |o| {
                 if let Shape::Line { b: bb, .. } = &mut o.shape {
                     *bb = b;
@@ -973,7 +1246,7 @@ impl FlowPaintApp {
             });
             return;
         }
-        let mut q = self.snap_point(raw);
+        let mut q = self.snap_active(raw);
         if shift {
             let dx = q[0] - anchor[0];
             let dy = q[1] - anchor[1];
@@ -1015,6 +1288,73 @@ impl FlowPaintApp {
             )
         };
         let painter = ui.painter();
+
+        // Domain extent (U4): with the full grid rendered (margin
+        // included), shade the margin ring, outline the usable
+        // interior, and label the margin in cells and physical units.
+        // View-only — every readout stays in visible-cell coordinates.
+        if self.extent_on {
+            let (vw, vh) = self.stats_grid;
+            let m = self.stats_margin as f32;
+            let interior =
+                egui::Rect::from_two_pos(to_screen([0.0, 0.0]), to_screen([vw as f32, vh as f32]));
+            if m > 0.0 {
+                let outer = egui::Rect::from_two_pos(
+                    to_screen([-m, -m]),
+                    to_screen([vw as f32 + m, vh as f32 + m]),
+                );
+                let fill = super::theme::extent_margin_fill();
+                // Four bands around the interior (no overlap).
+                painter.rect_filled(
+                    egui::Rect::from_min_max(outer.min, egui::pos2(outer.max.x, interior.min.y)),
+                    0.0,
+                    fill,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(outer.min.x, interior.max.y), outer.max),
+                    0.0,
+                    fill,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(outer.min.x, interior.min.y),
+                        egui::pos2(interior.min.x, interior.max.y),
+                    ),
+                    0.0,
+                    fill,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(interior.max.x, interior.min.y),
+                        egui::pos2(outer.max.x, interior.max.y),
+                    ),
+                    0.0,
+                    fill,
+                );
+            }
+            painter.rect_stroke(
+                interior,
+                0.0,
+                egui::Stroke::new(1.0, super::theme::EXTENT_OUTLINE),
+            );
+            let ps = self.phys_cache;
+            let label = if self.stats_margin > 0 {
+                format!(
+                    "usable interior — sponge margin {} cells = {} each side",
+                    self.stats_margin,
+                    fmt_len(ps.len_m(m)),
+                )
+            } else {
+                "usable interior — no simulated margin".to_string()
+            };
+            painter.text(
+                interior.min + egui::vec2(6.0, 4.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::TextStyle::Monospace.resolve(ui.style()),
+                super::theme::EXTENT_OUTLINE,
+            );
+        }
 
         // Faint snap grid while a draw tool is armed.
         if self.snap_enabled && self.tool != Tool::Select {
@@ -1105,6 +1445,118 @@ impl FlowPaintApp {
         // scale handles, the rotate handle above, the pivot marker.
         let pt_per_cell = mapping.px_per_cell / ppp;
         self.draw_gizmo(ui, painter, pt_per_cell, &to_screen);
+
+        // Eraser (U4): translucent preview of the swept stroke while it
+        // collects, and the radius cursor whenever the tool is armed.
+        if self.tool == Tool::Eraser {
+            let r_pt = self.eraser_radius.max(0.5) * pt_per_cell;
+            if let Gesture::Erase { pts } = &self.gesture {
+                let fill = super::theme::eraser_fill();
+                let path: Vec<egui::Pos2> = pts.iter().map(|p| to_screen(*p)).collect();
+                for p in &path {
+                    painter.circle_filled(*p, r_pt, fill);
+                }
+                if path.len() >= 2 {
+                    painter.add(egui::Shape::line(
+                        path,
+                        egui::Stroke::new(2.0 * r_pt, fill),
+                    ));
+                }
+            }
+            if let Some(c) = self.hover_cell {
+                painter.circle_stroke(
+                    to_screen(c),
+                    r_pt,
+                    egui::Stroke::new(1.0, super::theme::BAD),
+                );
+            }
+        }
+
+        // Measure (U4): the picked span with its live readout.
+        if let Gesture::Measure { a, b } = &self.gesture {
+            let (pa, pb) = (to_screen(*a), to_screen(*b));
+            let stroke = egui::Stroke::new(1.5, super::theme::SNAP_MARK);
+            painter.line_segment([pa, pb], stroke);
+            painter.circle_stroke(pa, 3.0, stroke);
+            painter.circle_stroke(pb, 3.0, stroke);
+            let ps = self.phys_cache;
+            let l = Self::dist(*a, *b);
+            if l > 0.1 {
+                let ang = -(b[1] - a[1]).atan2(b[0] - a[0]).to_degrees();
+                painter.text(
+                    egui::pos2((pa.x + pb.x) * 0.5, (pa.y + pb.y) * 0.5 - 10.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    format!("L {}   ∠ {}", fmt_len(ps.len_m(l)), fmt_angle(ang)),
+                    egui::TextStyle::Monospace.resolve(ui.style()),
+                    super::theme::SNAP_MARK,
+                );
+            }
+        }
+
+        // Object-snap indicator (U4): a kind-shaped marker at the
+        // candidate, with its name alongside.
+        if let Some(hit) = &self.osnap_hit {
+            let p = to_screen(hit.pos);
+            let stroke = egui::Stroke::new(1.5, super::theme::SNAP_MARK);
+            match hit.kind {
+                OsnapKind::Endpoint => {
+                    painter.rect_stroke(
+                        egui::Rect::from_center_size(p, egui::vec2(9.0, 9.0)),
+                        0.0,
+                        stroke,
+                    );
+                }
+                OsnapKind::Midpoint => {
+                    // Triangle.
+                    let pts = vec![
+                        p + egui::vec2(0.0, -5.5),
+                        p + egui::vec2(5.0, 4.0),
+                        p + egui::vec2(-5.0, 4.0),
+                    ];
+                    painter.add(egui::Shape::closed_line(pts, stroke));
+                }
+                OsnapKind::Center => {
+                    painter.circle_stroke(p, 5.0, stroke);
+                    painter.circle_filled(p, 1.5, super::theme::SNAP_MARK);
+                }
+                OsnapKind::Intersection => {
+                    painter.line_segment(
+                        [p + egui::vec2(-4.5, -4.5), p + egui::vec2(4.5, 4.5)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [p + egui::vec2(-4.5, 4.5), p + egui::vec2(4.5, -4.5)],
+                        stroke,
+                    );
+                }
+                OsnapKind::Perpendicular => {
+                    // Right-angle mark.
+                    painter.line_segment(
+                        [p + egui::vec2(-5.0, 5.0), p + egui::vec2(-5.0, -3.0)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [p + egui::vec2(-5.0, 5.0), p + egui::vec2(3.0, 5.0)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [p + egui::vec2(-5.0, 0.0), p + egui::vec2(0.0, 0.0)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [p + egui::vec2(0.0, 0.0), p + egui::vec2(0.0, 5.0)],
+                        stroke,
+                    );
+                }
+            }
+            painter.text(
+                p + egui::vec2(8.0, -8.0),
+                egui::Align2::LEFT_BOTTOM,
+                hit.kind.label(),
+                egui::TextStyle::Small.resolve(ui.style()),
+                super::theme::SNAP_MARK,
+            );
+        }
 
         if ids.len() != 1 {
             return;

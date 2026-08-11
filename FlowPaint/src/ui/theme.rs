@@ -70,6 +70,20 @@ pub(crate) const SCALE_BAR: Color32 = INK;
 pub(crate) fn rubber_fill() -> Color32 {
     SEL.gamma_multiply(0.12)
 }
+/// Object-snap indicator marker + label, and the measure-tool readout
+/// (U4): the amber accent, distinct from the teal selection so a snap
+/// candidate never reads as a selection.
+pub(crate) const SNAP_MARK: Color32 = WARN;
+/// Eraser stroke preview fill: the destructive accent at low opacity.
+pub(crate) fn eraser_fill() -> Color32 {
+    BAD.gamma_multiply(0.25)
+}
+/// Domain-extent overlay (U4): interior outline + margin label...
+pub(crate) const EXTENT_OUTLINE: Color32 = INK_2;
+/// ...and the margin-ring shading over the rendered sponge region.
+pub(crate) fn extent_margin_fill() -> Color32 {
+    VIEW_BG.gamma_multiply(0.45)
+}
 /// Probe marker and plot-series colors (T2-B), indexed by probe slot:
 /// distinct hues that read on both the dark canvas and the plot panel.
 pub(crate) const PROBE_COLORS: [Color32; 8] = [

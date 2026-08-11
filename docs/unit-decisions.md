@@ -120,6 +120,12 @@ unit status and pointers here.
   `add_many` undo entry). The Engine inspector keys off the parent
   link (Fan child + stamp child); the raster-scan path survives ONLY
   for pre-v8 scenes with baked fan cells.
+- Nozzle chamber-fan speed, clamp layers (U1-era, moved here from
+  CLAUDE.md at U4): dialog/auto multiplier and the fan child's
+  `fan_mult` clamp to 0.2–2.0; the runtime bounds live in the shaders
+  — **LBM `MAX_LATTICE_SPEED = 0.3` binds almost always** (lbm.wgsl),
+  Euler's Mach-8 sanity clamp effectively never (euler.wgsl). The cap
+  is a *readout*, not a field — the binding constants live in shaders.
 
 ## T2-A (locked color range + colormap)
 
@@ -192,6 +198,90 @@ Full write-up: `docs/t2a-color-range.md`.
 - `Settings.wind_tunnel` stays as the freestream switch (`free_u`,
   reset state); `Cmd::SetWindTunnel` re-arms the legacy edge preset.
   Every pre-v9 load path derives `edges` from it (`EdgeBcs::legacy`).
+
+## U4 (fill + eraser + object snaps + domain extent)
+
+Design report: `docs/u4-eraser-design.md` (stamp erase cut from the
+first release, approved; bell venting = overdraw with vector walls,
+stated in the eraser tooltip next to the stamp refusal).
+
+- **Shared geometry lives in `src/geomops.rs`** — the eraser booleans
+  and the bucket's flood/trace share one set of degenerate-case guards
+  (the ui/canvas.rs 0.5-cell minimum radii are the precedent): open
+  fragments < 1.0 cell drop, closed fragments < 1.0 cell² drop,
+  vertices weld at 1e-3.
+- **Eraser commits on RELEASE**, not live: a subtract can split an
+  object, and live application changes object identity mid-drag. One
+  undo entry per stroke via `SketchModel::apply_erase` — a
+  `ModelOp::Group` of Modify (first fragment keeps the original id and
+  z-slot) + the new `ModelOp::Insert` (remaining fragments contiguous
+  above it) + Remove (erased to nothing). The plan's
+  `record_modify_coalesced` line survives only for in-place cases;
+  splits change the object count, which a coalesced modify cannot
+  express.
+- Stroke conjugation: world capsules map into each object's STORED
+  space exactly (similarity ⇒ disc stays a disc; radius divides by the
+  composed scale — the same conjugation as `hit_under`). Centerline
+  shapes inflate the radius by half the thickness (WYSIWYG); filled
+  polygons do not.
+- Filled-polygon subtraction is SEQUENTIAL per capsule (each is
+  convex; Greiner–Hormann difference walk in `poly_minus_convex`),
+  ordered by BFS from the boundary-crossing capsules so a stroke that
+  starts interior but crosses the edge subtracts fine; an interior-only
+  footprint refuses (`WouldHole` — `Shape::Poly` has no holes; on the
+  plan's deferred list). Two robustness measures found by test, do not
+  remove: the stroke is RDP-simplified at r/4 before capsule building,
+  and each capsule gets a deterministic sub-0.5% radius jitter keyed by
+  stroke index — consecutive same-radius capsules on a straight drag
+  otherwise carve slot walls EXACTLY tangent to the next capsule and
+  the crossing walk corrupts.
+- The two refusals carry DISTINCT messages: stamp (with the
+  overdraw/bell-vent workaround) vs interior-hole (with the
+  cross-the-edge fix). Rect/Ellipse polygonize to a Poly only on an
+  actual cut (a miss keeps them parametric). Locked/hidden skipped
+  (`editable` convention); erase is not selection-scoped.
+- **Right-drag-erase from 61368c8 is NOT reinstated** — verified
+  against the U1/U2 gesture map: the Secondary press now finishes
+  polylines and clears selections. The X key and `Tool::Eraser`
+  return; Fill = F, Measure = M.
+- **Paint bucket** rasterizes the MODEL alone (margin 0, no tunnel
+  bands) over the visible grid, floods 4-connected, refuses on
+  non-fluid clicks and regions open to the domain edge (distinct
+  messages), traces the outer contour (corner walk keeping the region
+  on the right; saddle = sharpest turn, matching 4-connectivity),
+  RDP eps 0.75, and inserts the filled Poly at the BOTTOM z-slot
+  (`insert_at(0)`) so interior island walls keep winning overlaps.
+  Known caveat: fluid sealed INSIDE a hollow island gets covered by
+  the fill polygon (holes again). Tooltip states the
+  boundary-is-a-snapshot limitation.
+- **Filled closed Poly**: even-odd scanline fill over cell centres;
+  thickness ignored (the filled Rect/Ellipse convention); hit test
+  adds point-in-polygon; `can_fill` extended in the inspector.
+- **Object snaps**: endpoint > intersection > midpoint > center >
+  perpendicular (that fixed order first, distance breaks ties within a
+  kind). Radius 10 screen POINTS (`SNAP_RADIUS_PT`), so it holds
+  across zoom. Ctrl suspends; an object snap beats the grid snap;
+  hidden objects are skipped but LOCKED objects still snap (reference
+  geometry); the object being drawn is excluded. One candidate is
+  computed per frame from the active pointer and consumed by every
+  snapped coordinate that frame. Ellipse quadrant points rank as
+  Midpoint; intersections come from a 64-segment pool of nearby
+  outlines (different objects only). Perpendicular needs the gesture's
+  anchor. MoveSel and the gizmo pivot keep grid-only snapping.
+- **Measure** (delegable-with-snaps item, folded in): drag two points,
+  distance + angle live on the canvas and into the status line on
+  release; creates no object; Shift angle-snaps.
+- **Domain extent** is a pure UNIFORM change: `Settings.show_extent`
+  (not scene-persisted) makes `write_render_uniform` widen
+  `vis_origin/vis_size` to the full grid and shift `lb_origin` by the
+  margin — no shader edit, no mapping change, PNG export untouched.
+  The canvas overlay shades the margin ring, outlines the interior,
+  and labels the margin in cells + physical units via `ui/units.rs`.
+  Acceptance held by construction: every readout keeps visible-cell
+  coordinates.
+- New theme entries: `SNAP_MARK` (amber — a snap candidate must not
+  read as a teal selection), `eraser_fill()` (destructive red, α .25),
+  `EXTENT_OUTLINE`/`extent_margin_fill()`.
 
 ## Second track merge (U3 + T2-C)
 

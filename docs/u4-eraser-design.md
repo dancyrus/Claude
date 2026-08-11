@@ -1,9 +1,20 @@
-# U4 eraser — design report (pre-implementation)
+# U4 eraser — design report
 
-Plan v4.1 §U4 requires this report before any eraser code is written:
+Plan v4.1 §U4 required this report before any eraser code was written:
 both designs (vector boolean subtract, stamp mask layer) and a
 recommendation on whether stamps need erase support in the first
-release. No implementation has been started.
+release. **Decision (approved): ship vector erase; cut stamp erase
+from the first release.** The RS-25 nozzle is a U5 sample-scene
+candidate, so bell venting will come up — overdrawing the bell with
+vector walls is the sanctioned v1 workaround, and the eraser tooltip
+says so next to the stamp refusal so nobody files it as a bug.
+
+The two refusal cases get DISTINCT, specific status messages (a tool
+that says no twice for different reasons reads as broken if both
+messages are generic): one for a stroke over a stamp (with the
+overdraw workaround), one for a stroke wholly interior to a filled
+shape (with the cross-the-edge fix). The missing hole support is also
+recorded on the plan's "Deferred, on purpose" list, not just here.
 
 The eraser is a new feature, not a restoration: `146e797` removed the
 raster eraser with the raster canvas, and raster subtraction cannot
