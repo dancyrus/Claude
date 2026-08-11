@@ -2368,11 +2368,16 @@ impl FlowPaintApp {
         };
         if frame == 1 {
             // Deterministic scene: Pinball preset, compressible mode, at
-            // whatever grid the app started with (the default).
+            // whatever grid the app started with (the default). Tracers
+            // are pinned OFF here for the same reason scene and solver
+            // are pinned: every recorded bench number was taken with the
+            // pre-U5 no-tracer default, and U5's first-run 100 k tracers
+            // otherwise leak into the measured workload (~7% on mean).
             let (vw, vh) = self.stats_grid;
             let objs = build_preset(ScenePreset::Pinball, &mut self.model, vw, vh);
             self.model.replace_all(objs);
             cmds.push(Cmd::SetSolver(SolverMode::Euler));
+            cmds.push(Cmd::SetParticles(0));
             cmds.push(Cmd::ResetFlow);
         }
         if done {
