@@ -112,6 +112,7 @@ impl FlowPaintApp {
             Tool::Bucket => ph::PAINT_BUCKET,
             Tool::Eraser => ph::ERASER,
             Tool::Measure => ph::RULER,
+            Tool::Mirror => ph::VECTOR_TWO,
         };
         let on = self.tool == tool;
         if theme::ribbon_button(ui, on, false, icon, label)
@@ -238,6 +239,9 @@ impl FlowPaintApp {
                     );
             });
         });
+        // Mirror & array live in the INSPECTOR's selection panels, next
+        // to Duplicate/Delete — they are selection ops, and the Geometry
+        // tab has no horizontal room left at the 900 px minimum.
     }
 
     fn ribbon_physics(&mut self, ui: &mut egui::Ui, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {

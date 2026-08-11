@@ -1,16 +1,105 @@
 //! The object inspector (selected-object properties) and the defaults
 //! panel for newly drawn objects.
 
-use crate::app::{Cmd, FlowPaintApp, Gesture, UiSnapshot};
+use crate::app::{Cmd, FlowPaintApp, Gesture, Tool, UiSnapshot};
 use crate::model::{ObjMaterial, Shape};
 use crate::sim::{RenderMode, SolverMode};
 use eframe::egui;
 
 use super::units::{fmt_factor, fmt_len, fmt_mach, fmt_speed};
 
+use egui_phosphor::regular as ph;
+
 use super::theme;
 
 impl FlowPaintApp {
+    /// Mirror & linear-array rows, shared by the single/multi/group
+    /// panels — selection ops live in the inspector next to
+    /// Duplicate/Delete (there is no ribbon room at the 900 px
+    /// minimum). Both add INDEPENDENT copies, one undo entry each.
+    fn mirror_array_rows(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Mirror").small().color(theme::INK_3));
+            if ui
+                .button(ph::FLIP_HORIZONTAL)
+                .on_hover_text(
+                    "Mirror the selection across the domain's vertical \
+                     centerline. The mirrored copies are independent \
+                     objects, not instances — one undo step.",
+                )
+                .clicked()
+            {
+                self.mirror_selected_axis(true);
+            }
+            if ui
+                .button(ph::FLIP_VERTICAL)
+                .on_hover_text(
+                    "Mirror the selection across the domain's horizontal \
+                     centerline. The mirrored copies are independent \
+                     objects, not instances — one undo step.",
+                )
+                .clicked()
+            {
+                self.mirror_selected_axis(false);
+            }
+            let on = self.tool == Tool::Mirror;
+            if theme::toggle(ui, on, format!("{} Pick line…", ph::VECTOR_TWO))
+                .on_hover_text(
+                    "Mirror the selection across a picked line: drag the \
+                     line's two points on the canvas (they snap to \
+                     endpoints, midpoints and centers like any pick). The \
+                     mirrored copies are independent objects, not \
+                     instances — one undo step.",
+                )
+                .clicked()
+                && !on
+            {
+                self.finish_gesture();
+                self.tool = Tool::Mirror;
+                self.status =
+                    "Mirror: drag the line to mirror across (snaps apply; \
+                     Shift angle-snaps, Esc cancels)."
+                        .into();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Array").small().color(theme::INK_3));
+            if ui
+                .button(format!("{} Apply", ph::SQUARES_FOUR))
+                .on_hover_text(
+                    "Linear array: add count−1 copies of the selection, \
+                     each stepped by the spacing. The copies are \
+                     independent objects, not instances — one undo step.",
+                )
+                .clicked()
+            {
+                self.array_selected();
+            }
+            ui.add(egui::DragValue::new(&mut self.array_count).range(2..=64))
+                .on_hover_text("Total count, the original included");
+            ui.add(
+                egui::DragValue::new(&mut self.array_step[0])
+                    .speed(0.5)
+                    .suffix(" X"),
+            )
+            .on_hover_text("Step between neighbours, in cells");
+            ui.add(
+                egui::DragValue::new(&mut self.array_step[1])
+                    .speed(0.5)
+                    .suffix(" Y"),
+            )
+            .on_hover_text("Step between neighbours, in cells");
+        });
+        let ps = self.phys_cache;
+        theme::derived(
+            ui,
+            format!(
+                "step = {} , {}",
+                fmt_len(ps.len_m(self.array_step[0])),
+                fmt_len(ps.len_m(self.array_step[1]))
+            ),
+        );
+    }
     /// The settings panel: the property block for whatever the tree has
     /// selected. The three-way branch (mid-gesture placeholder, object
     /// inspector, defaults) moved here unchanged from the old control
@@ -314,7 +403,9 @@ impl FlowPaintApp {
                 self.delete_selected();
             }
         });
-        // Deleting or duplicating invalidates `i`/`before`; bail out.
+        self.mirror_array_rows(ui);
+        // Deleting, duplicating, mirroring or arraying invalidates
+        // `i`/`before`; bail out.
         if self.single_sel() != Some(id) {
             return;
         }
@@ -450,6 +541,7 @@ impl FlowPaintApp {
                 self.delete_selected();
             }
         });
+        self.mirror_array_rows(ui);
         // Z-order for the set (also in the tree's context menu).
         ui.horizontal(|ui| {
             if ui.button("Front").on_hover_text("Ctrl+Shift+]").clicked() {
@@ -626,6 +718,7 @@ impl FlowPaintApp {
                 self.delete_selected();
             }
         });
+        self.mirror_array_rows(ui);
         ui.label(
             egui::RichText::new(
                 "Double-click a member on the canvas to enter the group \

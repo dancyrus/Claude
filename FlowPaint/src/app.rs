@@ -36,6 +36,11 @@ enum Tool {
     Eraser,
     /// Two-point distance/angle readout; creates no object (U4).
     Measure,
+    /// Mirror the selection across a picked line (deferred out of U4):
+    /// drag the two line points (they object-snap like any pick), the
+    /// mirrored copies commit on release as one undo entry. No bare-key
+    /// shortcut, so it stays out of `Tool::ALL`.
+    Mirror,
 }
 
 impl Tool {
@@ -166,6 +171,10 @@ enum Gesture {
     Erase { pts: Vec<[f32; 2]> },
     /// Measuring from `a` to the cursor; no object is created.
     Measure { a: [f32; 2], b: [f32; 2] },
+    /// Picking the mirror line from `a` to the cursor; the model is
+    /// untouched until release, when the mirrored copies commit as one
+    /// undo entry (the eraser's commit-on-release convention).
+    MirrorLine { a: [f32; 2], b: [f32; 2] },
 }
 
 /// Object layout of scene files v3–v5, BEFORE lock/hide existed. bincode
@@ -829,6 +838,11 @@ pub struct FlowPaintApp {
     osnap_hit: Option<OsnapHit>,
     /// Eraser radius in cells (0.5-cell floor, the canvas precedent).
     eraser_radius: f32,
+    /// Linear-array parameters (Geometry ribbon; session-scoped, not
+    /// scene-persisted): total count INCLUDING the original, and the
+    /// world-cell step between neighbours.
+    array_count: u32,
+    array_step: [f32; 2],
     /// Domain-extent view toggle (U4): render the full grid including
     /// the sponge margin. View-only — no readout changes with it.
     extent_on: bool,
@@ -979,6 +993,8 @@ impl FlowPaintApp {
             osnap_enabled: true,
             osnap_hit: None,
             eraser_radius: 4.0,
+            array_count: 3,
+            array_step: [32.0, 0.0],
             extent_on: false,
             domain_width_m: 1.0,
             fluid_name: "air",
@@ -1966,7 +1982,9 @@ impl FlowPaintApp {
                 Gesture::GizmoPivot => {}
                 // No model edit happened yet; dropping the gesture IS
                 // the cancel.
-                Gesture::Erase { .. } | Gesture::Measure { .. } => {}
+                Gesture::Erase { .. }
+                | Gesture::Measure { .. }
+                | Gesture::MirrorLine { .. } => {}
                 Gesture::RubberBand { base, .. } => self.selected = base,
                 Gesture::None => {
                     // First Esc leaves an entered group, second clears
@@ -2203,6 +2221,78 @@ impl FlowPaintApp {
         };
     }
 
+    // --- Mirror & linear array (deferred out of U4, landed after) -----
+    // Both act on the selection's outermost members, add independent
+    // deep copies (never instances), and are ONE undo entry each; the
+    // copies become the selection (the duplicate convention).
+
+    /// Mirror the selection across the WORLD line a–b. Called from the
+    /// Mirror tool's release (finish_gesture), so it must NOT call
+    /// finish_gesture itself.
+    pub(in crate::app) fn mirror_selected_across(&mut self, a: [f32; 2], b: [f32; 2]) {
+        let roots = self.transform_targets();
+        if roots.is_empty() {
+            self.status = "Select something to mirror first.".into();
+            return;
+        }
+        let new_roots = self.model.mirror_subtrees(&roots, a, b);
+        if new_roots.is_empty() {
+            return;
+        }
+        self.deselect_all();
+        for &id in &new_roots {
+            self.select_add(id);
+        }
+        self.status = format!(
+            "Mirrored {} object(s) — the copies are independent.",
+            new_roots.len()
+        );
+    }
+
+    /// Mirror across the domain's vertical (`vertical_axis`) or
+    /// horizontal centerline — the ribbon's one-click axis buttons.
+    pub(in crate::app) fn mirror_selected_axis(&mut self, vertical_axis: bool) {
+        self.finish_gesture();
+        let (vw, vh) = self.stats_grid;
+        let c = [vw as f32 * 0.5, vh as f32 * 0.5];
+        let b = if vertical_axis {
+            [c[0], c[1] + 1.0]
+        } else {
+            [c[0] + 1.0, c[1]]
+        };
+        self.mirror_selected_across(c, b);
+    }
+
+    /// Linear array: `array_count − 1` copies of the selection, each
+    /// stepped by `array_step` world cells.
+    pub(in crate::app) fn array_selected(&mut self) {
+        self.finish_gesture();
+        let roots = self.transform_targets();
+        if roots.is_empty() {
+            self.status = "Select something to array first.".into();
+            return;
+        }
+        if self.array_step == [0.0, 0.0] {
+            self.status =
+                "Array spacing is zero — the copies would stack in place.".into();
+            return;
+        }
+        let copies = self.array_count.max(2) as usize - 1;
+        let new_roots = self.model.array_subtrees(&roots, self.array_step, copies);
+        if new_roots.is_empty() {
+            return;
+        }
+        self.deselect_all();
+        for &id in &new_roots {
+            self.select_add(id);
+        }
+        self.status = format!(
+            "Arrayed: {} independent cop{} added.",
+            new_roots.len(),
+            if new_roots.len() == 1 { "y" } else { "ies" }
+        );
+    }
+
     /// One harness step per frame: time the frame, set up the scene on
     /// the first call, and print the stats + quit when done.
     fn bench_tick(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
@@ -2356,6 +2446,18 @@ impl FlowPaintApp {
                         ui::units::fmt_len(ps.len_m(l)),
                         ui::units::fmt_angle(ang)
                     );
+                }
+            }
+            // The model was untouched during the pick; the mirror
+            // commits here as one undo entry, then the tool disarms
+            // (a one-shot op, back to Select with the copies selected).
+            Gesture::MirrorLine { a, b } => {
+                if Self::dist(a, b) >= 1.0 {
+                    self.mirror_selected_across(a, b);
+                    self.tool = Tool::Select;
+                } else {
+                    self.status =
+                        "Mirror: drag to define the line to mirror across.".into();
                 }
             }
             // Selection was applied live; nothing to finalize.

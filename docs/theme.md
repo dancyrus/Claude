@@ -237,3 +237,25 @@ Settings→units mirror is one relaxed atomic store), and U4's paths
 stay pointer-gated as recorded above. Note the standing gap logged in
 unit-decisions §U4: this harness never executes compute_osnap, so the
 snap cost remains unmeasured.
+
+## Post-mirror/array measurement (deferred-out-of-U4 item)
+
+Paired back-to-back A/B in one session (same container, otherwise
+idle; lavapipe, so relative comparison only), run in both orders:
+
+```
+A = main 9f40ca2, B = mirror/array 3656271          mean       p99
+pair 1 (A first): A 1086.71 / 1261.81   B 1081.03 / 1358.54
+pair 2 (B first): B 1078.07 / 1275.27   A 1075.08 / 1394.25
+```
+
+Order-independent result: mean −0.5 % / +0.3 %, p99 +7.7 % / −8.5 %
+— the deltas flip sign with run order and the fat p99 tail again
+sits on whichever build runs second in the pair (the known
+session-position pattern); no regression. Expected: the bench runs
+the Select tool with nothing selected, so the new inspector rows
+never draw (they live in the selection panels), the object-snap
+gate's added `Tool::Mirror` arm is never entered, the mirror-line
+overlay only draws during its gesture, and the model hot paths
+(rasterize, `parent_abs`) are untouched — mirror/array code runs
+only when explicitly invoked.
