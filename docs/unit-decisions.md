@@ -459,6 +459,14 @@ stated in the eraser tooltip next to the stamp refusal).
   via `ab_glyph` — already in the tree through epaint; pinned as a
   direct dependency, so U5 adds no new compiled code. Colors from
   `ui/theme.rs`; bars sample the app.rs CPU colormap mirrors.
+- **`ab_glyph = "0.2"` in Cargo.toml is an APPROVED exception** to the
+  standing ask-before-adding-a-dependency constraint, approved
+  retroactively at the final merge gate. The reasoning that earned the
+  approval: the crate is already in the dependency tree via epaint,
+  the direct pin resolves to the same version, and nothing new
+  compiles. Do not read the entry as a violation, and do not treat
+  this as precedent for adding crates that bring new compiled code
+  without asking first.
 - **Quick export**: Ctrl+E (canvas) / Ctrl+Shift+E (annotated) write
   the first free `flowpaint-export-NN[-annotated].png` in the working
   directory — the dialog-free companions to the File-menu items (rfd

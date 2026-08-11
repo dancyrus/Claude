@@ -165,18 +165,6 @@ at the bottom before adding anything back.
   `docs/u4-eraser-design.md` §"The hole case";
   `docs/unit-decisions.md` §U4 (bucket caveat).
 
-### Mirror and array
-- Mirror about an axis or picked line; linear array with count and
-  spacing; copies are independent objects, one undo entry each.
-- **DEFERRED** (out of U4, on purpose — "slot it wherever there is
-  room rather than blocking U4").
-- Why: small and independent; it just needed U3's selection/transform
-  machinery, not a unit of its own.
-- Unblocks: already unblocked (needs only U3, which landed) — awaiting
-  a slot. Still absent on main.
-- Reasoning: `docs/flowpaint-plan-v4.1.md` §"Deferred out of U4, on
-  purpose" and the merge-order chart.
-
 ### DXF or SVG import
 - Importing geometry drawn elsewhere (SolidWorks exports, vector art).
 - **DEFERRED — the plan marks it "Deferred, not cut" explicitly.**
@@ -278,6 +266,11 @@ Verified shipped on main; do not re-add them here:
   one approved exception to the shader freeze.
 - **Measure tool.** Plan v4.1 listed it as "fold in … if it fits"; it
   fit, and shipped in U4 (key M).
+- **Mirror and linear array.** Deferred out of U4 on purpose ("slot it
+  wherever there is room rather than blocking U4"); the slot arrived
+  after U4 and it shipped via `claude/mirror-linear-array-vlmsub` —
+  independent deep copies, inspector placement, `Reflect2` baking
+  (`docs/unit-decisions.md` §"Mirror & linear array").
 - **Scene persistence of color ranges.** Track-era T2-A deferred it to
   the merge; it landed in scene v7.
 - **The three track-era statics** (T2-A ranges, T2-B probes, T2-D unit

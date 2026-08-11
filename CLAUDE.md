@@ -5,20 +5,24 @@ sibling — untouched by the UI overhaul). Two solvers: D2Q9 LBM
 (incompressible, `shaders/lbm.wgsl`) and finite-volume Euler MUSCL+HLLC
 (compressible, `shaders/euler.wgsl`). Geometry is a persistent vector
 object model (`model.rs`): objects stay live and editable, the grid is a
-damage-region re-projection, **nothing is ever flattened** — any eraser
-must be a per-object, undoable operation (see plan phase 6a).
+damage-region re-projection, **nothing is ever flattened** — the
+eraser is a per-object, undoable subtract (U4).
 
-The working plan is `docs/flowpaint-plan-v4.1.md` (six units on two
-tracks; supersedes v4's phase numbering — the v4 reasoning doc was never
-checked in). Standing constraints carry from
-`docs/flowpaint-ui-overhaul-plan-v3.md`; the layout mockup
-`docs/ui-target.html` is authoritative for spacing, color, type and
-panel arrangement — not for widget construction or numeric values.
+The working plan was `docs/flowpaint-plan-v4.1.md` (six units on two
+tracks). **Plan v4.1 is COMPLETE** — every unit has landed and merged
+into main (tag `v2.0-plan-v4.1`). Everything FlowPaint deliberately
+does NOT have is indexed in one place, `docs/deferred.md` (cut vs
+deferred, with reasoning pointers) — read it before assuming a feature
+is missing, re-adding one, or starting follow-up work. Standing
+constraints carry from `docs/flowpaint-ui-overhaul-plan-v3.md`; the
+layout mockup `docs/ui-target.html` is authoritative for spacing,
+color, type and panel arrangement — not for widget construction or
+numeric values.
 
 ## Unit status (plan v4.1)
 
-Per-unit decisions later units must not re-derive live in
-`docs/unit-decisions.md` — read it before starting any unit.
+Per-unit decisions that must not be re-derived live in
+`docs/unit-decisions.md` — read it before touching a unit's area.
 
 - **U1 (cleanup + navigation): done**, branch
   `claude/flowpaint-v4.1-u1-nav-o8c1im`.
@@ -29,47 +33,41 @@ Per-unit decisions later units must not re-derive live in
   similarity nodes + `parent` links; gizmo in `ui/canvas.rs`. §U3.
 - **T2-A (color range + colormap): done**, branch
   `claude/t2a-color-range-opuijy` (off `34d57aa`, no U1); write-up in
-  `docs/t2a-color-range.md`. Asymmetric manual min/max deliberately
-  unimplemented (needs a per-mode offset in `render.wgsl`).
+  `docs/t2a-color-range.md`.
 - **T2-B (probes + Re input): done**, branch
   `claude/flowpaint-v4.1-t2b-probes` (off the U1 tip).
 - **U4 (fill + eraser + snaps + domain extent): done**, branch
   `claude/eraser-design-report-fwk843` (off the second-track-merge
-  main). Vector eraser only — stamp erase cut (approved), holes
-  refused. Decisions in §U4; design report `docs/u4-eraser-design.md`.
+  main). Vector eraser only. Decisions in §U4; design report
+  `docs/u4-eraser-design.md`.
 - **Mirror + linear array: done**, branch
   `claude/mirror-linear-array-vlmsub` (off main). Independent deep
-  copies (never instances), one undo entry each; controls live in the
-  inspector's selection panels (no ribbon room at 900 px). Reflection
-  bakes per shape (`Reflect2` — not a `Sim2`); read §Mirror & linear
-  array before touching it.
+  copies, never instances; controls in the inspector's selection
+  panels; reflection bakes per shape (`Reflect2` — not a `Sim2`).
+  Read §Mirror & linear array before touching it.
 - **U5 (share-ready output): done**, branch
   `claude/u5-share-ready-output` (off main). One `Cmd::ExportPng`
-  path, Canvas | Annotated; the annotated sheet self-describes in the
-  exporter's active unit system; first-run scene = Pinball; quick
-  export Ctrl+E / Ctrl+Shift+E. §U5.
+  path, Canvas | Annotated (the sheet self-describes in the active
+  unit system); first-run scene = Pinball; Ctrl+E / Ctrl+Shift+E. §U5.
 - **T2-C (per-edge boundary conditions): done**, branch
   `claude/t2-c-boundary-conditions-s0iupf`. Far field / inlet /
-  outlet / wall; **periodic is reserved** (blocked by the shader
-  freeze). Read §T2-C before touching edges, sponge, tunnel preset.
+  outlet / wall; periodic is reserved. §T2-C.
 - **T2-D (SI / decimal-inch toggle): done**, branch
   `claude/si-decimal-inch-toggle-x17w11` (off main). All conversion at
-  the UI boundary — `ui/units.rs` `fmt_*` out, `InputUnit` adapters in
-  (inputs take the active unit); canonical values stay SI. §T2-D.
-- Scene format: **v9** current (second track merge: v9 ABSORBED v8 —
-  U3's `parent` links / `Group` nodes / probe set sit above T2-C's
-  appended `edges`), loads v3+ (v3 lacks solver fields; v4/v5 share a
-  layout; v6 appends `locked`/`hidden` — pre-v6 objects use the
-  `SketchObjectV5` mirror; v7 appends color ranges; v8 is decode-only,
-  pre-v8 objects use the `SketchObjectV7` mirror; older files derive
-  edges from `wind_tunnel`). Decode funnels … → v7 → v8 → v9; later
-  bumps start at v10.
+  the UI boundary (`ui/units.rs` `fmt_*` out, `InputUnit` adapters
+  in); canonical values stay SI. §T2-D.
+- Scene format: **v9** current (v9 ABSORBED v8 at the second track
+  merge — U3's `parent`/`Group` nodes/probes above T2-C's appended
+  `edges`), loads v3+ (v3 lacks solver fields; v4/v5 share a layout;
+  v6 appends `locked`/`hidden`, pre-v6 decodes via the
+  `SketchObjectV5` mirror; v7 appends color ranges; v8 decode-only,
+  pre-v8 via `SketchObjectV7`; older files derive edges from
+  `wind_tunnel`). Decode funnels … → v7 → v8 → v9; bumps start at v10.
 - Track-era static debt is fully paid, three folds, no more: T2-A's
   ranges (`Settings.ranges`, v7+), T2-B's probes (`Settings.probes`,
   v8+), T2-D's unit system (`Settings.unit_system` + `Cmd`, NOT
   scene-persisted — display preference; the `units.rs` static is now a
-  per-frame mirror only). §Third integration. Still open: unify
-  plot/legend inversion factors in `ui/units.rs`.
+  per-frame mirror only). §Third integration.
 
 ## Transforms & nested groups (U3)
 
@@ -82,20 +80,16 @@ cycle prevention, world-space ops, why scaling is uniform — lives in
 
 ## Hard rules
 
-- **Never edit anything under `FlowPaint/src/shaders/`** during the UI
-  effort. One approved exception has landed: T2-A's colormap-swap
-  branches in `render.wgsl` (`flags` bit 1; no uniform added or
-  reordered). The inferno/coolwarm stop tables in `app.rs` mirror
-  `render.wgsl` and must stay linked to it (don't re-theme them alone).
+- **Never edit anything under `FlowPaint/src/shaders/`.** One approved
+  exception landed: T2-A's colormap-swap branches in `render.wgsl`
+  (`flags` bit 1; no uniform added or reordered). The inferno/coolwarm
+  stop tables in `app.rs` mirror `render.wgsl`; keep them linked.
 - **egui stays at 0.29.1 — the upgrade is deferred** (plan v3). Moving
-  to 0.35 drags wgpu 22→29 through all of `sim.rs`. API breaks waiting
-  when it happens: `egui::menu::bar` + 11 `close_menu` sites,
-  `rect_stroke` gains `StrokeKind`, `Rounding`→`CornerRadius` (u8),
-  `Frame::none()`; low-confidence flags on 0.34 panel/`App::update`
-  deprecations — verify against release notes first.
-- All visual constants resolve through `src/ui/theme.rs` (see
-  `docs/theme.md`); nothing sets colors, rounding, spacing or font sizes
-  ad hoc. Exceptions: colormap mirrors and `def_smoke` in `app.rs`, and
+  to 0.35 drags wgpu 22→29 through all of `sim.rs`; the known API
+  breaks are recorded in `docs/deferred.md` (egui entry).
+- All visual constants resolve through `src/ui/theme.rs`
+  (`docs/theme.md`); no ad-hoc colors, rounding, spacing or font
+  sizes. Exceptions: colormap mirrors and `def_smoke` in `app.rs`,
   the `smoke_rgb` picker conversion in `ui/inspector.rs`.
 - Numeric readouts render monospace (`TextStyle::Monospace`,
   `drag_value_text_style`); no proportional digits in value boxes.
@@ -112,12 +106,14 @@ cycle prevention, world-space ops, why scaling is uniform — lives in
   Convention: canonical value in the box, unit in the label, derived
   value on a `theme::derived` secondary line.
   - `ui/canvas.rs` — gestures, overlays, scale bar, the U3 transform
-    gizmo (corner scale, rotate handle, draggable pivot), and the free
-    view transform (wheel/pinch zoom at cursor, middle/space drag pan,
-    `ViewRequest` consumption, pan clamp).
+    gizmo (corner scale, rotate handle, draggable pivot), the mirror
+    line tool, and the free view transform (zoom at cursor,
+    middle/space drag pan, `ViewRequest` consumption, pan clamp).
   - `ui/ribbon.rs` — tabs Home/Geometry/Physics/Study/Results (Run/Step,
     tools, solver+fluid, generators/presets, field/particles/View).
-  - `ui/menu.rs` — rare ops: file IO, resolution, margin checkbox.
+  - `ui/menu.rs` — rare ops: file IO, PNG export, resolution, margin
+    checkbox. `ui/export.rs` — U5 annotated-sheet composition (pure
+    `ExportInfo` → pixels; GPU-free tests).
   - `ui/inspector.rs` — object/group/multi panels (staged
     Rotate/Scale/Center about the common pivot), defaults.
   - `ui/status.rs` — status strip incl. zoom %; `ui/tree.rs` — model
@@ -132,24 +128,22 @@ A generated nozzle is an **Engine group** keyed off the parent link
 (clamp layers and the shader speed caps: `docs/unit-decisions.md`
 §U3). Edge BCs: **any WALL edge forces the sponge to width 0**;
 inlet/outlet keep it — that pairing IS the legacy tunnel. Full rules
-(preset band painting, `paint_edge_bcs` ordering) in
-`docs/unit-decisions.md` §T2-C; read it before touching edges, the
+in `docs/unit-decisions.md` §T2-C; read it before touching edges, the
 sponge, or the tunnel preset.
 
 ## Eraser, fill, snaps (U4)
 
 The eraser is a per-object boolean subtract committed on release (one
 undo entry per stroke); the paint bucket emits a traced filled Poly;
-both share the degenerate-case guards in `src/geomops.rs`. Stamps ship
-WITHOUT erase support (approved cut — `docs/u4-eraser-design.md`);
-holes in filled polygons are refused and deferred (plan's deferred
-list). Snap priority, refusal messages, the domain-extent uniform
-trick and every other U4 decision: `docs/unit-decisions.md` §U4.
+both share the degenerate-case guards in `src/geomops.rs`. Stamp
+erase and polygon holes are refused (indexed in `docs/deferred.md`;
+design report `docs/u4-eraser-design.md`). Every other U4 decision:
+`docs/unit-decisions.md` §U4.
 
 ## Frame-time baseline (plan working rules)
 
-`FlowPaint-V2 --bench`: Pinball preset, compressible mode, default grid
-(High, 1920×960 + margin), 10-frame warmup, 300 measured frames — Xvfb
-+ Mesa lavapipe, so relative paired A/B comparisons only (history in
-`docs/theme.md`). Re-run as a paired A/B after any unit touching the
-canvas or rasterizer; mean and p99 must not regress.
+`FlowPaint-V2 --bench`: Pinball preset, compressible mode, default
+grid (High, 1920×960 + margin), 10 warmup + 300 measured frames —
+Xvfb + Mesa lavapipe, so relative paired A/B only (history in
+`docs/theme.md`). Re-run after any change touching the canvas or
+rasterizer; mean and p99 must not regress.
