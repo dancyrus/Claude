@@ -254,18 +254,10 @@ impl FlowPaintApp {
         if !pt_per_m.is_finite() || pt_per_m <= 0.0 {
             return;
         }
-        // Nearest 1-2-5 length in log space to the target width.
-        let target_m = TARGET_PT / pt_per_m;
-        let decade = 10f32.powf(target_m.log10().floor());
-        let mut len_m = decade;
-        let mut best = f32::INFINITY;
-        for m in [1.0, 2.0, 5.0, 10.0] {
-            let err = ((m * decade) / target_m).ln().abs();
-            if err < best {
-                best = err;
-                len_m = m * decade;
-            }
-        }
+        // Nearest 1-2-5 length to the target width, stepped in the
+        // active display unit (units::nice_len_m, shared with the U5
+        // export sheet) so inch mode reads 10.000 in, not 7.874 in.
+        let len_m = super::units::nice_len_m(TARGET_PT / pt_per_m);
         let w_pt = len_m * pt_per_m;
         let a = rect.left_bottom() + egui::vec2(MARGIN_PT, -MARGIN_PT);
         let b = a + egui::vec2(w_pt, 0.0);

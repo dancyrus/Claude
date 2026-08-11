@@ -1850,8 +1850,11 @@ impl GpuSim {
     // --- PNG export ---------------------------------------------------
 
     /// Render the visible window at 1 px per cell into an offscreen
-    /// texture and save it as a PNG. Blocks until the readback completes.
-    pub fn export_png(&self, path: &std::path::Path) -> Result<(), String> {
+    /// texture and return it as an image. Blocks until the readback
+    /// completes. The caller decides what to do with the pixels — save
+    /// directly (canvas variant) or compose the annotated sheet (U5,
+    /// `ui/export.rs`); both ride this one path.
+    pub fn export_canvas_image(&self) -> Result<image::RgbaImage, String> {
         let (w, h) = (self.vis_w as u32, self.vis_h as u32);
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("export"),
@@ -1958,8 +1961,7 @@ impl GpuSim {
 
         let img: image::RgbaImage =
             image::ImageBuffer::from_raw(w, h, pixels).ok_or("bad image buffer")?;
-        img.save(path).map_err(|e| e.to_string())?;
-        Ok(())
+        Ok(img)
     }
 
     // --- Scene files --------------------------------------------------

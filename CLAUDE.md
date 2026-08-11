@@ -37,7 +37,11 @@ Per-unit decisions later units must not re-derive live in
   `claude/eraser-design-report-fwk843` (off the second-track-merge
   main). Vector eraser only — stamp erase cut (approved), holes
   refused. Decisions in §U4; design report `docs/u4-eraser-design.md`.
-  Next: U5 and mirror/array are unblocked.
+- **U5 (share-ready output): done**, branch
+  `claude/u5-share-ready-output` (off main). One `Cmd::ExportPng`
+  path, Canvas | Annotated; the annotated sheet self-describes in the
+  exporter's active unit system; first-run scene = Pinball; quick
+  export Ctrl+E / Ctrl+Shift+E. §U5. Next: mirror/array.
 - **T2-C (per-edge boundary conditions): done**, branch
   `claude/t2-c-boundary-conditions-s0iupf`. Far field / inlet /
   outlet / wall; **periodic is reserved** (blocked by the shader

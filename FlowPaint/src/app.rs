@@ -7,7 +7,8 @@
 use crate::model::{ObjMaterial, Shape, SketchModel, SketchObject};
 use crate::sim::{
     ColorMap, EdgeBcs, EdgeKind, FieldRange, GpuSim, RangeMode, RenderMode,
-    SolverMode, UnitSystem, ViewportMapping, DEFAULT_MARGIN_INDEX, RESOLUTIONS,
+    SolverMode, UnitSystem, ViewportMapping, DEFAULT_MARGIN_INDEX, PARTICLE_CHOICES,
+    RESOLUTIONS,
 };
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -784,7 +785,11 @@ enum Cmd {
         quantity: crate::sim::ProbeQuantity,
         show_plot: bool,
     },
-    ExportPng(std::path::PathBuf),
+    /// Export the view as a PNG (U5): `Canvas` is the raw field pixels
+    /// at 1 px per cell; `Annotated` appends the burned-in legend,
+    /// scale bar and run-conditions sheet (`ui/export.rs`). One path —
+    /// both variants ride this command.
+    ExportPng(std::path::PathBuf, ExportKind),
     SetMapping(ViewportMapping),
     /// Domain-extent toggle (U4): widen the render window to the full
     /// grid including the sponge margin. Pure view change — the grid,
@@ -792,6 +797,14 @@ enum Cmd {
     SetShowExtent(bool),
     /// Display unit system (T2-D fold; not scene-persisted).
     SetUnitSystem(UnitSystem),
+}
+
+/// The two PNG export variants (U5). Canvas-only keeps the exported
+/// pixels bit-identical to the pre-U5 exporter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportKind {
+    Canvas,
+    Annotated,
 }
 
 pub struct FlowPaintApp {
@@ -945,18 +958,35 @@ impl FlowPaintApp {
             .as_ref()
             .expect("FlowPaint needs the wgpu backend");
         let res_index = 2; // High
-        let sim = GpuSim::new(
+        let mut sim = GpuSim::new(
             rs.device.clone(),
             rs.queue.clone(),
             rs.target_format,
             res_index,
         );
+        // First-run tracers ON (U5, deliberately moving U1's opt-in
+        // default — recorded in unit-decisions §U5): inlet-seeded smoke
+        // needs tens of seconds to cross the domain, so particles are
+        // what makes the sample scene visibly MOVE within the first
+        // seconds. Brightness well below the 0.3 default: at the
+        // fit-to-window zoom the whole field's tracers overlap, and the
+        // sample must read as flow over the obstacles, not speckle.
+        // The Results▸Particles checkbox turns them off.
+        sim.settings.particle_count = PARTICLE_CHOICES[0].1;
+        sim.settings.particle_brightness = 0.10;
         rs.renderer.write().callback_resources.insert(sim);
 
         let (vw, vh) = (RESOLUTIONS[res_index].1, RESOLUTIONS[res_index].2);
         let mut model = SketchModel::default();
-        // Start with the classic cylinder demo as a live, editable object.
-        let objs = build_preset(ScenePreset::Cylinder, &mut model, vw, vh);
+        // First-run sample scene (U5): the Pinball preset, live and
+        // editable. Chosen over the RS-25 insert because it moves at
+        // once on the default solver — staggered cylinders in the wind
+        // tunnel shed visibly within the first frames of LBM smoke,
+        // while a nozzle needs its chamber to spin up and reads best in
+        // compressible mode. Pinball also states the tool's mental
+        // model in one glance: obstacles + wind tunnel + smoke.
+        // (--bench replaces the scene at its first frame either way.)
+        let objs = build_preset(ScenePreset::Pinball, &mut model, vw, vh);
         model.replace_all(objs);
 
         Self {
@@ -999,7 +1029,7 @@ impl FlowPaintApp {
             show_edges: false,
             show_legend: true,
             res_index,
-            particles_on: false, // Settings::default starts with no tracers
+            particles_on: true, // first-run tracers (U5); index 0 = 100 k
             particle_index: 0,
             margin_on: true,
             margin_index: DEFAULT_MARGIN_INDEX,
@@ -1779,8 +1809,8 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             pr.quantity = quantity;
             pr.show_plot = show_plot;
         }
-        Cmd::ExportPng(p) => {
-            app.status = match sim.export_png(&p) {
+        Cmd::ExportPng(p, kind) => {
+            app.status = match app.export_png_file(sim, &p, kind) {
                 Ok(()) => format!("Exported {}", p.display()),
                 Err(e) => format!("Export failed: {e}"),
             };
@@ -2078,6 +2108,18 @@ impl FlowPaintApp {
             self.model.redo();
             self.deselect_all();
         }
+        // Quick export (U5): Ctrl+E canvas-only, Ctrl+Shift+E annotated
+        // — the dialog-free companions to the File-menu items, writing
+        // the first free flowpaint-export-NN[-annotated].png in the
+        // working directory. Same Cmd::ExportPng path as the menu.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E)) {
+            let kind = if ctx.input(|i| i.modifiers.shift) {
+                ExportKind::Annotated
+            } else {
+                ExportKind::Canvas
+            };
+            cmds.push(Cmd::ExportPng(Self::quick_export_path(kind), kind));
+        }
         if matches!(self.gesture, Gesture::None) {
             let mut switch = None;
             ctx.input(|i| {
@@ -2130,6 +2172,22 @@ impl FlowPaintApp {
                 self.transform_selection_world(|m, id| m.translate_world(id, d));
             }
         }
+    }
+
+    /// First free `flowpaint-export-NN[-annotated].png` in the working
+    /// directory, for the quick-export shortcuts (U5).
+    fn quick_export_path(kind: ExportKind) -> std::path::PathBuf {
+        let suffix = match kind {
+            ExportKind::Canvas => "",
+            ExportKind::Annotated => "-annotated",
+        };
+        for n in 1..1000u32 {
+            let p = std::path::PathBuf::from(format!("flowpaint-export-{n:02}{suffix}.png"));
+            if !p.exists() {
+                return p;
+            }
+        }
+        std::path::PathBuf::from(format!("flowpaint-export{suffix}.png"))
     }
 
     /// Apply a world-space transform to the selection's OUTERMOST

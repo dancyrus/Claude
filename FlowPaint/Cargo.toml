@@ -16,6 +16,9 @@ egui-wgpu = "0.29"
 # Ribbon icon font (phase 2+ of the UI overhaul); one variant bundled.
 egui-phosphor = { version = "0.7", default-features = false, features = ["regular"] }
 wgpu = "22"
+# Text on exported PNGs (U5); already in the tree via epaint — this
+# pins the same version as a direct dependency, no new code compiled.
+ab_glyph = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"

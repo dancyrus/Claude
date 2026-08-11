@@ -38,13 +38,34 @@ impl FlowPaintApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Export view as PNG…").clicked() {
+                    if ui
+                        .button("Export view as PNG…   Ctrl+E")
+                        .on_hover_text("The raw field pixels, one pixel per cell")
+                        .clicked()
+                    {
                         if let Some(p) = rfd::FileDialog::new()
                             .add_filter("PNG image", &["png"])
                             .set_file_name("flowpaint.png")
                             .save_file()
                         {
-                            cmds.push(Cmd::ExportPng(p));
+                            cmds.push(Cmd::ExportPng(p, crate::app::ExportKind::Canvas));
+                        }
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Export annotated PNG…   Ctrl+Shift+E")
+                        .on_hover_text(
+                            "The view plus a burned-in legend, scale bar and \
+                             run-conditions block — share-ready",
+                        )
+                        .clicked()
+                    {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("PNG image", &["png"])
+                            .set_file_name("flowpaint-annotated.png")
+                            .save_file()
+                        {
+                            cmds.push(Cmd::ExportPng(p, crate::app::ExportKind::Annotated));
                         }
                         ui.close_menu();
                     }
