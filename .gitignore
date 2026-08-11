@@ -15,4 +15,3 @@ build/
 # Rust
 FlowPaint/target/
 
-.bench-main/

@@ -186,3 +186,30 @@ Expected: the bench scene is the wind-tunnel preset, so
 `legacy_wind_tunnel_projection_is_unchanged`), and `apply_edge_bcs` is
 one branch per damage event — the bench has exactly one damage event
 (the preset load). The solver kernels are untouched by both units.
+
+## Post-U4 measurement (fill + eraser + snaps + domain extent)
+
+Paired back-to-back A/B in one session (fresh container — absolute
+numbers are not comparable to earlier hosts; lavapipe, so relative
+comparison only), run in both orders. An earlier attempt ran
+concurrently with release builds and UI smoke tests and was discarded:
+its A baseline came out ~90 % over a quiet run of the same binary —
+the bench needs an otherwise idle host.
+
+```
+A = main 9f77dae, B = U4 tip 8d9012b                mean       p99
+pair 1 (A first): A 1905.54 / 2600.33   B 1932.00 / 3041.14
+pair 2 (B first): B 1875.39 / 2618.09   A 1926.11 / 2747.90
+```
+
+Order-independent result: mean +1.4 % / −2.6 %, p99 +17 % / −4.7 % —
+the deltas flip sign with run order and the fat p99 tail again sits on
+whichever build runs second in the pair (the session-position pattern
+first seen at the second-track merge); no regression. Expected: the
+bench drives no pointer, so the eraser/bucket/measure paths never run
+and the per-frame object-snap resolution is gated off (it only
+computes while a draw tool or handle drag is active — the bench stays
+on Select). The domain-extent toggle is off, so write_render_uniform
+emits the same values as before, and the rasterizer's only new branch
+(filled closed Poly) sits in the Poly arm, which the Pinball scene's
+Rect/Ellipse objects never enter.
