@@ -356,6 +356,12 @@ gives it meaning.
   walls, and the natural companion to arcs.
 - **Union and intersect booleans.** Subtract arrives with the eraser in U4; the other two can
   follow once its degenerate handling has seen real use.
+- **Holes in filled polygons** (`Shape::Poly` with interior rings). Deferred for the same
+  reason as arcs and splines: a hole representation touches the format, the fill rasterizer,
+  hit tests, handles, and every boolean. It is a real limit — annuli, ducts with a bore,
+  plates with a port — and the U4 eraser refuses an erase wholly interior to a filled shape
+  because of it (see `docs/u4-eraser-design.md`). Until it lands, such parts are built from
+  outline rings or two overlapping shapes.
 - **DXF or SVG import.** The highest-value item on the whole list for an audience that
   already has geometry in SolidWorks, and the strongest reason for anyone else to try the
   tool. It wants a stable object model under it, so build it after U3. **Deferred, not cut.**

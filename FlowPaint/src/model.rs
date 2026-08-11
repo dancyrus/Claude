@@ -460,6 +460,12 @@ impl SketchObject {
                 if n == 1 {
                     return dist(p, pts[0]) <= t;
                 }
+                // A filled polygon hits anywhere inside (U4), not just
+                // near its outline.
+                if self.filled && *closed && n >= 3 && crate::geomops::point_in_polygon(p, pts)
+                {
+                    return true;
+                }
                 let segs = if *closed { n } else { n.saturating_sub(1) };
                 (0..segs).any(|i| seg_dist(p, pts[i], pts[(i + 1) % n]) <= t)
             }
@@ -685,15 +691,9 @@ fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
+// One point-to-segment distance in the crate (U4): geomops owns it.
 fn seg_dist(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
-    let ab = [b[0] - a[0], b[1] - a[1]];
-    let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-    let t = if l2 > 1e-6 {
-        (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    dist(p, [a[0] + t * ab[0], a[1] + t * ab[1]])
+    crate::geomops::seg_point_dist(p, a, b)
 }
 
 fn to_local(p: [f32; 2], c: [f32; 2], angle: f32) -> [f32; 2] {
@@ -708,6 +708,11 @@ fn to_local(p: [f32; 2], c: [f32; 2], angle: f32) -> [f32; 2] {
 pub enum ModelOp {
     Add(SketchObject),
     Remove(usize, SketchObject),
+    /// Insertion at a specific z-slot (eraser split fragments sit right
+    /// above the object they came from; the paint bucket's fill goes to
+    /// the bottom). `Add` always re-appends at the top on redo, so it
+    /// cannot express these.
+    Insert(usize, SketchObject),
     Modify {
         i: usize,
         before: SketchObject,
@@ -1040,6 +1045,56 @@ impl SketchModel {
                 self.mark_world_dirty(id);
                 let obj = self.objects.remove(i);
                 ops.push(ModelOp::Remove(i, obj));
+            }
+        }
+        if !ops.is_empty() {
+            self.undo.push(ModelOp::Group { ops, coalesce: false });
+            self.redo.clear();
+        }
+    }
+
+    /// Insert at a z-slot, undoably (the paint bucket's fill goes to the
+    /// BOTTOM so interior island walls keep winning their overlaps —
+    /// `model.objects` order is z-order).
+    pub fn insert_at(&mut self, index: usize, obj: SketchObject) {
+        let i = index.min(self.objects.len());
+        self.mark_value_world_dirty(&obj);
+        self.undo.push(ModelOp::Insert(i, obj.clone()));
+        self.redo.clear();
+        self.objects.insert(i, obj);
+    }
+
+    /// Apply one eraser stroke's outcome as ONE undo entry. Each change
+    /// replaces an object with 0..n fragments: none = fully erased, one
+    /// = trimmed in place, several = a split — the first fragment keeps
+    /// the original id and z-slot, the rest insert contiguously above it
+    /// so overlap resolution doesn't shift. Ops are captured against the
+    /// live list in order; the group's reverse-order undo unwinds them
+    /// at valid indices (the remove_many convention).
+    pub fn apply_erase(&mut self, changes: Vec<(u64, Vec<SketchObject>)>) {
+        let mut ops = Vec::new();
+        for (id, repl) in changes {
+            let Some(i) = self.find(id) else { continue };
+            self.mark_world_dirty(id);
+            if repl.is_empty() {
+                let obj = self.objects.remove(i);
+                ops.push(ModelOp::Remove(i, obj));
+                continue;
+            }
+            let before = self.objects[i].clone();
+            self.objects[i] = repl[0].clone();
+            ops.push(ModelOp::Modify {
+                i,
+                before,
+                after: repl[0].clone(),
+                coalesce: false,
+            });
+            self.mark_world_dirty(id);
+            for (k, frag) in repl.iter().enumerate().skip(1) {
+                let at = i + k;
+                self.objects.insert(at, frag.clone());
+                ops.push(ModelOp::Insert(at, frag.clone()));
+                self.mark_world_dirty(frag.id);
             }
         }
         if !ops.is_empty() {
@@ -1416,6 +1471,16 @@ impl SketchModel {
                 self.objects.insert((*i).min(self.objects.len()), o.clone());
                 self.mark_world_dirty(o.id);
             }
+            ModelOp::Insert(i, o) => {
+                self.mark_world_dirty(o.id);
+                // The captured index is valid inside a group's reverse
+                // replay; fall back to the id if a stray op drifted.
+                if self.objects.get(*i).map(|x| x.id) == Some(o.id) {
+                    self.objects.remove(*i);
+                } else if let Some(j) = self.find(o.id) {
+                    self.objects.remove(j);
+                }
+            }
             ModelOp::Modify { i, before, .. } => {
                 // Mark both states' WORLD footprints (a group's covers
                 // its subtree), with the list state that holds each.
@@ -1456,6 +1521,10 @@ impl SketchModel {
                 } else {
                     self.objects.pop();
                 }
+            }
+            ModelOp::Insert(i, o) => {
+                self.objects.insert((*i).min(self.objects.len()), o.clone());
+                self.mark_world_dirty(o.id);
             }
             ModelOp::Modify { i, after, .. } => {
                 let id = after.id;
@@ -1699,6 +1768,43 @@ fn rasterize_object(geo: &mut Geometry, obj: &SketchObject, clip: GridRect, m: i
                 );
                 return;
             }
+            if obj.filled && *closed && n >= 3 {
+                // Filled polygon: even-odd scanline over the cell
+                // centres (thickness is ignored, like filled
+                // Rect/Ellipse — U4).
+                let rect = obj.bounds();
+                let rect = GridRect {
+                    x0: rect.x0 + m,
+                    y0: rect.y0 + m,
+                    x1: rect.x1 + m,
+                    y1: rect.y1 + m,
+                }
+                .intersect(clip);
+                let w = geo.w;
+                let mut write = cell_writer(geo, obj);
+                let mut xs: Vec<f32> = Vec::with_capacity(8);
+                for y in rect.y0..rect.y1 {
+                    let yc = y as f32 + 0.5 - mf;
+                    xs.clear();
+                    for i in 0..n {
+                        let a = pts[i];
+                        let b = pts[(i + 1) % n];
+                        if (a[1] <= yc) != (b[1] <= yc) {
+                            xs.push(a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1]));
+                        }
+                    }
+                    xs.sort_by(|p, q| p.partial_cmp(q).unwrap());
+                    for pair in xs.chunks_exact(2) {
+                        // Cells whose centre lies inside the span.
+                        let x0 = ((pair[0] + mf - 0.5).ceil() as i32).max(rect.x0);
+                        let x1 = ((pair[1] + mf - 0.5).floor() as i32).min(rect.x1 - 1);
+                        for x in x0..=x1 {
+                            write((y as usize) * w + x as usize, None);
+                        }
+                    }
+                }
+                return;
+            }
             let segs = if *closed { n } else { n.saturating_sub(1) };
             for i in 0..segs {
                 let a = pts[i];
@@ -1890,6 +1996,122 @@ mod tests {
 
     fn ids(m: &SketchModel) -> Vec<u64> {
         m.objects.iter().map(|o| o.id).collect()
+    }
+
+    #[test]
+    fn insert_at_undoes_and_redoes_at_its_slot() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        let b = obj(&mut m, [50.0, 0.0]);
+        let id = m.fresh_id();
+        let mut o = m.objects[0].clone();
+        o.id = id;
+        m.insert_at(0, o);
+        assert_eq!(ids(&m), vec![id, a, b]);
+        m.undo();
+        assert_eq!(ids(&m), vec![a, b]);
+        m.redo();
+        assert_eq!(ids(&m), vec![id, a, b]);
+    }
+
+    #[test]
+    fn apply_erase_split_is_one_undo_entry_with_contiguous_fragments() {
+        let mut m = SketchModel::default();
+        let a = obj(&mut m, [0.0, 0.0]);
+        let b = obj(&mut m, [50.0, 0.0]);
+        let c = obj(&mut m, [100.0, 0.0]);
+        let order0: Vec<u64> = ids(&m);
+        let before_b = m.objects[m.find(b).unwrap()].clone();
+        // Split b into two fragments and delete c, as one stroke.
+        let mut f1 = before_b.clone();
+        f1.shape = Shape::Line { a: [40.0, 0.0], b: [45.0, 0.0] };
+        let f2_id = m.fresh_id();
+        let mut f2 = before_b.clone();
+        f2.id = f2_id;
+        f2.shape = Shape::Line { a: [55.0, 0.0], b: [60.0, 0.0] };
+        m.apply_erase(vec![(b, vec![f1, f2]), (c, Vec::new())]);
+        // Fragments sit contiguously at b's slot; c is gone.
+        assert_eq!(ids(&m), vec![a, b, f2_id]);
+        assert!(matches!(
+            m.objects[m.find(b).unwrap()].shape,
+            Shape::Line { .. }
+        ));
+        // ONE undo restores everything, including c's slot and b's shape.
+        m.undo();
+        assert_eq!(ids(&m), order0);
+        assert!(m.objects[m.find(b).unwrap()] == before_b);
+        m.redo();
+        assert_eq!(ids(&m), vec![a, b, f2_id]);
+    }
+
+    #[test]
+    fn filled_closed_poly_rasterizes_its_interior() {
+        let mut m = SketchModel::default();
+        let id = m.fresh_id();
+        m.add(SketchObject {
+            id,
+            // A 10×10 axis-aligned diamond (so scanlines cross edges).
+            shape: Shape::Poly {
+                pts: vec![[10.0, 2.0], [18.0, 10.0], [10.0, 18.0], [2.0, 10.0]],
+                closed: true,
+            },
+            material: ObjMaterial::Wall,
+            thickness: 2.0,
+            filled: true,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: None,
+        });
+        let mut geo = Geometry::new(24, 24);
+        m.rasterize_region(&mut geo, GridRect::full(24, 24), 0, false);
+        // The centre is solid, the diamond's area is roughly half the
+        // bounding box, and cells outside the bounds stay fluid.
+        assert_eq!(geo.cell[10 * 24 + 10], CELL_WALL);
+        let walls = geo.cell.iter().filter(|&&c| c == CELL_WALL).count();
+        // Ideal area = d²/2 = 128; the cell-centre test quantizes.
+        assert!((100..160).contains(&walls), "diamond fill {walls} cells");
+        assert_eq!(geo.cell[0], CELL_FLUID);
+        // An unfilled copy must NOT fill the interior (outline only).
+        let i = m.find(id).unwrap();
+        m.objects[i].filled = false;
+        m.mark_all_dirty();
+        let mut geo2 = Geometry::new(24, 24);
+        m.rasterize_region(&mut geo2, GridRect::full(24, 24), 0, false);
+        assert_eq!(geo2.cell[10 * 24 + 10], CELL_FLUID);
+    }
+
+    #[test]
+    fn filled_closed_poly_hit_tests_its_interior() {
+        let mut m = SketchModel::default();
+        let id = m.fresh_id();
+        let mut o = SketchObject {
+            id,
+            shape: Shape::Poly {
+                pts: vec![[10.0, 2.0], [18.0, 10.0], [10.0, 18.0], [2.0, 10.0]],
+                closed: true,
+            },
+            material: ObjMaterial::Wall,
+            thickness: 2.0,
+            filled: true,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: None,
+        };
+        assert!(o.hit([10.0, 10.0], 0.0), "interior must hit when filled");
+        o.filled = false;
+        assert!(!o.hit([10.0, 10.0], 0.0), "interior must miss when unfilled");
+        assert!(o.hit([10.0, 2.5], 1.0), "outline still hits");
+        let _ = m.add(o);
     }
 
     #[test]

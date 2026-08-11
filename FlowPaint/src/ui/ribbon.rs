@@ -101,27 +101,104 @@ impl FlowPaintApp {
         });
     }
 
+    fn tool_button(&mut self, ui: &mut egui::Ui, tool: Tool, label: &str, tip: String) {
+        let icon = match tool {
+            Tool::Select => ph::CURSOR,
+            Tool::Line => ph::LINE_SEGMENT,
+            Tool::Rect => ph::RECTANGLE,
+            Tool::Ellipse => ph::CIRCLE,
+            Tool::Polyline => ph::POLYGON,
+            Tool::Pencil => ph::PENCIL_SIMPLE,
+            Tool::Bucket => ph::PAINT_BUCKET,
+            Tool::Eraser => ph::ERASER,
+            Tool::Measure => ph::RULER,
+        };
+        let on = self.tool == tool;
+        if theme::ribbon_button(ui, on, false, icon, label)
+            .on_hover_text(tip)
+            .clicked()
+            && !on
+        {
+            self.finish_gesture();
+            self.tool = tool;
+        }
+    }
+
     fn ribbon_geometry(&mut self, ui: &mut egui::Ui) {
         group(ui, "Sketch tools", |ui| {
-            for (tool, label, key) in Tool::ALL {
-                let icon = match tool {
-                    Tool::Select => ph::CURSOR,
-                    Tool::Line => ph::LINE_SEGMENT,
-                    Tool::Rect => ph::RECTANGLE,
-                    Tool::Ellipse => ph::CIRCLE,
-                    Tool::Polyline => ph::POLYGON,
-                    Tool::Pencil => ph::PENCIL_SIMPLE,
-                };
-                let on = self.tool == tool;
-                if theme::ribbon_button(ui, on, false, icon, label)
-                    .on_hover_text(format!("Key: {key}"))
-                    .clicked()
-                    && !on
-                {
-                    self.finish_gesture();
-                    self.tool = tool;
-                }
+            for (tool, label, key) in Tool::ALL.into_iter().take(6) {
+                self.tool_button(ui, tool, label, format!("Key: {key}"));
             }
+        });
+        // Compact verticals, not ribbon_buttons: with three more tools
+        // the Geometry tab has no horizontal room left at the 900 px
+        // minimum (the Results View group precedent).
+        group(ui, "Modify", |ui| {
+            ui.vertical(|ui| {
+                for (tool, icon, label, tip) in [
+                    (
+                        Tool::Bucket,
+                        ph::PAINT_BUCKET,
+                        "Fill",
+                        "Flood-fill an enclosed region and trace it into a \
+                         filled polygon of the current material (key F). The \
+                         traced outline is a snapshot — move a bounding wall \
+                         afterward and the fill does not follow. A region \
+                         open to the domain edge refuses.",
+                    ),
+                    (
+                        Tool::Eraser,
+                        ph::ERASER,
+                        "Eraser",
+                        "Erase vector geometry (key X): cuts lines and \
+                         polylines, carves filled shapes (a partial erase \
+                         turns a rectangle or ellipse into a polygon). One \
+                         undo step per stroke. Stamps (generated parts) \
+                         can't be erased in this release — delete them or \
+                         overdraw with vector walls (that's how to vent a \
+                         nozzle bell). A hole fully inside a filled shape \
+                         isn't supported — drag the stroke across the \
+                         shape's edge.",
+                    ),
+                    (
+                        Tool::Measure,
+                        ph::RULER,
+                        "Measure",
+                        "Pick two points, read distance and angle (key M); \
+                         snaps like the draw tools and creates no object.",
+                    ),
+                ] {
+                    let on = self.tool == tool;
+                    if theme::toggle(ui, on, format!("{icon} {label}"))
+                        .on_hover_text(tip)
+                        .clicked()
+                        && !on
+                    {
+                        self.finish_gesture();
+                        self.tool = tool;
+                    }
+                }
+            });
+            ui.vertical(|ui| {
+                // Bare label, not row(): its 66 px label cell is what
+                // pushed the aids group past 900 px.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("radius").small().color(theme::INK_3),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.eraser_radius)
+                            .range(0.5..=32.0)
+                            .speed(0.25)
+                            .suffix(" cells"),
+                    )
+                    .on_hover_text("Eraser radius");
+                });
+                theme::derived(
+                    ui,
+                    format!("= {}", fmt_len(self.phys_cache.len_m(self.eraser_radius))),
+                );
+            });
         });
         group(ui, "Sketch aids", |ui| {
             ui.vertical(|ui| {
@@ -150,6 +227,15 @@ impl FlowPaintApp {
                         .on_hover_text(format!("Grid spacing: {spacing_m}"));
                     }
                 });
+                ui.checkbox(&mut self.osnap_enabled, "Object snaps")
+                    .on_hover_text(
+                        "Snap draw tools to existing geometry: endpoint, \
+                         intersection, midpoint, center, perpendicular (that \
+                         is also the priority order when several are in \
+                         range; an object snap beats the grid). The radius \
+                         is in screen pixels, so it holds across zoom. Hold \
+                         Ctrl to suspend.",
+                    );
             });
         });
     }
@@ -620,6 +706,17 @@ impl FlowPaintApp {
                         self.view_request = Some(ViewRequest::Selection);
                     }
                 });
+                if ui
+                    .checkbox(&mut self.extent_on, "Domain extent")
+                    .on_hover_text(
+                        "Draw the full simulated grid including the sponge \
+                         margin, with the usable interior outlined and the \
+                         margin labeled. View-only: no readout changes.",
+                    )
+                    .changed()
+                {
+                    cmds.push(Cmd::SetShowExtent(self.extent_on));
+                }
             });
         });
     }

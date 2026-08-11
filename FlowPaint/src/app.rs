@@ -26,17 +26,61 @@ enum Tool {
     Ellipse,
     Polyline,
     Pencil,
+    /// Paint bucket: flood-fill an enclosed region, trace the contour,
+    /// emit a filled polygon (U4).
+    Bucket,
+    /// Vector eraser: boolean subtract per object, one undo entry per
+    /// stroke (U4; key X as pre-rebuild — right-drag-erase from 61368c8
+    /// is NOT reinstated, the right button now finishes polylines and
+    /// clears selections).
+    Eraser,
+    /// Two-point distance/angle readout; creates no object (U4).
+    Measure,
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, &'static str); 6] = [
+    const ALL: [(Tool, &'static str, &'static str); 9] = [
         (Tool::Select, "Select", "S"),
         (Tool::Line, "Line", "L"),
         (Tool::Rect, "Rectangle", "R"),
         (Tool::Ellipse, "Ellipse", "E"),
         (Tool::Polyline, "Polyline", "P"),
         (Tool::Pencil, "Pencil", "B"),
+        (Tool::Bucket, "Fill", "F"),
+        (Tool::Eraser, "Eraser", "X"),
+        (Tool::Measure, "Measure", "M"),
     ];
+}
+
+/// Object-snap kinds (U4), in PRIORITY order: when several candidates
+/// sit inside the snap radius, the lowest discriminant wins; distance
+/// breaks ties within a kind. Recorded in docs/unit-decisions.md §U4.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum OsnapKind {
+    Endpoint,
+    Intersection,
+    Midpoint,
+    Center,
+    Perpendicular,
+}
+
+impl OsnapKind {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            OsnapKind::Endpoint => "endpoint",
+            OsnapKind::Intersection => "intersection",
+            OsnapKind::Midpoint => "midpoint",
+            OsnapKind::Center => "center",
+            OsnapKind::Perpendicular => "perpendicular",
+        }
+    }
+}
+
+/// The object-snap candidate under the cursor this frame (world cells).
+#[derive(Clone, Copy)]
+pub(crate) struct OsnapHit {
+    pub pos: [f32; 2],
+    pub kind: OsnapKind,
 }
 
 /// Which ribbon tab is open (the ribbon itself lives in ui/ribbon.rs).
@@ -116,6 +160,12 @@ enum Gesture {
     },
     /// Dragging the gizmo pivot marker (no model edit).
     GizmoPivot,
+    /// Collecting an eraser stroke (world cells, decimated). The model
+    /// is untouched until release: commit-on-release keeps one undo
+    /// entry per stroke and object identities stable mid-drag (U4).
+    Erase { pts: Vec<[f32; 2]> },
+    /// Measuring from `a` to the cursor; no object is created.
+    Measure { a: [f32; 2], b: [f32; 2] },
 }
 
 /// Object layout of scene files v3–v5, BEFORE lock/hide existed. bincode
@@ -732,6 +782,10 @@ enum Cmd {
     },
     ExportPng(std::path::PathBuf),
     SetMapping(ViewportMapping),
+    /// Domain-extent toggle (U4): widen the render window to the full
+    /// grid including the sponge margin. Pure view change — the grid,
+    /// mapping and every readout stay in visible-cell coordinates.
+    SetShowExtent(bool),
 }
 
 pub struct FlowPaintApp {
@@ -761,6 +815,17 @@ pub struct FlowPaintApp {
     snap_enabled: bool,
     snap_spacing: f32,
     snap_angle_deg: f32,
+    /// Object snaps (U4): endpoint/intersection/midpoint/center/
+    /// perpendicular; hold Ctrl to suspend. Radius is screen points.
+    osnap_enabled: bool,
+    /// This frame's snap candidate, computed once per frame by the
+    /// canvas and consumed by every snapped coordinate that frame.
+    osnap_hit: Option<OsnapHit>,
+    /// Eraser radius in cells (0.5-cell floor, the canvas precedent).
+    eraser_radius: f32,
+    /// Domain-extent view toggle (U4): render the full grid including
+    /// the sponge margin. View-only — no readout changes with it.
+    extent_on: bool,
     // Physical scaling.
     domain_width_m: f32,
     fluid_name: &'static str,
@@ -905,6 +970,10 @@ impl FlowPaintApp {
             snap_enabled: false,
             snap_spacing: 10.0,
             snap_angle_deg: 45.0,
+            osnap_enabled: true,
+            osnap_hit: None,
+            eraser_radius: 4.0,
+            extent_on: false,
             domain_width_m: 1.0,
             fluid_name: "air",
             fluid_nu: 1.5e-5,
@@ -1720,6 +1789,10 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
                 sim.write_render_uniform();
             }
         }
+        Cmd::SetShowExtent(on) => {
+            sim.settings.show_extent = on;
+            sim.write_render_uniform();
+        }
     }
 }
 
@@ -1880,6 +1953,9 @@ impl FlowPaintApp {
                     self.restore_before(&before);
                 }
                 Gesture::GizmoPivot => {}
+                // No model edit happened yet; dropping the gesture IS
+                // the cancel.
+                Gesture::Erase { .. } | Gesture::Measure { .. } => {}
                 Gesture::RubberBand { base, .. } => self.selected = base,
                 Gesture::None => {
                     // First Esc leaves an entered group, second clears
@@ -2006,6 +2082,9 @@ impl FlowPaintApp {
                         "R" => egui::Key::R,
                         "E" => egui::Key::E,
                         "P" => egui::Key::P,
+                        "F" => egui::Key::F,
+                        "X" => egui::Key::X,
+                        "M" => egui::Key::M,
                         _ => egui::Key::B,
                     };
                     if i.key_pressed(k) {
@@ -2253,9 +2332,321 @@ impl FlowPaintApp {
                 self.model.record_modify_many(&before);
             }
             Gesture::GizmoPivot => {}
+            // The model was untouched during the drag; the whole edit
+            // commits here, as one undo entry (U4 commit-on-release).
+            Gesture::Erase { pts } => self.apply_erase_stroke(&pts),
+            Gesture::Measure { a, b } => {
+                let ps = self.phys_cache;
+                let l = Self::dist(a, b);
+                if l > 0.5 {
+                    let ang = -(b[1] - a[1]).atan2(b[0] - a[0]).to_degrees();
+                    self.status = format!(
+                        "Measured: L {}   ∠ {}",
+                        ui::units::fmt_len(ps.len_m(l)),
+                        ui::units::fmt_angle(ang)
+                    );
+                }
+            }
             // Selection was applied live; nothing to finalize.
             Gesture::RubberBand { .. } => {}
             Gesture::None => {}
+        }
+    }
+
+    // --- U4: eraser + paint bucket -------------------------------------
+
+    /// Apply one finished eraser stroke: subtract the swept-disc
+    /// footprint from every editable leaf it touches, in each object's
+    /// STORED space (a similarity maps the world discs to exact stored
+    /// discs — the U3 uniform-scale payoff). One undo entry per stroke.
+    fn apply_erase_stroke(&mut self, pts: &[[f32; 2]]) {
+        use crate::geomops::{clip_path, subtract_polygon, Capsule, ClipPath, PolySubtract};
+        if pts.is_empty() {
+            return;
+        }
+        let r = self.eraser_radius.max(0.5);
+        // Straighten the stroke first (RDP at a fraction of the radius):
+        // a straight drag becomes ONE long capsule instead of a chain of
+        // tangent ones, which both bounds the boolean work and starves
+        // the degenerate coincident-wall case.
+        let pts = Self::simplify_stroke(pts, (r * 0.25).min(1.0));
+        // World capsules along the stroke; a click is a single disc.
+        let mut caps_world: Vec<Capsule> = Vec::with_capacity(pts.len());
+        if pts.len() == 1 {
+            caps_world.push(Capsule { a: pts[0], b: pts[0], r });
+        } else {
+            for w in pts.windows(2) {
+                caps_world.push(Capsule { a: w[0], b: w[1], r });
+            }
+        }
+        // Stroke AABB (world), for the candidate pass.
+        let mut lo = pts[0];
+        let mut hi = pts[0];
+        for p in pts {
+            lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+            hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+        }
+
+        let mut changes: Vec<(u64, Vec<SketchObject>)> = Vec::new();
+        let mut hole_refusals: Vec<&'static str> = Vec::new();
+        let mut stamp_touched = false;
+        let candidates: Vec<u64> = self
+            .model
+            .objects
+            .iter()
+            .filter(|o| !matches!(o.shape, Shape::Group { .. }))
+            .map(|o| o.id)
+            .collect();
+        for id in candidates {
+            if self.model.eff_locked(id) || self.model.eff_hidden(id) {
+                continue;
+            }
+            let Some(i) = self.model.find(id) else { continue };
+            let abs = self.model.parent_abs(id);
+            let obj = &self.model.objects[i];
+            // Bounds pre-check in world space, inflated by the radius.
+            let b = obj.bounds_under(abs);
+            if (b.x1 as f32) < lo[0] - r
+                || (b.x0 as f32) > hi[0] + r
+                || (b.y1 as f32) < lo[1] - r
+                || (b.y0 as f32) > hi[1] + r
+            {
+                continue;
+            }
+            // Conjugate the stroke into stored space: centres through
+            // the inverse chain, radius divided by the composed scale.
+            // The guards conjugate the same way (review finding): they
+            // mean WORLD cells, so in stored space they divide by the
+            // scale (length) and scale² (area) — otherwise a scaled-up
+            // group drops visible fragments as "slivers".
+            let s = abs.s.max(1e-9);
+            let inv = abs.inverse();
+            let min_len = crate::geomops::MIN_RUN_LEN / s;
+            let min_area = crate::geomops::MIN_AREA / (s * s);
+            let caps: Vec<Capsule> = caps_world
+                .iter()
+                .map(|c| Capsule {
+                    a: inv.apply(c.a),
+                    b: inv.apply(c.b),
+                    r: c.r / s,
+                })
+                .collect();
+            let obj = &self.model.objects[i];
+            let half_t = obj.thickness * 0.5;
+            match &obj.shape {
+                Shape::Group { .. } => {}
+                Shape::Stamp { .. } => {
+                    // Design decision (approved): stamps ship without
+                    // erase support. Refuse with a specific message.
+                    let hit = caps.iter().any(|c| {
+                        stamp_obb_touched(obj, c.a, c.b, c.r)
+                    });
+                    if hit {
+                        stamp_touched = true;
+                    }
+                }
+                Shape::Line { a, b } => {
+                    match clip_path(&[*a, *b], false, &caps, half_t, min_len) {
+                        ClipPath::Untouched => {}
+                        ClipPath::Erased => changes.push((id, Vec::new())),
+                        ClipPath::Runs(runs) => {
+                            let frags = self.line_fragments(i, runs);
+                            changes.push((id, frags));
+                        }
+                    }
+                }
+                Shape::Poly { pts: ppts, closed } => {
+                    if obj.filled && *closed {
+                        match subtract_polygon(ppts, &caps, min_area) {
+                            PolySubtract::Untouched => {}
+                            PolySubtract::Erased => changes.push((id, Vec::new())),
+                            PolySubtract::WouldHole => hole_refusals.push("polygon"),
+                            PolySubtract::Pieces(pieces) => {
+                                let frags = self.poly_fragments(i, pieces, true);
+                                changes.push((id, frags));
+                            }
+                        }
+                    } else {
+                        match clip_path(ppts, *closed, &caps, half_t, min_len) {
+                            ClipPath::Untouched => {}
+                            ClipPath::Erased => changes.push((id, Vec::new())),
+                            ClipPath::Runs(runs) => {
+                                let frags = self.open_fragments(i, runs);
+                                changes.push((id, frags));
+                            }
+                        }
+                    }
+                }
+                Shape::Rect { .. } | Shape::Ellipse { .. } => {
+                    // Convert to a polygon ring VIRTUALLY; only commit
+                    // the conversion when the stroke actually cuts it
+                    // (a miss leaves the shape parametric).
+                    let ring = shape_ring(&self.model.objects[i].shape);
+                    let obj = &self.model.objects[i];
+                    if obj.filled {
+                        match subtract_polygon(&ring, &caps, min_area) {
+                            PolySubtract::Untouched => {}
+                            PolySubtract::Erased => changes.push((id, Vec::new())),
+                            PolySubtract::WouldHole => hole_refusals.push(
+                                match obj.shape {
+                                    Shape::Rect { .. } => "rectangle",
+                                    _ => "ellipse",
+                                },
+                            ),
+                            PolySubtract::Pieces(pieces) => {
+                                let frags = self.poly_fragments(i, pieces, true);
+                                changes.push((id, frags));
+                            }
+                        }
+                    } else {
+                        match clip_path(&ring, true, &caps, half_t, min_len) {
+                            ClipPath::Untouched => {}
+                            ClipPath::Erased => changes.push((id, Vec::new())),
+                            ClipPath::Runs(runs) => {
+                                let frags = self.open_fragments(i, runs);
+                                changes.push((id, frags));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Status: distinct, specific messages for the two refusals (see
+        // the design doc); a success summary otherwise.
+        let n_changed = changes.len();
+        if n_changed > 0 {
+            self.model.apply_erase(changes);
+            let mut msg = if n_changed == 1 {
+                "Erased across 1 object.".to_string()
+            } else {
+                format!("Erased across {n_changed} objects.")
+            };
+            if stamp_touched {
+                msg.push_str(" Skipped a generated part — stamps can't be erased.");
+            }
+            if !hole_refusals.is_empty() {
+                msg.push_str(" Skipped a filled shape — the stroke stayed inside it.");
+            }
+            self.status = msg;
+        } else if !hole_refusals.is_empty() {
+            self.status = format!(
+                "That stroke stays inside the filled {} — holes aren't supported. \
+                 Drag the stroke across the shape's edge instead.",
+                hole_refusals[0]
+            );
+        } else if stamp_touched {
+            self.status = "Stamps (generated parts) can't be erased in this release — \
+                           delete the stamp, or overdraw it with vector walls (that's \
+                           how to vent a nozzle bell for now)."
+                .into();
+        }
+    }
+
+    /// Fragments for a cut Line: 2-point runs stay Lines.
+    fn line_fragments(&mut self, i: usize, runs: Vec<Vec<[f32; 2]>>) -> Vec<SketchObject> {
+        let src = self.model.objects[i].clone();
+        runs.into_iter()
+            .enumerate()
+            .map(|(k, run)| {
+                let mut o = src.clone();
+                if k > 0 {
+                    o.id = self.model.fresh_id();
+                }
+                o.shape = Shape::Line { a: run[0], b: *run.last().unwrap() };
+                o
+            })
+            .collect()
+    }
+
+    /// Fragments for cut open runs (open Poly / opened ring): open,
+    /// unfilled polylines inheriting every property.
+    fn open_fragments(&mut self, i: usize, runs: Vec<Vec<[f32; 2]>>) -> Vec<SketchObject> {
+        let src = self.model.objects[i].clone();
+        runs.into_iter()
+            .enumerate()
+            .map(|(k, run)| {
+                let mut o = src.clone();
+                if k > 0 {
+                    o.id = self.model.fresh_id();
+                }
+                o.shape = Shape::Poly { pts: run, closed: false };
+                o.filled = false;
+                o
+            })
+            .collect()
+    }
+
+    /// Fragments for carved filled polygons: closed, filled pieces.
+    fn poly_fragments(
+        &mut self,
+        i: usize,
+        pieces: Vec<Vec<[f32; 2]>>,
+        filled: bool,
+    ) -> Vec<SketchObject> {
+        let src = self.model.objects[i].clone();
+        pieces
+            .into_iter()
+            .enumerate()
+            .map(|(k, pts)| {
+                let mut o = src.clone();
+                if k > 0 {
+                    o.id = self.model.fresh_id();
+                }
+                o.shape = Shape::Poly { pts, closed: true };
+                o.filled = filled;
+                o
+            })
+            .collect()
+    }
+
+    /// Paint bucket (U4): flood-fill the model's rasterized grid from
+    /// the click, trace the contour, emit a filled polygon of the
+    /// current default material. The traced boundary is a SNAPSHOT (the
+    /// tooltip says so); the fill inserts at the BOTTOM z-slot so
+    /// interior island walls keep winning their overlaps.
+    pub(in crate::app) fn bucket_fill(&mut self, p: [f32; 2]) {
+        use crate::geomops::{flood_region, trace_mask, Flood};
+        let (vw, vh) = self.stats_grid;
+        if p[0] < 0.0 || p[1] < 0.0 || p[0] >= vw as f32 || p[1] >= vh as f32 {
+            return;
+        }
+        // Rasterize the model alone over the visible grid (no margin,
+        // no tunnel bands — the domain edges decide openness below).
+        let mut geo = crate::geometry::Geometry::new(vw, vh);
+        self.model
+            .rasterize_region(&mut geo, crate::geometry::GridRect::full(vw, vh), 0, false);
+        match flood_region(&geo.cell, vw, vh, (p[0] as usize, p[1] as usize)) {
+            Flood::NotFluid => {
+                self.status =
+                    "Paint bucket: that spot is inside an object — click open fluid \
+                     inside an enclosed region."
+                        .into();
+            }
+            Flood::OpenToEdge => {
+                self.status =
+                    "Paint bucket: the region is open to the domain edge, so the fill \
+                     would flood the whole domain — close the region first."
+                        .into();
+            }
+            Flood::Region(mask) => {
+                let contour = trace_mask(&mask, vw, vh);
+                let pts = Self::simplify_stroke(&contour, 0.75);
+                if pts.len() < 3 {
+                    self.status = "Paint bucket: the region is too small to fill.".into();
+                    return;
+                }
+                let mut obj = self.new_object(Shape::Poly { pts, closed: true });
+                obj.filled = true;
+                let id = obj.id;
+                self.model.insert_at(0, obj);
+                self.select_only(id);
+                self.status = format!(
+                    "Filled the region with a traced {} polygon. The outline is a \
+                     snapshot — it won't follow the walls if they move.",
+                    self.def_material.label()
+                );
+            }
         }
     }
 
@@ -2503,6 +2894,67 @@ impl FlowPaintApp {
     }
 
 
+}
+
+/// The polygon ring of a Rect (its 4 corners) or Ellipse (sampled at a
+/// size-scaled count), in STORED coordinates — the eraser's virtual
+/// conversion before boolean subtraction (committed only on a real cut).
+fn shape_ring(shape: &Shape) -> Vec<[f32; 2]> {
+    match shape {
+        Shape::Rect { c, half, angle } => {
+            let (s, co) = angle.sin_cos();
+            [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                .iter()
+                .map(|(kx, ky)| {
+                    let lx = kx * half[0];
+                    let ly = ky * half[1];
+                    [c[0] + lx * co - ly * s, c[1] + lx * s + ly * co]
+                })
+                .collect()
+        }
+        Shape::Ellipse { c, r, angle } => {
+            let (s, co) = angle.sin_cos();
+            let n = ((r[0].max(r[1]) * std::f32::consts::TAU) as usize).clamp(24, 96);
+            (0..n)
+                .map(|k| {
+                    let t = k as f32 / n as f32 * std::f32::consts::TAU;
+                    let lx = r[0] * t.cos();
+                    let ly = r[1] * t.sin();
+                    [c[0] + lx * co - ly * s, c[1] + lx * s + ly * co]
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Does a stroke capsule (stored space) reach a stamp's oriented box?
+/// Only gates the "stamps can't be erased" message — sampled, not exact.
+fn stamp_obb_touched(obj: &SketchObject, a: [f32; 2], b: [f32; 2], r: f32) -> bool {
+    let Shape::Stamp { raster, c, scale, angle } = &obj.shape else {
+        return false;
+    };
+    let hx = (raster.rect.2 - raster.rect.0).max(0) as f32 * 0.5 * scale;
+    let hy = (raster.rect.3 - raster.rect.1).max(0) as f32 * 0.5 * scale;
+    let (sn, cs) = angle.sin_cos();
+    let to_box = |p: [f32; 2]| -> [f32; 2] {
+        let dx = p[0] - c[0];
+        let dy = p[1] - c[1];
+        [dx * cs + dy * sn, -dx * sn + dy * cs]
+    };
+    let box_dist = |p: [f32; 2]| -> f32 {
+        let q = to_box(p);
+        let ox = (q[0].abs() - hx).max(0.0);
+        let oy = (q[1].abs() - hy).max(0.0);
+        (ox * ox + oy * oy).sqrt()
+    };
+    let seg_len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+    let steps = ((seg_len / (r * 0.5).max(0.25)).ceil() as usize).clamp(1, 64);
+    (0..=steps).any(|k| {
+        let t = k as f32 / steps as f32;
+        let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        box_dist(p) <= r
+    })
 }
 
 /// Clamp a file-borne float, replacing NaN/inf (which pass through

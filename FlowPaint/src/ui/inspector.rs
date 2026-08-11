@@ -110,7 +110,12 @@ impl FlowPaintApp {
         ui.label(super::theme::heading(format!("Object — {kind}")));
 
         let is_stamp = matches!(obj.shape, Shape::Stamp { .. });
-        let can_fill = matches!(obj.shape, Shape::Rect { .. } | Shape::Ellipse { .. });
+        // U4: closed polylines fill too (the plan's "probably most of
+        // what a fill tool needs to be").
+        let can_fill = matches!(
+            obj.shape,
+            Shape::Rect { .. } | Shape::Ellipse { .. } | Shape::Poly { closed: true, .. }
+        );
         let ps = self.phys_cache;
 
         if !is_stamp {

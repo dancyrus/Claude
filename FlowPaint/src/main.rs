@@ -6,6 +6,7 @@
 mod app;
 mod generators;
 mod geometry;
+mod geomops;
 mod model;
 mod sim;
 

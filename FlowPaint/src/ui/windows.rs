@@ -56,6 +56,8 @@ impl FlowPaintApp {
                             "S / L / R / E / P / B",
                             "select / line / rect / ellipse / polyline / pencil",
                         ),
+                        ("F / X / M", "fill (paint bucket) / eraser / measure"),
+                        ("Ctrl while drawing", "suspend object snaps"),
                         ("Shift+click", "add to / remove from the selection"),
                         ("Drag on empty space", "rubber-band select (Shift adds)"),
                         ("Ctrl+A", "select all"),
