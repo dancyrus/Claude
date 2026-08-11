@@ -161,6 +161,8 @@ Full write-up: `docs/t2a-color-range.md`.
 
 ## T2-C (per-edge boundary conditions)
 
+- Branch provenance (detail moved out of CLAUDE.md): the T2-C branch
+  was cut from the T2+U2 integration merge tip.
 - Shipped edge kinds: **far field, inlet, outlet, wall** (`EdgeKind`,
   `Settings.edges` in sim.rs). **Periodic is reserved, not shipped**:
   it needs wraparound in the LBM streaming (`lbm.wgsl:84`) and the
@@ -212,3 +214,38 @@ Full write-up: `docs/t2a-color-range.md`.
 - No decision from either unit moved. U3's probe fold and T2-C's edge
   machinery compose without overlap: probes ride `Settings.probes`,
   edges ride `Settings.edges`, and both persist in v9.
+
+## T2-D (SI / decimal-inch unit toggle)
+
+- The toggle is FORMAT-TIME ONLY: every canonical value in the app —
+  `Settings`, `Cmd`s, the scene format, DragValue boxes — stays SI;
+  only `ui/units.rs` converts, at render. Input boxes deliberately
+  keep their canonical SI value and unit (Physics▸Domain "width … m",
+  the legend's Manual range max in m/s / 1/s / Pa): the panel
+  convention is canonical value in the box, unit in the label, and
+  converting inputs would push unit handling into files frozen while
+  U4 runs.
+- Inch mode is ASME decimal-inch practice: inches only (no feet, no
+  fractions), the leading zero dropped below 1 in (".500 in"),
+  precision stepping 4/3/2/1 decimals as magnitude grows. Derived
+  quantities use the inch–pound–second system: in/s, psi, lb/in³,
+  in²/s (gas density and gauge pressure go scientific — ips numbers
+  are like that: air is 4.34e-5 lb/in³). Time, angles, Mach, CFL,
+  vorticity (1/s), factors, sim rate and zoom are unit-system neutral
+  and identical in both modes.
+- The selector is a "units" row (theme::toggle pair SI / inch) in
+  Results▸Display: that group had vertical room inside the 64 px
+  group height, so the Results tab gains ZERO width at the 900 px
+  minimum. Verified interactively at 900×600 in both solver modes
+  (LBM and Euler) under Xvfb.
+- Track-era store, same precedent as T2-A/T2-B: a `static AtomicBool`
+  in `ui/units.rs` behind `unit_system()`/`set_unit_system()`,
+  because `app.rs` is frozen while U4 runs concurrently. NOT
+  scene-persisted. At the merge: fold into `Settings` + a `Cmd` +
+  scene persistence (v10+), keeping the formatters as the only
+  conversion point.
+- Bypass audit came up clean: every physical readout routes through
+  `units::fmt_*` — legend, status strip, probe-plot axis labels,
+  ribbon derived lines, generators, tree, canvas scale bar and drag
+  dimensions, inspector derived lines. The only hardcoded unit
+  strings in `src/ui/` are the two SI input suffixes above.

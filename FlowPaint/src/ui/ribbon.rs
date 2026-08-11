@@ -7,7 +7,7 @@ use crate::app::{build_preset, Cmd, FlowPaintApp, RibbonTab, ScenePreset, Tool, 
 use crate::sim::{EdgeBcs, RangeMode, RenderMode, SolverMode, PARTICLE_CHOICES};
 use eframe::egui;
 
-use super::units::{fmt_density, fmt_len, fmt_speed, fmt_time};
+use super::units::{self, fmt_density, fmt_len, fmt_speed, fmt_time, UnitSystem};
 use egui_phosphor::regular as ph;
 
 use super::theme;
@@ -494,6 +494,23 @@ impl FlowPaintApp {
                 if ui.checkbox(&mut tints, "Highlight fans & drains").changed() {
                     cmds.push(Cmd::SetBoundaryTints(tints));
                 }
+                // T2-D: the unit system every readout formats in
+                // (ui/units.rs). Inputs keep their canonical SI value.
+                row(ui, "units", |ui| {
+                    let sys = units::unit_system();
+                    for (label, s, tip) in [
+                        ("SI", UnitSystem::Si, "Metric readouts: m, m/s, Pa"),
+                        (
+                            "inch",
+                            UnitSystem::DecimalInch,
+                            "ASME decimal-inch readouts: in, in/s, psi",
+                        ),
+                    ] {
+                        if theme::toggle(ui, sys == s, label).on_hover_text(tip).clicked() {
+                            units::set_unit_system(s);
+                        }
+                    }
+                });
             });
         });
         group(ui, "Particles", |ui| {

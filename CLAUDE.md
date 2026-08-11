@@ -25,9 +25,8 @@ Per-unit decisions later units must not re-derive live in
 - **U2 (multi-select + tier): done**, branch
   `claude/flowpaint-u2-multi-select-kvfbsi` (off the U1 branch).
 - **U3 (transforms + nested groups): done**, branch
-  `claude/u3-transforms-nested-groups-qo5qxi`. Groups are
-  `Shape::Group` similarity nodes + `parent` links; gizmo in
-  `ui/canvas.rs`. Decisions in §U3. Next: U4 is unblocked.
+  `claude/u3-transforms-nested-groups-qo5qxi`. `Shape::Group`
+  similarity nodes + `parent` links; gizmo in `ui/canvas.rs`. §U3.
 - **T2-A (color range + colormap): done**, branch
   `claude/t2a-color-range-opuijy` (off `34d57aa`, no U1); write-up in
   `docs/t2a-color-range.md`. Asymmetric manual min/max deliberately
@@ -35,12 +34,13 @@ Per-unit decisions later units must not re-derive live in
 - **T2-B (probes + Re input): done**, branch
   `claude/flowpaint-v4.1-t2b-probes` (off the U1 tip).
 - **T2-C (per-edge boundary conditions): done**, branch
-  `claude/t2-c-boundary-conditions-s0iupf` (off the T2+U2 integration
-  merge tip). Kinds: far field / inlet / outlet / wall; **periodic is
-  reserved** (scene discriminant 4, greyed in the UI) — it needs both
-  kernels' streaming/stencil indexing changed, blocked by the shader
-  freeze. Read `docs/unit-decisions.md` §T2-C before touching edges,
-  the sponge, or the tunnel preset.
+  `claude/t2-c-boundary-conditions-s0iupf`. Far field / inlet /
+  outlet / wall; **periodic is reserved** (blocked by the shader
+  freeze). Read §T2-C before touching edges, sponge, tunnel preset.
+- **T2-D (SI / decimal-inch toggle): done**, branch
+  `claude/si-decimal-inch-toggle-x17w11` (off main). Format-time only
+  (`ui/units.rs` static + Results▸Display "units" row; canonical
+  values and inputs stay SI); ASME decimal inch, ips units. §T2-D.
 - Scene format: **v9** current (second track merge: v9 ABSORBED v8 —
   U3's `parent` links / `Group` nodes / probe set sit above T2-C's
   appended `edges`), loads v3+ (v3 lacks solver fields; v4/v5 share a
