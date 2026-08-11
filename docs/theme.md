@@ -213,3 +213,27 @@ on Select). The domain-extent toggle is off, so write_render_uniform
 emits the same values as before, and the rasterizer's only new branch
 (filled closed Poly) sits in the Poly arm, which the Pinball scene's
 Rect/Ellipse objects never enter.
+
+## Third-integration measurement (U4 + T2-D merged)
+
+Paired back-to-back A/B in one session (fresh container — absolute
+numbers are again not host-comparable; lavapipe, relative only), run
+in both orders on an otherwise idle host: both release binaries were
+built BEFORE any measurement started, per the poisoned-baseline
+caveat above.
+
+```
+A = main 9f77dae, B = integration tip 1b1cb24       mean       p99
+pair 1 (A first): A 2797.79 / 3147.86   B 2800.76 / 3357.78
+pair 2 (B first): B 2812.88 / 3233.13   A 2817.81 / 3363.21
+```
+
+Order-independent result: mean +0.1 % / −0.2 %, p99 +6.7 % / −3.9 % —
+mean deltas are inside noise, and the fat p99 tail sits on whichever
+build runs second in the pair for the third record running; no
+regression. Expected: T2-D is format-time-only (the bench draws no
+panels that change cost with the unit system, and the per-frame
+Settings→units mirror is one relaxed atomic store), and U4's paths
+stay pointer-gated as recorded above. Note the standing gap logged in
+unit-decisions §U4: this harness never executes compute_osnap, so the
+snap cost remains unmeasured.
