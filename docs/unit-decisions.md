@@ -158,3 +158,37 @@ Full write-up: `docs/t2a-color-range.md`.
 - Probe plot conversions duplicate the legend's shader-inversion
   factors (T2-A keeps its own copy in `ui/legend.rs`) — unify both
   into `ui/units.rs` at the merge.
+
+## T2-C (per-edge boundary conditions)
+
+- Shipped edge kinds: **far field, inlet, outlet, wall** (`EdgeKind`,
+  `Settings.edges` in sim.rs). **Periodic is reserved, not shipped**:
+  it needs wraparound in the LBM streaming (`lbm.wgsl:84`) and the
+  Euler stencil clamping (`euler.wgsl:101`) — a change in BOTH kernels
+  that the shader freeze blocks. Scene v9 reserves discriminant 4 for
+  it and the UI greys it out; implementing it is a **post-freeze
+  task** needing no further format bump.
+- **`wind_tunnel: true` never was "no painted edge cells"** (this was
+  not written down anywhere and cost T2-C a re-read): the model
+  rasterizer has always painted 2-cell bands at the true grid edges —
+  left `CELL_INLET` (fan (1,0), 2-of-12 dye seed stripes) and right
+  `CELL_OUTLET` (`rasterize_region`, model.rs). Top and bottom were
+  far field (zero-gradient edge + sponge). The preset therefore maps
+  to **{left inlet, right outlet, top/bottom far field}**, not
+  all-far-field — that mapping is what keeps legacy scenes' output
+  identical.
+- The preset keeps the rasterizer's own band painting (byte-identical
+  legacy output); only non-preset edge sets go through
+  `sim::paint_edge_bcs`, which clips to the repainted region (so
+  damage uploads never balloon to the full perimeter) and runs after
+  the object pass — inside the 2-cell bands the domain boundary wins.
+- **Sponge coupling: any WALL edge forces sponge width 0** (a sponged
+  wall is not a wall — the sponge relaxes near-edge cells toward the
+  freestream and silently overrides no-slip). Inlet/outlet edges KEEP
+  the sponge: that pairing IS the legacy wind tunnel, and dropping it
+  would change existing scenes' output. This deliberately narrows the
+  original decision "any non-far-field edge kills the sponge", which
+  was made against the wrong premise above.
+- `Settings.wind_tunnel` stays as the freestream switch (`free_u`,
+  reset state); `Cmd::SetWindTunnel` re-arms the legacy edge preset.
+  Every pre-v9 load path derives `edges` from it (`EdgeBcs::legacy`).

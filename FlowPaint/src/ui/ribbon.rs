@@ -4,7 +4,7 @@
 //! use compact label + widget rows, mockup-style.
 
 use crate::app::{build_preset, Cmd, FlowPaintApp, RibbonTab, ScenePreset, Tool, UiSnapshot, ViewRequest, FLUID_PRESETS};
-use crate::sim::{RangeMode, RenderMode, SolverMode, PARTICLE_CHOICES};
+use crate::sim::{EdgeBcs, RangeMode, RenderMode, SolverMode, PARTICLE_CHOICES};
 use eframe::egui;
 
 use super::units::{fmt_density, fmt_len, fmt_speed, fmt_time};
@@ -367,13 +367,49 @@ impl FlowPaintApp {
                         cmds.push(Cmd::SetDyeFade(fade));
                     }
                 });
-                if ui
-                    .checkbox(&mut tunnel, "Wind tunnel")
-                    .on_hover_text("Freestream inflow, left to right")
-                    .changed()
-                {
-                    self.fluid_preset_idx = None;
-                    cmds.push(Cmd::SetWindTunnel(tunnel));
+                // The edges dialog rides in the checkbox row: a separate
+                // ribbon group pushes Domain past the 900 px minimum.
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut tunnel, "Wind tunnel")
+                        .on_hover_text(
+                            "Freestream inflow, left to right; resets the \
+                             edges to the tunnel preset",
+                        )
+                        .changed()
+                    {
+                        self.fluid_preset_idx = None;
+                        cmds.push(Cmd::SetWindTunnel(tunnel));
+                    }
+                    if ui
+                        .small_button("Edges…")
+                        .on_hover_text(
+                            "Per-edge boundary conditions: far field, \
+                             inlet, outlet or wall",
+                        )
+                        .clicked()
+                    {
+                        self.show_edges = !self.show_edges;
+                    }
+                });
+                // One line when the edge set is not a legacy preset:
+                // left · right · top · bottom, amber when a wall edge
+                // has turned the sponge off.
+                let e = snap.edges;
+                if !e.is_tunnel_preset() && e != EdgeBcs::OPEN {
+                    let text = format!(
+                        "{} · {} · {} · {}{}",
+                        e.0[0].short(),
+                        e.0[1].short(),
+                        e.0[2].short(),
+                        e.0[3].short(),
+                        if e.disables_sponge() { " — sponge off" } else { "" }
+                    );
+                    if e.disables_sponge() {
+                        ui.colored_label(theme::WARN, text);
+                    } else {
+                        theme::derived(ui, text);
+                    }
                 }
             });
         });

@@ -35,19 +35,26 @@ Per-unit decisions later units must not re-derive live in
   unimplemented (needs a per-mode offset in `render.wgsl`).
 - **T2-B (probes + Re input): done**, branch
   `claude/flowpaint-v4.1-t2b-probes` (off the U1 tip).
-- Scene format: **v8** current (U3), loads v3+ (v3 lacks solver
-  fields; v4/v5 share a layout; v6 appends per-object
-  `locked`/`hidden` — pre-v6 objects decode via the `SketchObjectV5`
-  mirror; v7 appends color ranges; v8 appends `parent` links, `Group`
-  nodes and the probe set — pre-v8 objects decode via the
-  `SketchObjectV7` mirror). **T2-C takes v9**; later bumps start at
-  v10 (plan v4.1's numbers run one low — don't repeat the off-by-one).
-- The track merge folded T2-A's color-range state out of the sim.rs
-  Mutex into `Settings.ranges` + `Cmd` (persisted since v7); U3 did
-  the same for T2-B's probes — `sim::probes()` is gone, the store is
-  `Settings.probes` + probe `Cmd`s, read via the app's per-frame
-  `ProbeUi` snapshot, positions persisted in v8. Still open: unify the
-  plot/legend shader-inversion factors in `ui/units.rs`.
+- **T2-C (per-edge boundary conditions): done**, branch
+  `claude/t2-c-boundary-conditions-s0iupf` (off the T2+U2 integration
+  merge tip). Kinds: far field / inlet / outlet / wall; **periodic is
+  reserved** (scene discriminant 4, greyed in the UI) — it needs both
+  kernels' streaming/stencil indexing changed, blocked by the shader
+  freeze. Read `docs/unit-decisions.md` §T2-C before touching edges,
+  the sponge, or the tunnel preset.
+- Scene format: **v9** current (second track merge: v9 ABSORBED v8 —
+  U3's `parent` links / `Group` nodes / probe set sit above T2-C's
+  appended `edges`), loads v3+ (v3 lacks solver fields; v4/v5 share a
+  layout; v6 appends `locked`/`hidden` — pre-v6 objects use the
+  `SketchObjectV5` mirror; v7 appends color ranges; v8 is decode-only,
+  pre-v8 objects use the `SketchObjectV7` mirror; older files derive
+  edges from `wind_tunnel`). Decode funnels … → v7 → v8 → v9; later
+  bumps start at v10.
+- Track-era Mutex debt is fully paid: T2-A's ranges live in
+  `Settings.ranges` + `Cmd` (v7+), T2-B's probes in `Settings.probes`
+  + probe `Cmd`s read via the per-frame `ProbeUi` snapshot (v8+).
+  Still open: unify the plot/legend shader-inversion factors in
+  `ui/units.rs`.
 
 ## Transforms & nested groups (U3)
 
@@ -122,6 +129,18 @@ Euler's Mach-8 sanity clamp effectively never (euler.wgsl). The cap is
 a *readout*, not a field — the binding constants live in shaders.
 (Pre-v8 scenes still carry fan-cell stamps; the inspector's raster-scan
 Engine path remains for them only.)
+
+## Edge BCs and the sponge (T2-C coupling)
+
+`Settings.edges` holds the four edge kinds; non-preset sets are baked
+as 2-cell bands by `sim::paint_edge_bcs` after the object pass. The
+wind-tunnel preset {left inlet, right outlet, top/bottom far field}
+instead keeps the model rasterizer's legacy band painting byte-for-byte
+(`rasterize_region`'s `wind_tunnel` flag = "edges == preset"). **Any
+WALL edge forces the absorbing sponge to width 0** (a sponged wall is
+not a wall); inlet/outlet edges keep the sponge — that pairing is the
+legacy tunnel and must not change. `wind_tunnel` remains the freestream
+switch; toggling it re-arms the preset.
 
 ## Frame-time baseline (plan working rules)
 
