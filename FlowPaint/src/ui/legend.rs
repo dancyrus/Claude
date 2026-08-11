@@ -6,8 +6,8 @@ use crate::sim::{ColorMap, FieldRange, RangeMode, RenderMode, SolverMode};
 use eframe::egui;
 
 use super::units::{
-    fmt_density, fmt_kvisc, fmt_len, fmt_mach, fmt_omega, fmt_pressure,
-    fmt_sim_rate, fmt_speed, fmt_time,
+    self, fmt_density, fmt_kvisc, fmt_len, fmt_mach, fmt_omega,
+    fmt_pressure, fmt_sim_rate, fmt_speed, fmt_time,
 };
 
 impl FlowPaintApp {
@@ -291,11 +291,13 @@ impl FlowPaintApp {
         });
         if fr.mode == RangeMode::Manual {
             let mut v = fr.sat_phys;
-            let suffix = match mode {
-                RenderMode::Speed => " m/s",
-                RenderMode::Vorticity => " 1/s",
-                RenderMode::Pressure => " Pa",
-                RenderMode::Dye => "",
+            // Typed in the active unit system; committed canonical SI
+            // (T2-D input adapter).
+            let unit = match mode {
+                RenderMode::Speed => units::speed_input_unit(),
+                RenderMode::Vorticity => units::omega_input_unit(),
+                RenderMode::Pressure => units::pressure_input_unit(),
+                RenderMode::Dye => units::dimensionless_input_unit(),
             };
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("max").small().color(super::theme::INK_3));
@@ -304,7 +306,9 @@ impl FlowPaintApp {
                         egui::DragValue::new(&mut v)
                             .range(1e-4..=1e9)
                             .speed((fr.sat_phys.abs() * 0.01).max(0.001))
-                            .suffix(suffix),
+                            .custom_formatter(move |x, _| unit.fmt(x))
+                            .custom_parser(move |s| unit.parse(s))
+                            .suffix(unit.suffix),
                     )
                     .on_hover_text(match mode {
                         RenderMode::Speed => "Speed where the scale saturates; 0 stays the bottom",

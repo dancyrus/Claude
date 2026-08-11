@@ -167,6 +167,8 @@ Full write-up: `docs/t2a-color-range.md`.
 
 ## T2-C (per-edge boundary conditions)
 
+- Branch provenance (detail moved out of CLAUDE.md): the T2-C branch
+  was cut from the T2+U2 integration merge tip.
 - Shipped edge kinds: **far field, inlet, outlet, wall** (`EdgeKind`,
   `Settings.edges` in sim.rs). **Periodic is reserved, not shipped**:
   it needs wraparound in the LBM streaming (`lbm.wgsl:84`) and the
@@ -302,3 +304,48 @@ stated in the eraser tooltip next to the stamp refusal).
 - No decision from either unit moved. U3's probe fold and T2-C's edge
   machinery compose without overlap: probes ride `Settings.probes`,
   edges ride `Settings.edges`, and both persist in v9.
+
+## T2-D (SI / decimal-inch unit toggle)
+
+- The conversion lives at the UI BOUNDARY ONLY: every canonical value
+  in the app — `Settings`, `Cmd`s, the scene format, the value a
+  DragValue commits — stays SI; `ui/units.rs` converts on the way out
+  (the `fmt_*` formatters) and on the way in (the `InputUnit`
+  adapters). Input boxes accept and display the ACTIVE unit system:
+  Physics▸Domain width and the legend's Manual range max wire an
+  `InputUnit` into `DragValue::custom_formatter`/`custom_parser`, so
+  typing 24 in inch mode commits 0.6096 m. The canonical-value
+  convention governs storage and call-site formatting, not what the
+  user types — an inch mode you cannot type inches into would be
+  read-only, defeating the toggle. The type→commit→switch→switch-back
+  round trip is pinned by test (no float-conversion drift; the box
+  returns to exactly "24.00 in").
+- Inch mode is ASME decimal-inch practice: inches only (no feet, no
+  fractions), the leading zero dropped below 1 in (".500 in"),
+  precision stepping 4/3/2/1 decimals as magnitude grows. Derived
+  quantities use the inch–pound–second system: in/s, psi, in²/s —
+  EXCEPT density, which is deliberately lbm/ft³ (air ≈ 0.0765), not
+  the dimensionally consistent lb/in³ (air 4.34e-5): nobody carries
+  gas density in pounds per cubic inch, mixed units are normal in ips
+  work, and the goal is the number an engineer recognizes. psi and
+  in²/s read fine and stay. Time, angles, Mach, CFL, vorticity (1/s),
+  factors, sim rate and zoom are unit-system neutral and identical in
+  both modes. Input boxes use plain decimal display (no ASME
+  leading-zero drop) — typing convention, not drawing convention.
+- The selector is a "units" row (theme::toggle pair SI / inch) in
+  Results▸Display: that group had vertical room inside the 64 px
+  group height, so the Results tab gains ZERO width at the 900 px
+  minimum. Verified interactively at 900×600 in both solver modes
+  (LBM and Euler) under Xvfb.
+- Track-era store, same precedent as T2-A/T2-B: a `static AtomicBool`
+  in `ui/units.rs` behind `unit_system()`/`set_unit_system()`,
+  because `app.rs` is frozen while U4 runs concurrently. NOT
+  scene-persisted. At the merge: fold into `Settings` + a `Cmd` +
+  scene persistence (v10+), keeping the formatters as the only
+  conversion point.
+- Bypass audit came up clean: every physical readout routes through
+  `units::fmt_*` — legend, status strip, probe-plot axis labels,
+  ribbon derived lines, generators, tree, canvas scale bar and drag
+  dimensions, inspector derived lines — and both unit-bearing input
+  boxes route through the `InputUnit` adapters; `src/ui/` carries no
+  hardcoded unit strings outside `units.rs`.
