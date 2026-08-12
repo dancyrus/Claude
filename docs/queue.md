@@ -28,10 +28,11 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
    `ui/windows.rs`) — UNCLAIMED
 6. **Object-snap frame-cost measurement**: a bench mode that arms the
    Line tool and drives a pointer; do NOT change the default workload
-   (bench harness, `docs/theme.md`) — IN PROGRESS
+   (bench harness, `docs/theme.md`) — DONE
    (`claude/agent-protocol-amendments-ohhfmn`)
 7. **Unit-system persistence across sessions**, as a user preference
-   not scene state (`ui/units.rs`, `app.rs` prefs) — UNCLAIMED
+   not scene state (`ui/units.rs`, `app.rs` prefs) — IN PROGRESS
+   (`claude/agent-protocol-amendments-ohhfmn`)
 
 ## Sequential — each depends on the item above it
 
