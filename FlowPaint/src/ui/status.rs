@@ -12,11 +12,13 @@
 //! canvas, which U3 owns).
 
 use crate::app::{Cmd, FlowPaintApp};
-use crate::sim::{ProbeQuantity, ProbeSample, PROBE_HISTORY_CAP};
+use crate::sim::{ProbeQuantity, ProbeSample, RenderMode, PROBE_HISTORY_CAP};
 use eframe::egui;
 
 use super::theme;
-use super::units::{fmt_cfl, fmt_len, fmt_omega, fmt_pressure, fmt_speed, fmt_time, fmt_zoom};
+use super::units::{
+    self, fmt_cfl, fmt_len, fmt_omega, fmt_pressure, fmt_speed, fmt_time, fmt_zoom,
+};
 
 impl FlowPaintApp {
     pub(in crate::app) fn status_bar(&mut self, ctx: &egui::Context, cmds: &mut Vec<Cmd>) {
@@ -124,29 +126,28 @@ impl FlowPaintApp {
         }
     }
 
-    /// Physical value of one probe sample for a plot quantity. These
-    /// conversions mirror the legend's inversion of the shader
-    /// normalizations (the T2-A branch keeps the same factors for the
-    /// color range) — unify both into `ui/units.rs` at the track merge.
+    /// Physical value of one probe sample for a plot quantity: the raw
+    /// sample magnitude times `units::field_phys_per_render` — THE home
+    /// for inverting the shader normalizations (queue item 5 unified
+    /// this with the legend's copy; this file's old copy carried the
+    /// "unify at the track merge" note).
     fn probe_value(&self, q: ProbeQuantity, s: &ProbeSample) -> f32 {
-        let ps = self.phys_cache;
+        let f = |mode: RenderMode| {
+            units::field_phys_per_render(
+                mode,
+                self.phys_cache,
+                self.stats_euler,
+                self.fluid_a,
+                self.fluid_rho,
+            )
+        };
         match q {
-            // ps.dt is defined so that dx/dt is the physical value of
-            // one velocity-buffer unit in BOTH solvers (LBM cells/step,
-            // Euler u·dt with u in units of a∞).
             ProbeQuantity::Speed => {
-                (s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1]).sqrt() * ps.u_phys(1.0)
+                (s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1]).sqrt() * f(RenderMode::Speed)
             }
-            ProbeQuantity::Vorticity => s.curl / ps.dt,
-            ProbeQuantity::Pressure => {
-                if self.stats_euler {
-                    // The Euler density buffer stores 1 + 0.1 (p − p∞),
-                    // p nondimensionalized by ρ∞ a∞².
-                    s.drho * 10.0 * self.fluid_rho * self.fluid_a * self.fluid_a
-                } else {
-                    ps.pressure_pa(s.drho, self.fluid_rho)
-                }
-            }
+            ProbeQuantity::Vorticity => s.curl * f(RenderMode::Vorticity),
+            ProbeQuantity::Pressure => s.drho * f(RenderMode::Pressure),
+            // Smoke is a passive tracer (factor 1); keep the direct read.
             ProbeQuantity::Smoke => s.dye,
         }
     }

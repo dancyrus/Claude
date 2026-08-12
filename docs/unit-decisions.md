@@ -691,3 +691,34 @@ First shader change under the lifted freeze. Branch
   bound only while `EdgeBcs::wrap_bits != 0`). Do not collapse the
   two pipelines back into one "simpler" runtime branch — the 12% is
   what that costs on the software-rendering bench host.
+
+## Queue item 5 (plot/legend inversion-factor unification)
+
+Internal debt from the T2-A/T2-B concurrent tracks, paid. Branch
+`claude/agent-protocol-amendments-xskax5`.
+
+- **One home**: `units::field_phys_per_render(mode, PhysScale, euler,
+  fluid_a, fluid_rho)` — the physical value of one render-buffer unit
+  per field, with the solver conventions documented on the function.
+  The legend's `range_phys_per_render` and the probe plot's
+  `probe_value` (status.rs) both delegate; neither carries factors
+  anymore. Pinned by
+  `field_phys_per_render_pins_the_solver_conventions` (units.rs).
+- **The two old copies were algebraically identical but textually
+  different on Euler speed**: legend computed `a∞/euler_dt` directly,
+  the probe plot used `PhysScale::u_phys(1.0)` = dx/dt with
+  dt = euler_dt·dx/a∞. The unified form is the PhysScale one (fewer
+  inputs); the guard moved from `euler_dt.max(1e-6)` to `phys_scale`'s
+  existing `fluid_a.max(1.0)` — display-only, sub-ulp for real fluids.
+- **The queue's file list was wrong and the code won** (recorded per
+  the protocol's plan-vs-code rule): it named `ui/windows.rs`, but the
+  probe plot's copy lives in `ui/status.rs` (deferred.md had it
+  right). Files actually touched: `ui/units.rs`, `ui/legend.rs`,
+  `ui/status.rs`. queue.md's entry was corrected at the DONE flip.
+- `auto_sat_render` (legend) is NOT part of this: it computes the
+  Auto range's saturation point in render units (forward direction),
+  not a phys-per-render factor. Item 4's asymmetric-range work owns
+  that area.
+- No bench: none of `ui/canvas.rs`, `model.rs`, `geomops.rs`,
+  `sim.rs`, or shaders touched — legend/status/units are panel code
+  off the per-frame solver path.

@@ -82,6 +82,42 @@ const LBFT3_PER_KGM3: f32 = 0.062_428;
 /// m²/s → in²/s.
 const IN2_PER_M2: f32 = 1.0 / (M_PER_IN * M_PER_IN);
 
+/// Physical value of ONE render-buffer unit of a field — THE single
+/// home for inverting the shader normalizations (queue item 5; T2-A's
+/// legend and T2-B's probe plot each carried a copy of these factors
+/// before this). Solver conventions, from the buffer notes in
+/// euler.wgsl and the T2-B probe work:
+/// - Speed: LBM stores lattice cells/step; Euler stores u·dt with u in
+///   units of a∞. `PhysScale.dt` is defined per solver so that dx/dt
+///   is the physical value of one velocity-buffer unit in BOTH
+///   (Euler: dt = euler_dt·dx/a∞, so dx/dt = a∞/euler_dt).
+/// - Vorticity: the sampled curl is per buffer time step, so 1/dt.
+/// - Pressure: LBM stores Δρ (p = cs²·Δρ, cs² = 1/3 lattice units);
+///   Euler's density buffer stores 1 + 0.1·(p − p∞) with p in units of
+///   ρ∞·a∞², so one unit of (density − 1) is 10·ρ∞·a∞² pascals.
+/// - Dye: passive tracer, dimensionless — factor 1.
+pub(crate) fn field_phys_per_render(
+    mode: crate::sim::RenderMode,
+    ps: crate::app::PhysScale,
+    euler: bool,
+    fluid_a: f32,
+    fluid_rho: f32,
+) -> f32 {
+    use crate::sim::RenderMode;
+    match mode {
+        RenderMode::Speed => ps.u_phys(1.0),
+        RenderMode::Vorticity => 1.0 / ps.dt,
+        RenderMode::Pressure => {
+            if euler {
+                10.0 * fluid_rho * fluid_a * fluid_a
+            } else {
+                ps.pressure_pa(1.0, fluid_rho)
+            }
+        }
+        RenderMode::Dye => 1.0,
+    }
+}
+
 /// Nearest "nice" 1-2-5 length to `target_m`, stepped in the ACTIVE
 /// display unit (metres or inches), so a scale bar reads a round
 /// number in either system — 10.000 in, not 7.874 in (U5; shared by
@@ -443,5 +479,33 @@ mod tests {
         assert_eq!(unit_system_pref_str(UnitSystem::DecimalInch), "inch");
         assert_eq!(unit_system_from_pref("feet"), None);
         assert_eq!(unit_system_from_pref(""), None);
+    }
+
+    /// Queue item 5: the unified inversion factors pin the shader
+    /// normalization conventions in one place. If a normalization in
+    /// render.wgsl/euler.wgsl changes, this test and both consumers
+    /// (legend color range, probe plot) move together.
+    #[test]
+    fn field_phys_per_render_pins_the_solver_conventions() {
+        use crate::app::PhysScale;
+        use crate::sim::RenderMode::*;
+        let ps = PhysScale { dx: 0.5, dt: 0.25 };
+        let (a, rho) = (340.0f32, 1.2f32);
+        // Speed: dx/dt — the same factor in BOTH solvers (PhysScale.dt
+        // is defined per solver to make that true).
+        assert_eq!(field_phys_per_render(Speed, ps, false, a, rho), 2.0);
+        assert_eq!(field_phys_per_render(Speed, ps, true, a, rho), 2.0);
+        // Vorticity: per buffer time step.
+        assert_eq!(field_phys_per_render(Vorticity, ps, false, a, rho), 4.0);
+        // Pressure, LBM: cs²·(dx/dt)²·ρ with cs² = 1/3.
+        let lbm_p = field_phys_per_render(Pressure, ps, false, a, rho);
+        assert!((lbm_p - 4.0 * rho / 3.0).abs() < 1e-5);
+        // Pressure, Euler: one unit of (density − 1) = 10·ρ∞·a∞² Pa.
+        assert_eq!(
+            field_phys_per_render(Pressure, ps, true, a, rho),
+            10.0 * rho * a * a
+        );
+        // Dye: passive tracer, dimensionless.
+        assert_eq!(field_phys_per_render(Dye, ps, true, a, rho), 1.0);
     }
 }

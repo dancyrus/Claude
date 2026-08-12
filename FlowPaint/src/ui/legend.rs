@@ -11,35 +11,20 @@ use super::units::{
 };
 
 impl FlowPaintApp {
-    /// Physical value of one render-buffer unit of a field — the factor
-    /// the legend uses to invert the shader's normalization (T2-A). All
-    /// unit conversions for the color range live here, app-side; the sim
-    /// stores render-unit values only.
+    /// Physical value of one render-buffer unit of a field — delegates
+    /// to `units::field_phys_per_render`, THE home for inverting the
+    /// shader normalizations (queue item 5 unified this with the probe
+    /// plot's copy). The sim stores render-unit values only. Note the
+    /// Euler Speed factor is the same quantity the old in-file copy
+    /// computed directly: dx/dt = a∞/euler_dt by PhysScale's definition.
     fn range_phys_per_render(&self, mode: RenderMode, snap: &UiSnapshot) -> f32 {
-        let ps = self.phys_cache;
-        let euler = snap.solver == SolverMode::Euler;
-        match mode {
-            // LBM: lattice cells/step. Euler: the buffer stores u * dt
-            // with u in units of a∞.
-            RenderMode::Speed => {
-                if euler {
-                    self.fluid_a / snap.euler_dt.max(1e-6)
-                } else {
-                    ps.u_phys(1.0)
-                }
-            }
-            RenderMode::Vorticity => 1.0 / ps.dt,
-            // LBM: density deviation, p = cs² · Δρ. Euler: the density
-            // buffer stores 1 + 0.1 · (p − p∞), p in units of ρ∞ a∞².
-            RenderMode::Pressure => {
-                if euler {
-                    10.0 * self.fluid_rho * self.fluid_a * self.fluid_a
-                } else {
-                    ps.pressure_pa(1.0, self.fluid_rho)
-                }
-            }
-            RenderMode::Dye => 1.0,
-        }
+        units::field_phys_per_render(
+            mode,
+            self.phys_cache,
+            snap.solver == SolverMode::Euler,
+            self.fluid_a,
+            self.fluid_rho,
+        )
     }
 
     /// Saturation point of a mode's AUTO range in render units — where

@@ -219,19 +219,6 @@ at the bottom before adding anything back.
   rides along whenever that happens.
 - Reasoning: `docs/unit-decisions.md` §"Third integration".
 
-### Plot/legend inversion-factor unification
-- One home in `ui/units.rs` for the factors that invert the shader's
-  field normalization, instead of two copies.
-- **DEFERRED** (internal debt, not a user-visible feature).
-- Why: T2-A's legend and T2-B's probe plot each grew their own copy
-  while the tracks ran concurrently. Verified still duplicated on
-  main: `ui/legend.rs` (`phys_factor`-style match) and `ui/status.rs`
-  (probe sample conversion) both carry the per-mode factors.
-- Unblocks: nothing — a cleanup awaiting someone touching that code.
-  The last track-era static debt was paid at the third integration;
-  this is the one remaining open item from that era.
-- Reasoning: `docs/unit-decisions.md` §T2-B; `CLAUDE.md` unit status.
-
 ### Object-snap frame-cost measurement
 - A `--bench` number for what `compute_osnap` costs per frame.
 - **DEFERRED** (a measurement gap, recorded so it doesn't read as "the
@@ -258,6 +245,11 @@ Verified shipped on main; do not re-add them here:
   once the freeze lifted — per-axis wrap in both kernels plus dye and
   particles, paired edges enforced by the dialog, no format bump
   (`docs/unit-decisions.md` §"Periodic boundary conditions").
+- **Plot/legend inversion-factor unification.** The last open
+  track-era debt, paid as queue item 5:
+  `units::field_phys_per_render` is the one home; the legend and the
+  probe plot (`ui/status.rs`) both delegate
+  (`docs/unit-decisions.md` §"Queue item 5").
 - **Measure tool.** Plan v4.1 listed it as "fold in … if it fits"; it
   fit, and shipped in U4 (key M).
 - **Mirror and linear array.** Deferred out of U4 on purpose ("slot it
