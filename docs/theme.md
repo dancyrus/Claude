@@ -319,3 +319,30 @@ Expected: the bench scene (Pinball, tunnel bands at 1x drive) keeps
 geometry once, at its frame-1 scene build). The A runs' fat max-frame
 outliers (7.7 s / 9.9 s) sat in the first and last run positions —
 the known session-position pattern, not code.
+
+## Queue item 6 measurement (object-snap frame cost, --bench-osnap)
+
+Six-run session (same container and lavapipe/Xvfb install as the
+item 2 record; both binaries built before any measurement; otherwise
+idle): A = main 51ea1ba `--bench`, B = item 6 2b584cc `--bench`,
+C = the same item 6 binary `--bench-osnap`. Forward A-B-C, then
+reverse C-B-A, so both comparisons get both orders:
+
+```
+                                                    mean       p99
+fwd: A 1970.90 / 4109.53   B 1981.14 / 4188.76   C 1959.60 / 2659.85
+rev: C 1898.53 / 2175.81   B 1920.41 / 3498.70   A 1893.16 / 3307.08
+```
+
+- **Default-workload regression (B vs A)**: +0.5 % / +1.4 % mean in
+  the two orders — inside this session's own A-run spread; the
+  bench-only cursor override is None-guarded off the default path.
+  No regression.
+- **Object-snap cost (C vs B)**: −1.1 % / −1.1 % mean, BOTH orders —
+  the armed Line tool + scripted sweep lands below the host's noise
+  floor. On the Pinball scene, `compute_osnap` per frame is
+  indistinguishable from zero; the candidate walk scales with object
+  count, so a future many-object scene could re-measure with the same
+  mode. This session's p99s ran fat and erratic (2.2–4.2 s) across
+  ALL runs including baseline — the known session-position pattern,
+  not code.

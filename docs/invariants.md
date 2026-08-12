@@ -93,8 +93,13 @@ No test covers these. A checker agent must launch the build and look.
 
 Not violations. Do not "fix" them without a decision.
 
-- Object-snap per-frame cost is unmeasured: the bench drives no
-  pointer and stays on Select, so `compute_osnap` never executes.
+- Object-snap per-frame cost is measured only at Pinball scale:
+  `--bench-osnap` (queue item 6) arms the Line tool and drives a
+  scripted pointer; the measured cost there is below the host noise
+  floor (docs/theme.md). The DEFAULT bench still drives no pointer
+  and stays on Select — historical numbers stay like-for-like — and
+  the perpendicular snap (anchor-dependent) is outside the mode's
+  reach.
 - Absolute bench numbers are not comparable across hosts or across
   container rebuilds. Only paired same-session A/B means anything.
 - Periodic boundaries are reserved in the format but not selectable.
