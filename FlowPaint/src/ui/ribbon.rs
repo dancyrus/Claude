@@ -28,6 +28,47 @@ impl FlowPaintApp {
                             self.ribbon_tab = tab;
                         }
                     }
+                    // Quick access: run control and history reachable
+                    // from every tab, on the strip's right side. Added
+                    // right-to-left, so Pause sits leftmost and its
+                    // Pause/Resume swap moves only its own left edge.
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add_enabled_ui(self.model.can_redo(), |ui| {
+                                if theme::quick_button(ui, ph::ARROW_U_UP_RIGHT, "Redo")
+                                    .clicked()
+                                {
+                                    self.finish_gesture();
+                                    self.model.redo();
+                                    self.deselect_all();
+                                }
+                            });
+                            ui.add_enabled_ui(self.model.can_undo(), |ui| {
+                                if theme::quick_button(ui, ph::ARROW_U_UP_LEFT, "Undo")
+                                    .clicked()
+                                {
+                                    self.finish_gesture();
+                                    self.model.undo();
+                                    self.deselect_all();
+                                }
+                            });
+                            if theme::quick_button(ui, ph::SKIP_FORWARD, "Step")
+                                .on_hover_text("Advance the simulation by one frame.")
+                                .clicked()
+                            {
+                                cmds.push(Cmd::StepOnce);
+                            }
+                            let (icon, label) = if snap.paused {
+                                (ph::PLAY, "Resume")
+                            } else {
+                                (ph::PAUSE, "Pause")
+                            };
+                            if theme::quick_button(ui, icon, label).clicked() {
+                                cmds.push(Cmd::TogglePause);
+                            }
+                        },
+                    );
                 });
             });
 
@@ -49,31 +90,12 @@ impl FlowPaintApp {
 
     // --- Tabs ---------------------------------------------------------
 
+    // Home is the scene-lifecycle tab: start a scene, open or save it,
+    // share it, restart its flow. Run control and history moved to the
+    // tab strip's quick-access cluster, which every tab shows.
     fn ribbon_home(&mut self, ui: &mut egui::Ui, snap: UiSnapshot, cmds: &mut Vec<Cmd>) {
-        group(ui, "Run", |ui| {
-            let (icon, label) = if snap.paused {
-                (ph::PLAY, "Resume")
-            } else {
-                (ph::PAUSE, "Pause")
-            };
-            if theme::ribbon_button(ui, false, false, icon, label).clicked() {
-                cmds.push(Cmd::TogglePause);
-            }
-            if theme::ribbon_button(ui, false, false, ph::SKIP_FORWARD, "Step")
-                .on_hover_text("Advance the simulation by one frame.")
-                .clicked()
-            {
-                cmds.push(Cmd::StepOnce);
-            }
-        });
         group(ui, "Scene", |ui| {
-            if theme::ribbon_button(ui, false, false, ph::ARROW_COUNTER_CLOCKWISE, "Reset flow")
-                .on_hover_text("Restart the flow from the freestream; the sketch stays")
-                .clicked()
-            {
-                cmds.push(Cmd::ResetFlow);
-            }
-            if theme::ribbon_button(ui, false, true, ph::TRASH, "Clear all")
+            if theme::ribbon_button(ui, false, true, ph::FILE, "New")
                 .on_hover_text("Remove every object (undoable) and reset the flow")
                 .clicked()
             {
@@ -82,22 +104,70 @@ impl FlowPaintApp {
                 self.model.replace_all(Vec::new());
                 cmds.push(Cmd::ResetFlow);
             }
+            if theme::ribbon_button(ui, false, false, ph::FOLDER_OPEN, "Open…")
+                .on_hover_text("Open a saved scene file (.flow)")
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("FlowPaint scene", &["flow"])
+                    .pick_file()
+                {
+                    self.load_scene(&p, cmds);
+                }
+            }
+            if theme::ribbon_button(ui, false, false, ph::FLOPPY_DISK, "Save…")
+                .on_hover_text("Save the scene to a file (.flow)")
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("FlowPaint scene", &["flow"])
+                    .set_file_name("scene.flow")
+                    .save_file()
+                {
+                    self.save_scene(&p, snap);
+                }
+            }
         });
-        group(ui, "History", |ui| {
-            ui.add_enabled_ui(self.model.can_undo(), |ui| {
-                if theme::ribbon_button(ui, false, false, ph::ARROW_U_UP_LEFT, "Undo").clicked() {
-                    self.finish_gesture();
-                    self.model.undo();
-                    self.deselect_all();
+        group(ui, "Share", |ui| {
+            if theme::ribbon_button(ui, false, false, ph::IMAGE, "View PNG…")
+                .on_hover_text(
+                    "Export the view as a PNG image: the raw field \
+                     pixels, one pixel per cell. Shortcut: Ctrl+E.",
+                )
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("PNG image", &["png"])
+                    .set_file_name("flowpaint.png")
+                    .save_file()
+                {
+                    cmds.push(Cmd::ExportPng(p, crate::app::ExportKind::Canvas));
                 }
-            });
-            ui.add_enabled_ui(self.model.can_redo(), |ui| {
-                if theme::ribbon_button(ui, false, false, ph::ARROW_U_UP_RIGHT, "Redo").clicked() {
-                    self.finish_gesture();
-                    self.model.redo();
-                    self.deselect_all();
+            }
+            if theme::ribbon_button(ui, false, false, ph::EXPORT, "Annotated…")
+                .on_hover_text(
+                    "Export the view plus a burned-in legend, scale bar \
+                     and run-conditions block — share-ready. Shortcut: \
+                     Ctrl+Shift+E.",
+                )
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("PNG image", &["png"])
+                    .set_file_name("flowpaint-annotated.png")
+                    .save_file()
+                {
+                    cmds.push(Cmd::ExportPng(p, crate::app::ExportKind::Annotated));
                 }
-            });
+            }
+        });
+        group(ui, "Flow", |ui| {
+            if theme::ribbon_button(ui, false, false, ph::ARROW_COUNTER_CLOCKWISE, "Reset flow")
+                .on_hover_text("Restart the flow from the freestream; the sketch stays")
+                .clicked()
+            {
+                cmds.push(Cmd::ResetFlow);
+            }
         });
     }
 

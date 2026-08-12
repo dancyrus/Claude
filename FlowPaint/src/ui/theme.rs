@@ -265,6 +265,17 @@ pub(crate) fn mono_small(ui: &mut egui::Ui, text: String) -> egui::Response {
     ui.label(egui::RichText::new(text).monospace().size(10.0))
 }
 
+/// A quick-access button (ribbon tab strip): icon beside a small text
+/// label on one line — the strip is too short for the two-line
+/// [`ribbon_button`]. Standard widget states style it (flat at rest,
+/// hairline on hover, faded when disabled). The minimum width keeps
+/// the strip from shifting when a label swaps (Pause/Resume).
+pub(crate) fn quick_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(format!("{icon} {label}")).min_size(Vec2::new(58.0, 18.0)),
+    )
+}
+
 /// A ribbon button: phosphor icon over a text label (never icon-only),
 /// with the mockup's `.bt` styling — flat at rest, hairline on hover,
 /// teal selected state, coral tint for destructive actions. Painted

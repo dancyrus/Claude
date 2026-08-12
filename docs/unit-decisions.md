@@ -510,3 +510,37 @@ Recorded 2026-08-12 by the session that opened the queue
   sessions do not collide.
 - **`docs/queue.md` created** with the post-v4.1 backlog in
   dependency order (parallel-safe, sequential, exclusive tiers).
+
+## Queue item 1 — ribbon quick-access + Home as scene lifecycle
+
+Branch `claude/queue-1-ribbon-home-x42vvi`. Files: `ui/ribbon.rs`,
+`ui/theme.rs` (`ui/menu.rs` deliberately unchanged, below).
+
+- **Quick access lives in the ribbon tab strip**, right-aligned:
+  Pause/Resume, Step, Undo, Redo — run control and history reachable
+  from every tab, same handlers the old Home groups called. One-line
+  `theme::quick_button` (icon beside label; the two-line
+  `ribbon_button` does not fit the 27 px strip). Buttons are added
+  right-to-left so Pause sits leftmost and the Pause/Resume label
+  swap moves only its own left edge; the helper's 58 px minimum
+  width absorbs the rest of the jitter.
+- **Home is the scene-lifecycle tab**: Scene (New / Open… / Save…),
+  Share (View PNG… / Annotated…), Flow (Reset flow). The buttons use
+  the same rfd dialogs, `load_scene`/`save_scene`, and
+  `Cmd::ExportPng` calls as the File menu — one path, more buttons,
+  per the no-second-path invariant.
+- **"Clear all" consolidated into "New"**: the two operations were
+  identical (`replace_all(vec![])` + `Cmd::ResetFlow`). New keeps the
+  destructive coral styling and stays one undoable step. Not a
+  feature removal — the operation remains on Home and as File▸New.
+- **The menu bar is unchanged.** The File menu keeps the full rare
+  set (incl. Quit); ribbon Home is the quick path. Duplication of
+  buttons over one code path is the pattern the menu already used
+  for Reset flow.
+- 900×600 check by width budget: the strip holds 5 tabs (~340 px) +
+  4 quick buttons (~260 px); the rebuilt Home body is 3 groups /
+  6 buttons, narrower than the old Home. Inch mode adds no strings
+  here (no unit-bearing readouts on Home or the strip).
+- No bench: only `ui/ribbon.rs` and `ui/theme.rs` changed; no
+  perf-sensitive file (`ui/canvas.rs`, `model.rs`, `geomops.rs`,
+  `sim.rs`) touched.

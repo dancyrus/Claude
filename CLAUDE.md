@@ -111,8 +111,9 @@ cycle prevention, world-space ops, why scaling is uniform — lives in
     gizmo (corner scale, rotate handle, draggable pivot), the mirror
     line tool, and the free view transform (zoom at cursor,
     middle/space drag pan, `ViewRequest` consumption, pan clamp).
-  - `ui/ribbon.rs` — tabs Home/Geometry/Physics/Study/Results (Run/Step,
-    tools, solver+fluid, generators/presets, field/particles/View).
+  - `ui/ribbon.rs` — quick access (Pause/Step/Undo/Redo, every tab) +
+    tabs: Home = scene lifecycle (New/Open/Save/exports/Reset flow),
+    then Geometry, Physics, Study, Results.
   - `ui/menu.rs` — rare ops: file IO, PNG export, resolution, margin
     checkbox. `ui/export.rs` — U5 annotated-sheet composition (pure
     `ExportInfo` → pixels; GPU-free tests).
