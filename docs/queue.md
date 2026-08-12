@@ -42,12 +42,13 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
 9. **Holes in filled polygons** (removes the U4 interior-erase
    refusal) — depends on 8 — DONE
    (`claude/agent-protocol-amendments-ohhfmn`)
-10. **Union and intersect booleans** — depends on 9 — IN PROGRESS
+10. **Union and intersect booleans** — depends on 9 — DONE
     (`claude/agent-protocol-amendments-ohhfmn`)
 11. **DXF/SVG import — REPORT FIRST**: DXF is mostly arcs and
     circles. Say whether you are consuming the new arc primitive or
     flattening to polylines, and what that costs — depends on 10 —
-    UNCLAIMED
+    IN PROGRESS
+    (`claude/agent-protocol-amendments-ohhfmn`, report first)
 
 ## Exclusive — only when everything above is DONE and no other session is active
 
