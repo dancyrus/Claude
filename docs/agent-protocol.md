@@ -16,18 +16,23 @@ contradicts this file, the prompt wins and you say so in your report.
 5. Run the invariant check (below) before merging.
 6. Merge to `main` yourself with `--ff-only` and push. Do not open a
    PR and wait. If the fast-forward fails, stop and report.
-7. Report. Stop. Do not start the next unit.
+7. Report, then claim the next claimable item in `docs/queue.md`
+   (§Queue and claiming) and continue. Stop only for the escalation
+   list (§Escalate and stop).
 
 ## Standing constraints
 
-- **Never edit `FlowPaint/src/shaders/`.** One approved exception
-  exists (a `RenderParams` flags bit); it is not precedent. If your
-  unit needs a shader change, stop and report what needs to move and
-  why, before writing code.
+- **The shader freeze is LIFTED** (2026-08-12 amendment). Shader
+  edits are allowed. Record every shader change in
+  `docs/unit-decisions.md`, re-run both solver modes (LBM and
+  Euler), and re-run the paired `--bench`. The CPU colormap stop
+  tables in `app.rs` still mirror `render.wgsl` and must stay
+  linked.
 - **Ask before adding a dependency.** One retroactive exception exists
   (`ab_glyph`, already in-tree via epaint); also not precedent.
-- **egui stays at 0.29.1.** The 0.35 upgrade is deferred with its API
-  break list in `docs/deferred.md`.
+- **egui stays at 0.29.1** until the exclusive queue item runs; the
+  upgrade needs an explicit go/no-go (escalation list). The API
+  break list is in `docs/deferred.md`.
 - **Nothing is ever flattened.** Every drawn thing stays a live,
   selectable, editable `SketchObject`. Any destructive-looking feature
   is a per-object, undoable operation.
@@ -87,13 +92,11 @@ way:
 
 ## Gates: stop and ask, or decide
 
-**Stop and ask** when the decision is irreversible or outside your
-lane: a shader edit, a new dependency, a scene-format number when
-another unit is in flight, or a design choice with more than one
-defensible answer and no recorded precedent.
+**Stop and ask** only for the escalation list in §Escalate and stop.
 
-**Decide and record** everything else. A report-and-stop at a unit
-boundary with no open question is pure cost.
+**Decide and record** everything else in `docs/unit-decisions.md`. A
+report-and-stop at a unit boundary with no open question is pure
+cost.
 
 When the plan and the code disagree, **the code wins and the plan is
 wrong**. Say so, fix the plan text, and record it. This has happened
@@ -101,8 +104,41 @@ four times: a scene version already in use, stale line references, a
 preset that painted nothing it claimed to paint, and a gate that had
 already been opened.
 
+## Queue and claiming
+
+The backlog lives in `docs/queue.md`, in dependency order, each item
+UNCLAIMED, IN PROGRESS (branch), or DONE. Parallel sessions must not
+collide, so claims go through `main`:
+
+1. `git fetch`; then on `main`, set your chosen item to IN PROGRESS
+   with your branch name; commit; push to `main` directly.
+2. If the push is rejected, someone claimed it first — pull, pick
+   the next claimable item, retry.
+3. Do the work on your branch. Gate, self-merge, mark the item DONE,
+   push.
+4. Repeat until nothing is claimable.
+
+Never claim an item whose dependencies are not DONE. The exclusive
+item runs only when everything above it is DONE and no other session
+is active.
+
+## Escalate and stop
+
+Stop and ask the user only for these. Everything else: decide,
+record it in `docs/unit-decisions.md`, and continue.
+
+- a new dependency
+- deleting or disabling a user-facing feature
+- a change to default physical values or solver defaults that alters
+  existing scenes' results
+- the egui upgrade go/no-go
+- the gate script failing for a reason you cannot fix without
+  violating a constraint
+
 ## Documents you are responsible for
 
+- `docs/queue.md` — the backlog and claim state; update on claim and
+  on completion, on `main` directly.
 - `docs/unit-decisions.md` — every decision a later unit must not
   re-derive, and every piece of debt with an owner.
 - `docs/deferred.md` — anything you cut or defer, with why and what

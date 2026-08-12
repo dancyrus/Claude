@@ -76,7 +76,8 @@ No test covers these. A checker agent must launch the build and look.
 ## Structural
 
 - No file under `FlowPaint/src/shaders/` differs from `main` without a
-  recorded approval in `docs/unit-decisions.md`.
+  recorded entry in `docs/unit-decisions.md` (the freeze is lifted;
+  the record, both-solver re-run, and paired bench are still owed).
 - No process-wide static holds application state. `Settings` is the
   store of record; edits go through `Cmd`. One documented frame-scoped
   mirror exists (`INCH_MODE`) and is explicitly not a store.

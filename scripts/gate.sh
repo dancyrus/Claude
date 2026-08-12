@@ -28,7 +28,14 @@ else bad "$BASE is NOT an ancestor of HEAD — you branched off something stale"
 hdr "Shaders"
 SH_CHANGED=$(echo "$CHANGED" | grep -E '^FlowPaint/src/shaders/' || true)
 if [ -z "$SH_CHANGED" ]; then ok "no shader edits"
-else bad "shader files edited without approval:"; echo "$SH_CHANGED" | sed 's/^/          /'; fi
+else
+  echo "$SH_CHANGED" | sed 's/^/          /'
+  if echo "$CHANGED" | grep -q 'docs/unit-decisions.md'; then ok "shader edits recorded in docs/unit-decisions.md"
+  else bad "shader files edited but docs/unit-decisions.md untouched — record every shader change"; fi
+  if echo "$CHANGED" | grep -q 'docs/theme.md'; then ok "docs/theme.md updated (paired --bench required for shader edits)"
+  else bad "shader files edited but docs/theme.md untouched — shader edits require the paired --bench"; fi
+  warn "confirm both solver modes (LBM and Euler) were re-run with these shader changes"
+fi
 
 hdr "Dependencies"
 if echo "$CHANGED" | grep -q 'FlowPaint/Cargo.toml'; then

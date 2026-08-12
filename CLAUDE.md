@@ -10,9 +10,9 @@ object model (`model.rs`): objects stay live and editable, the grid is a
 damage-region re-projection, **nothing is ever flattened** — the
 eraser is a per-object, undoable subtract (U4).
 
-The working plan was `docs/flowpaint-plan-v4.1.md` (six units on two
-tracks). **Plan v4.1 is COMPLETE** — every unit has landed and merged
-into main (tag `v2.0-plan-v4.1`). Everything FlowPaint deliberately
+The working plan was `docs/flowpaint-plan-v4.1.md`, now COMPLETE
+(tag `v2.0-plan-v4.1`); the follow-up backlog and its claim state
+live in `docs/queue.md`. Everything FlowPaint deliberately
 does NOT have is indexed in one place, `docs/deferred.md` (cut vs
 deferred, with reasoning pointers) — read it before assuming a feature
 is missing, re-adding one, or starting follow-up work. Standing
@@ -82,12 +82,12 @@ cycle prevention, world-space ops, why scaling is uniform — lives in
 
 ## Hard rules
 
-- **Never edit anything under `FlowPaint/src/shaders/`.** One approved
-  exception landed: T2-A's colormap-swap branches in `render.wgsl`
-  (`flags` bit 1; no uniform added or reordered). The inferno/coolwarm
-  stop tables in `app.rs` mirror `render.wgsl`; keep them linked.
-- **egui stays at 0.29.1 — the upgrade is deferred** (plan v3). Moving
-  to 0.35 drags wgpu 22→29 through all of `sim.rs`; the known API
+- **Shader freeze LIFTED** (queue era): record every shader change in
+  `docs/unit-decisions.md`, re-run both solver modes, and re-run the
+  paired `--bench`. The inferno/coolwarm stop tables in `app.rs`
+  mirror `render.wgsl`; keep them linked.
+- **egui stays at 0.29.1 — the upgrade is the exclusive queue item**.
+  Moving to 0.35 drags wgpu 22→29 through `sim.rs`; the known API
   breaks are recorded in `docs/deferred.md` (egui entry).
 - All visual constants resolve through `src/ui/theme.rs`
   (`docs/theme.md`); no ad-hoc colors, rounding, spacing or font

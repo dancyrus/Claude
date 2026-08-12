@@ -489,3 +489,24 @@ stated in the eraser tooltip next to the stamp refusal).
 - No bench re-run: U5 touches no per-frame path (export-time and
   startup-scene code only; `ui/canvas.rs`, `model.rs`, the rasterizer
   and shaders untouched).
+
+## Queue era (post-v4.1) — protocol amendments
+
+Recorded 2026-08-12 by the session that opened the queue
+(`claude/agent-protocol-amendments-x42vvi`), on user instruction.
+
+- **The shader freeze is lifted.** The standing "never edit
+  `FlowPaint/src/shaders/`" rule is replaced: shader edits are
+  allowed; every shader change is recorded in this file; both solver
+  modes (LBM and Euler) are re-run; the paired `--bench` is re-run.
+  The CPU colormap stop tables in `app.rs` still mirror `render.wgsl`
+  and must stay linked. `scripts/gate.sh` now fails a shader diff
+  only when the record or the bench entry is missing, instead of
+  failing on any shader diff.
+- **Autonomous mode.** Session step 7 (report, stop) is replaced by
+  claim-next-and-continue against `docs/queue.md`; only the
+  escalation list (`docs/agent-protocol.md` §Escalate and stop)
+  stops a session. Claims commit to `main` directly so parallel
+  sessions do not collide.
+- **`docs/queue.md` created** with the post-v4.1 backlog in
+  dependency order (parallel-safe, sequential, exclusive tiers).
