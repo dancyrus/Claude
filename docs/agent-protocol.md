@@ -89,6 +89,10 @@ way:
 - Record all four runs in `docs/theme.md` in the existing format.
 - If the deltas flip sign with run order, that is this host's known
   session-position pattern, not a regression. Say which it is and why.
+- `--bench-osnap` (queue item 6) is a separate variant: the same
+  harness with the Line tool armed and a scripted pointer sweep, for
+  measuring the object-snap cost. It never replaces the plain
+  `--bench` workload — regression gates keep using `--bench`.
 
 ## Gates: stop and ask, or decide
 

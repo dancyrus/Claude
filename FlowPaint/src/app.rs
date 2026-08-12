@@ -943,6 +943,11 @@ pub struct FlowPaintApp {
     /// This frame's snap candidate, computed once per frame by the
     /// canvas and consumed by every snapped coordinate that frame.
     osnap_hit: Option<OsnapHit>,
+    /// `--bench-osnap` only: the scripted pointer position (visible-cell
+    /// coords) the canvas osnap block reads when no real pointer hovers.
+    /// Always `None` outside that mode — the default workload must not
+    /// change (queue item 6).
+    bench_osnap_cursor: Option<[f32; 2]>,
     /// Eraser radius in cells (0.5-cell floor, the canvas precedent).
     eraser_radius: f32,
     /// Linear-array parameters (Geometry ribbon; session-scoped, not
@@ -1050,6 +1055,11 @@ struct BenchState {
     frame: u32,
     samples: Vec<f32>,
     last: Option<std::time::Instant>,
+    /// `--bench-osnap` (queue item 6): the same harness, plus the Line
+    /// tool armed and a scripted pointer sweep so `compute_osnap`
+    /// executes every frame. The plain `--bench` workload is untouched
+    /// — every historical number stays like-for-like.
+    osnap: bool,
 }
 
 /// Setup happens on frame 1; frames up to the warmup bound are excluded
@@ -1168,11 +1178,20 @@ impl FlowPaintApp {
             stats_euler: false,
             stats_u_inf: 0.0,
             stats_cfl: 0.0,
-            bench: if std::env::args().any(|a| a == "--bench") {
-                Some(BenchState { frame: 0, samples: Vec::new(), last: None })
-            } else {
-                None
+            bench: {
+                let osnap = std::env::args().any(|a| a == "--bench-osnap");
+                if osnap || std::env::args().any(|a| a == "--bench") {
+                    Some(BenchState {
+                        frame: 0,
+                        samples: Vec::new(),
+                        last: None,
+                        osnap,
+                    })
+                } else {
+                    None
+                }
             },
+            bench_osnap_cursor: None,
             stats_steps_per_s: 0.0,
             stats_sim_steps: 0.0,
             sim_time_s: 0.0,
@@ -2462,6 +2481,7 @@ impl FlowPaintApp {
             b.frame += 1;
             (b.frame, b.samples.len() >= BENCH_FRAMES)
         };
+        let osnap_mode = self.bench.as_ref().is_some_and(|b| b.osnap);
         if frame == 1 {
             // Deterministic scene: Pinball preset, compressible mode, at
             // whatever grid the app started with (the default). Tracers
@@ -2475,6 +2495,27 @@ impl FlowPaintApp {
             cmds.push(Cmd::SetSolver(SolverMode::Euler));
             cmds.push(Cmd::SetParticles(0));
             cmds.push(Cmd::ResetFlow);
+            if osnap_mode {
+                // Queue item 6: arm the Line tool and pin snaps on, so
+                // the scripted pointer below exercises `compute_osnap`
+                // (no gesture is started: no object is created, so the
+                // solver/raster workload stays exactly the default's;
+                // the perpendicular snap needs an anchor and is the one
+                // kind this mode does not reach).
+                self.tool = Tool::Line;
+                self.osnap_enabled = true;
+            }
+        }
+        if osnap_mode {
+            // Deterministic Lissajous sweep in visible-cell coords, sized
+            // to keep the cursor over the Pinball geometry so the
+            // candidate set keeps changing frame to frame.
+            let (vw, vh) = self.stats_grid;
+            let t = frame as f32;
+            self.bench_osnap_cursor = Some([
+                vw as f32 * (0.5 + 0.4 * (0.037 * t).cos()),
+                vh as f32 * (0.5 + 0.4 * (0.023 * t).sin()),
+            ]);
         }
         if done {
             let mut s = std::mem::take(&mut self.bench.as_mut().unwrap().samples);

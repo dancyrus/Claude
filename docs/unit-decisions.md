@@ -582,3 +582,22 @@ Branch `claude/queue-1-ribbon-home-x42vvi`. Files: `ui/ribbon.rs`,
   app.rs (unavoidable), and ONE line went into ribbon.rs's preset
   click (`Cmd::SetGamma`) while item 1 holds that file — kept to a
   single line to minimize the merge surface.
+
+## Queue item 6 (object-snap frame-cost bench mode)
+
+- **`--bench-osnap` is a variant, not a change**: same harness
+  (Pinball, Euler, tracers pinned 0, 10 warmup + 300 frames), plus
+  the Line tool armed, `osnap_enabled` pinned true, and a scripted
+  Lissajous pointer sweep in visible-cell coords fed through
+  `FlowPaintApp.bench_osnap_cursor`. That field is `None` in every
+  normal run and in plain `--bench` — the canvas only reads it after
+  `pointer.or(hover_pos())` comes up empty, so the default workload
+  and all historical numbers stay like-for-like.
+- **No gesture is started**: starting a Line draw would create an
+  object and change the raster/solver workload. Consequence: the
+  perpendicular snap (anchor-dependent) is not exercised; endpoint,
+  intersection, midpoint and center are. Recorded as the mode's known
+  measurement boundary.
+- The sweep frequencies (0.037/0.023 rad per frame) are deliberately
+  incommensurate with the 300-frame window so the cursor never
+  settles into a short loop.

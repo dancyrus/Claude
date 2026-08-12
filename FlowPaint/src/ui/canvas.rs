@@ -361,8 +361,13 @@ impl FlowPaintApp {
         // constraint), which overrides any object snap — computing one
         // anyway would draw a marker at a point the vertex won't go to.
         if self.osnap_enabled && osnap_tool && !ctrl && !shift && !pan_mode {
-            if let Some(pos) = pointer.or(response.hover_pos()) {
-                let cursor = to_cell(pos);
+            // The scripted `--bench-osnap` cursor only fills in when no
+            // real pointer hovers; it is None in every normal run.
+            let cursor_cell = pointer
+                .or(response.hover_pos())
+                .map(to_cell)
+                .or(self.bench_osnap_cursor);
+            if let Some(cursor) = cursor_cell {
                 let radius = SNAP_RADIUS_PT * ppp / px_per_cell;
                 let exclude = match &self.gesture {
                     Gesture::DrawShape { id, .. }
