@@ -15,7 +15,7 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
 2. **Gas properties: combustion-products fluid** (gamma ~1.2,
    a0 ~1620 m/s); widen Euler's `0.2..=2.0` fan range; correct the
    stale CUT entry for the fan cap in `docs/deferred.md`
-   (`sim.rs`, `ui/generators.rs`, `ui/inspector.rs`) — IN PROGRESS
+   (`sim.rs`, `ui/generators.rs`, `ui/inspector.rs`) — DONE
    (`claude/agent-protocol-amendments-ohhfmn`)
 3. **Periodic boundary conditions** — now unblocked; the variant is
    already reserved as v9 discriminant 4 (`lbm.wgsl`, `euler.wgsl`,
@@ -28,7 +28,8 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
    `ui/windows.rs`) — UNCLAIMED
 6. **Object-snap frame-cost measurement**: a bench mode that arms the
    Line tool and drives a pointer; do NOT change the default workload
-   (bench harness, `docs/theme.md`) — UNCLAIMED
+   (bench harness, `docs/theme.md`) — IN PROGRESS
+   (`claude/agent-protocol-amendments-ohhfmn`)
 7. **Unit-system persistence across sessions**, as a user preference
    not scene state (`ui/units.rs`, `app.rs` prefs) — UNCLAIMED
 
