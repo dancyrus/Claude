@@ -20,6 +20,12 @@ struct SimParams {
 
 const CELL_WALL: u32 = 1u;
 
+// Pipeline-specialization switch: 0 compiles the wrap logic out
+// entirely (the default pipeline every non-periodic scene runs — zero
+// added cost, measured); 1 enables the P.wrap uniform branches. The
+// engine binds the variant by EdgeBcs::wrap_bits (sim.rs).
+override WRAP_ENABLED: u32 = 0u;
+
 @group(0) @binding(0) var<uniform> P: SimParams;
 @group(0) @binding(1) var<storage, read> dye_in: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> dye_out: array<vec4f>;
@@ -33,8 +39,8 @@ fn wrap_pos(p: vec2f) -> vec2f {
     var q = p;
     let fw = f32(P.width);
     let fh = f32(P.height);
-    if ((P.wrap & 1u) != 0u) { q.x = q.x - fw * floor(q.x / fw); }
-    if ((P.wrap & 2u) != 0u) { q.y = q.y - fh * floor(q.y / fh); }
+    if (WRAP_ENABLED != 0u && (P.wrap & 1u) != 0u) { q.x = q.x - fw * floor(q.x / fw); }
+    if (WRAP_ENABLED != 0u && (P.wrap & 2u) != 0u) { q.y = q.y - fh * floor(q.y / fh); }
     return q;
 }
 
@@ -45,7 +51,7 @@ fn sample_dye(p_in: vec2f) -> vec4f {
     // Per axis: bilinear taps wrap across a periodic seam, clamp at an
     // ordinary edge (the pre-periodic behaviour).
     var x0: i32; var x1: i32; var tx: f32;
-    if ((P.wrap & 1u) != 0u) {
+    if (WRAP_ENABLED != 0u && (P.wrap & 1u) != 0u) {
         let fx = floor(p.x);
         tx = p.x - fx;
         x0 = ((i32(fx) % W) + W) % W;
@@ -57,7 +63,7 @@ fn sample_dye(p_in: vec2f) -> vec4f {
         tx = cx - f32(x0);
     }
     var y0: i32; var y1: i32; var ty: f32;
-    if ((P.wrap & 2u) != 0u) {
+    if (WRAP_ENABLED != 0u && (P.wrap & 2u) != 0u) {
         let fy = floor(p.y);
         ty = p.y - fy;
         y0 = ((i32(fy) % H) + H) % H;

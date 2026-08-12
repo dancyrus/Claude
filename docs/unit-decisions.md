@@ -680,3 +680,14 @@ First shader change under the lifted freeze. Branch
   test, or an xkbcommon panic from `--bench`, installs those two
   packages.
 - `SolverMode` gained `derive(Debug)` for test diagnostics.
+- **The wrap branches are pipeline-specialized, and that is
+  load-bearing.** The first paired bench caught the naive version — a
+  runtime `P.wrap` check in the hot loads — at +11.8% / +12.6% mean
+  in BOTH run orders (consistent sign = real regression, not the
+  session-position pattern). Fix: every wrap branch is guarded by a
+  WGSL `override WRAP_ENABLED: u32 = 0u`, each per-cell kernel is
+  created twice (default = wrap logic constant-folded OUT, so
+  non-periodic scenes run the pre-periodic machine code; wrap variant
+  bound only while `EdgeBcs::wrap_bits != 0`). Do not collapse the
+  two pipelines back into one "simpler" runtime branch — the 12% is
+  what that costs on the software-rendering bench host.

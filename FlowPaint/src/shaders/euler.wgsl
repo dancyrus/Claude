@@ -42,6 +42,12 @@ const RHO_FLOOR: f32 = 1e-3;
 const P_FLOOR: f32 = 1e-4;
 const PRESSURE_RENDER_SCALE: f32 = 0.1;
 
+// Pipeline-specialization switch: 0 compiles the wrap logic out
+// entirely (the default pipeline every non-periodic scene runs — zero
+// added cost, measured); 1 enables the P.wrap uniform branches. The
+// engine binds the variant by EdgeBcs::wrap_bits (sim.rs).
+override WRAP_ENABLED: u32 = 0u;
+
 @group(0) @binding(0) var<uniform> P: EulerParams;
 // Conserved state (rho, rho*u, rho*v, E) per cell.
 @group(0) @binding(1) var<storage, read> u_src: array<vec4f>;
@@ -107,13 +113,13 @@ fn inlet_prim(idx: u32) -> vec4f {
 // (v + n) covers every off-domain coordinate the kernel produces.
 fn load_x(x: i32) -> i32 {
     let w = i32(P.width);
-    if ((P.wrap & 1u) != 0u) { return (x + w) % w; }
+    if (WRAP_ENABLED != 0u && (P.wrap & 1u) != 0u) { return (x + w) % w; }
     return clamp(x, 0, w - 1);
 }
 
 fn load_y(y: i32) -> i32 {
     let h = i32(P.height);
-    if ((P.wrap & 2u) != 0u) { return (y + h) % h; }
+    if (WRAP_ENABLED != 0u && (P.wrap & 2u) != 0u) { return (y + h) % h; }
     return clamp(y, 0, h - 1);
 }
 
@@ -225,8 +231,8 @@ fn swz(w: vec4f) -> vec4f {
 fn sponge_factor(gx: u32, gy: u32) -> f32 {
     if (P.sponge_width <= 0.5) { return 0.0; }
     var dedge = 4294967295u;
-    if ((P.wrap & 1u) == 0u) { dedge = min(dedge, min(gx, P.width - 1u - gx)); }
-    if ((P.wrap & 2u) == 0u) { dedge = min(dedge, min(gy, P.height - 1u - gy)); }
+    if (WRAP_ENABLED == 0u || (P.wrap & 1u) == 0u) { dedge = min(dedge, min(gx, P.width - 1u - gx)); }
+    if (WRAP_ENABLED == 0u || (P.wrap & 2u) == 0u) { dedge = min(dedge, min(gy, P.height - 1u - gy)); }
     if (f32(dedge) >= P.sponge_width) { return 0.0; }
     let t = 1.0 - f32(dedge) / P.sponge_width;
     return P.sponge_strength * t * t;
@@ -272,8 +278,8 @@ fn euler_step(@builtin(global_invocation_id) gid: vec3u) {
             if (k == 1) { nx = x - 1; }
             if (k == 2) { ny = y + 1; }
             if (k == 3) { ny = y - 1; }
-            if ((P.wrap & 1u) != 0u) { nx = (nx + i32(W)) % i32(W); }
-            if ((P.wrap & 2u) != 0u) { ny = (ny + i32(H)) % i32(H); }
+            if (WRAP_ENABLED != 0u && (P.wrap & 1u) != 0u) { nx = (nx + i32(W)) % i32(W); }
+            if (WRAP_ENABLED != 0u && (P.wrap & 2u) != 0u) { ny = (ny + i32(H)) % i32(H); }
             if (nx < 0 || nx >= i32(W) || ny < 0 || ny >= i32(H)) { continue; }
             let nidx = u32(ny) * W + u32(nx);
             let nct = cell_type[nidx];

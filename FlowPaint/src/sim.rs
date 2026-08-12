@@ -714,6 +714,13 @@ pub struct GpuSim {
     advect_pipeline: wgpu::ComputePipeline,
     clear_dye_pipeline: wgpu::ComputePipeline,
     part_update_pipeline: wgpu::ComputePipeline,
+    // WRAP_ENABLED=1 variants, bound only while a periodic pair is
+    // active (EdgeBcs::wrap_bits != 0). The plain pipelines above have
+    // the wrap logic compiled out.
+    collide_pipeline_wrap: wgpu::ComputePipeline,
+    euler_step_pipeline_wrap: wgpu::ComputePipeline,
+    advect_pipeline_wrap: wgpu::ComputePipeline,
+    part_update_pipeline_wrap: wgpu::ComputePipeline,
     field_pipeline: wgpu::RenderPipeline,
     particle_pipeline: wgpu::RenderPipeline,
     field_pipeline_rgba: wgpu::RenderPipeline, // for PNG export
@@ -932,13 +939,38 @@ impl GpuSim {
                 cache: None,
             })
         };
+        // The periodic-wrap variants of the per-cell kernels, specialized
+        // via the WRAP_ENABLED override. The default pipelines compile the
+        // wrap logic OUT (constant-folded dead code), so every
+        // non-periodic scene runs the pre-periodic machine code — the
+        // measured cost of the runtime branches on the bench host was
+        // ~12% mean, which is why this is two pipelines and not one.
+        let wrap_constants: std::collections::HashMap<String, f64> =
+            [(String::from("WRAP_ENABLED"), 1.0)].into();
+        let make_cp_wrap = |pl: &wgpu::PipelineLayout, module: &wgpu::ShaderModule, entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(&format!("{entry} (wrap)")),
+                layout: Some(pl),
+                module,
+                entry_point: entry,
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &wrap_constants,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+        };
         let collide_pipeline = make_cp(&lbm_pl, &lbm_module, "collide");
+        let collide_pipeline_wrap = make_cp_wrap(&lbm_pl, &lbm_module, "collide");
         let reset_pipeline = make_cp(&lbm_pl, &lbm_module, "reset_rest");
         let euler_step_pipeline = make_cp(&euler_pl, &euler_module, "euler_step");
+        let euler_step_pipeline_wrap = make_cp_wrap(&euler_pl, &euler_module, "euler_step");
         let euler_reset_pipeline = make_cp(&euler_pl, &euler_module, "euler_reset");
         let advect_pipeline = make_cp(&dye_pl, &dye_module, "advect");
+        let advect_pipeline_wrap = make_cp_wrap(&dye_pl, &dye_module, "advect");
         let clear_dye_pipeline = make_cp(&dye_pl, &dye_module, "clear_dye");
         let part_update_pipeline = make_cp(&part_pl, &part_module, "update");
+        let part_update_pipeline_wrap = make_cp_wrap(&part_pl, &part_module, "update");
 
         let render_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("field pl"),
@@ -1113,6 +1145,10 @@ impl GpuSim {
             advect_pipeline,
             clear_dye_pipeline,
             part_update_pipeline,
+            collide_pipeline_wrap,
+            euler_step_pipeline_wrap,
+            advect_pipeline_wrap,
+            part_update_pipeline_wrap,
             field_pipeline,
             particle_pipeline,
             field_pipeline_rgba,
@@ -1695,8 +1731,15 @@ impl GpuSim {
             self.bufs.dye_side = 0;
         }
 
+        // A periodic pair binds the WRAP_ENABLED=1 kernel variants; the
+        // default variants have the wrap logic compiled out.
+        let wrapped = self.settings.edges.wrap_bits() != 0;
         if euler {
-            pass.set_pipeline(&self.euler_step_pipeline);
+            pass.set_pipeline(if wrapped {
+                &self.euler_step_pipeline_wrap
+            } else {
+                &self.euler_step_pipeline
+            });
             for _ in 0..steps {
                 let rot = self.bufs.euler_rot;
                 pass.set_bind_group(0, &self.bufs.euler_bind[rot][0], &[]);
@@ -1706,7 +1749,11 @@ impl GpuSim {
                 self.bufs.euler_rot = (rot + 1) % 3;
             }
         } else {
-            pass.set_pipeline(&self.collide_pipeline);
+            pass.set_pipeline(if wrapped {
+                &self.collide_pipeline_wrap
+            } else {
+                &self.collide_pipeline
+            });
             for _ in 0..steps {
                 pass.set_bind_group(0, &self.bufs.lbm_bind[self.bufs.f_side], &[]);
                 self.dispatch_grid(&mut pass, w, h);
@@ -1716,13 +1763,21 @@ impl GpuSim {
 
         // Dye advection once per frame (also while paused so painted smoke
         // sources appear immediately; dt is 0 then).
-        pass.set_pipeline(&self.advect_pipeline);
+        pass.set_pipeline(if wrapped {
+            &self.advect_pipeline_wrap
+        } else {
+            &self.advect_pipeline
+        });
         pass.set_bind_group(0, &self.bufs.dye_bind[self.bufs.dye_side], &[]);
         self.dispatch_grid(&mut pass, w, h);
         self.bufs.dye_side ^= 1;
 
         if self.settings.particle_count > 0 && !self.settings.paused {
-            pass.set_pipeline(&self.part_update_pipeline);
+            pass.set_pipeline(if wrapped {
+                &self.part_update_pipeline_wrap
+            } else {
+                &self.part_update_pipeline
+            });
             pass.set_bind_group(0, &self.bufs.part_bind, &[]);
             pass.dispatch_workgroups(self.settings.particle_count.div_ceil(256), 1, 1);
         }

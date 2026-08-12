@@ -23,6 +23,12 @@ const CELL_WALL: u32 = 1u;
 const CELL_INLET: u32 = 2u;
 const CELL_OUTLET: u32 = 3u;
 
+// Pipeline-specialization switch: 0 compiles the wrap logic out
+// entirely (the default pipeline every non-periodic scene runs — zero
+// added cost, measured); 1 enables the P.wrap uniform branches. The
+// engine binds the variant by EdgeBcs::wrap_bits (sim.rs).
+override WRAP_ENABLED: u32 = 0u;
+
 const MAX_LATTICE_SPEED: f32 = 0.3;
 
 @group(0) @binding(0) var<uniform> P: SimParams;
@@ -82,8 +88,8 @@ fn collide(@builtin(global_invocation_id) gid: vec3u) {
     for (var i = 0u; i < 9u; i++) {
         var sx = i32(gid.x) - E[i].x;
         var sy = i32(gid.y) - E[i].y;
-        if ((P.wrap & 1u) != 0u) { sx = (sx + i32(W)) % i32(W); }
-        if ((P.wrap & 2u) != 0u) { sy = (sy + i32(H)) % i32(H); }
+        if (WRAP_ENABLED != 0u && (P.wrap & 1u) != 0u) { sx = (sx + i32(W)) % i32(W); }
+        if (WRAP_ENABLED != 0u && (P.wrap & 2u) != 0u) { sy = (sy + i32(H)) % i32(H); }
         if (sx < 0 || sx >= i32(W) || sy < 0 || sy >= i32(H)) {
             f[i] = f_in[i * n + idx];
         } else {
@@ -174,8 +180,8 @@ fn collide(@builtin(global_invocation_id) gid: vec3u) {
     var sponge = 0.0;
     if (P.sponge_width > 0.5) {
         var dedge = 4294967295u;
-        if ((P.wrap & 1u) == 0u) { dedge = min(dedge, min(gid.x, W - 1u - gid.x)); }
-        if ((P.wrap & 2u) == 0u) { dedge = min(dedge, min(gid.y, H - 1u - gid.y)); }
+        if (WRAP_ENABLED == 0u || (P.wrap & 1u) == 0u) { dedge = min(dedge, min(gid.x, W - 1u - gid.x)); }
+        if (WRAP_ENABLED == 0u || (P.wrap & 2u) == 0u) { dedge = min(dedge, min(gid.y, H - 1u - gid.y)); }
         if (f32(dedge) < P.sponge_width) {
             let t = 1.0 - f32(dedge) / P.sponge_width;
             sponge = P.sponge_strength * t * t;
