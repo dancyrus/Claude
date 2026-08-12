@@ -15,7 +15,8 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
 2. **Gas properties: combustion-products fluid** (gamma ~1.2,
    a0 ~1620 m/s); widen Euler's `0.2..=2.0` fan range; correct the
    stale CUT entry for the fan cap in `docs/deferred.md`
-   (`sim.rs`, `ui/generators.rs`, `ui/inspector.rs`) — UNCLAIMED
+   (`sim.rs`, `ui/generators.rs`, `ui/inspector.rs`) — IN PROGRESS
+   (`claude/agent-protocol-amendments-ohhfmn`)
 3. **Periodic boundary conditions** — now unblocked; the variant is
    already reserved as v9 discriminant 4 (`lbm.wgsl`, `euler.wgsl`,
    `sim.rs`) — UNCLAIMED
