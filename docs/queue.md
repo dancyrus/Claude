@@ -19,7 +19,8 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
    (`claude/agent-protocol-amendments-ohhfmn`)
 3. **Periodic boundary conditions** — now unblocked; the variant is
    already reserved as v9 discriminant 4 (`lbm.wgsl`, `euler.wgsl`,
-   `sim.rs`) — UNCLAIMED
+   `sim.rs`) — IN PROGRESS
+   (`claude/agent-protocol-amendments-xskax5`)
 4. **Asymmetric manual min/max on color ranges** — now unblocked;
    needs a per-mode offset in `render.wgsl` (`render.wgsl`,
    `ui/legend.rs`) — UNCLAIMED
