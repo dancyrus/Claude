@@ -58,13 +58,13 @@ Per-unit decisions that must not be re-derived live in
   `claude/si-decimal-inch-toggle-x17w11` (off main). All conversion at
   the UI boundary (`ui/units.rs` `fmt_*` out, `InputUnit` adapters
   in); canonical values stay SI. §T2-D.
-- Scene format: **v9** current (v9 ABSORBED v8 at the second track
-  merge — U3's `parent`/`Group` nodes/probes above T2-C's appended
-  `edges`), loads v3+ (v3 lacks solver fields; v4/v5 share a layout;
-  v6 appends `locked`/`hidden`, pre-v6 decodes via the
-  `SketchObjectV5` mirror; v7 appends color ranges; v8 decode-only,
-  pre-v8 via `SketchObjectV7`; older files derive edges from
-  `wind_tunnel`). Decode funnels … → v7 → v8 → v9; bumps start at v10.
+- Scene format: **v10** current (appends Euler `gamma`, queue item 2;
+  v9 ABSORBED v8 at the second track merge — U3's `parent`/`Group`
+  nodes/probes above T2-C's `edges`), loads v3+ (v3 lacks solver
+  fields; v4/v5 share a layout; v6 appends `locked`/`hidden`, pre-v6
+  via the `SketchObjectV5` mirror; v7 appends color ranges; v8/v9
+  decode-only, pre-v8 via `SketchObjectV7`; pre-v9 derives edges from
+  `wind_tunnel`; pre-v10 is air). Funnel … → v9 → v10; bumps at v11.
 - Track-era static debt is fully paid, three folds, no more: T2-A's
   ranges (`Settings.ranges`, v7+), T2-B's probes (`Settings.probes`,
   v8+), T2-D's unit system (`Settings.unit_system` + `Cmd`, NOT

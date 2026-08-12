@@ -512,6 +512,64 @@ impl SceneV9 {
     }
 }
 
+/// Scene file (version 10, current): the v9 layout with the Euler
+/// gamma appended (queue item 2).
+#[derive(Serialize, Deserialize)]
+struct SceneV10 {
+    version: u32,
+    objects: Vec<SketchObject>,
+    wind_tunnel: bool,
+    flow_speed: f32,
+    viscosity: f32,
+    steps_per_frame: u32,
+    domain_width_m: f32,
+    fluid_nu: f32,
+    fluid_rho: f32,
+    ref_width: u32,
+    /// 0 = LBM (incompressible), 1 = Euler (compressible).
+    solver: u32,
+    mach: f32,
+    fluid_a: f32,
+    /// Indexed by `RenderMode as usize`; the Dye entry is unused.
+    ranges: [SceneRange; 4],
+    probes: Vec<SceneProbe>,
+    /// `ProbeQuantity` as its ALL-index (0 Speed … 3 Smoke).
+    probe_quantity: u32,
+    probe_show_plot: bool,
+    /// Edge kinds in `EDGE_NAMES` order (left, right, top, bottom):
+    /// 0 = far field, 1 = inlet, 2 = outlet, 3 = wall, 4 = periodic
+    /// (reserved; loads as far field until it ships).
+    edges: [u32; 4],
+    /// Euler ratio of specific heats; pre-v10 files are air (1.4).
+    gamma: f32,
+}
+
+impl SceneV10 {
+    fn from_v9(s: SceneV9) -> Self {
+        SceneV10 {
+            version: s.version,
+            objects: s.objects,
+            wind_tunnel: s.wind_tunnel,
+            flow_speed: s.flow_speed,
+            viscosity: s.viscosity,
+            steps_per_frame: s.steps_per_frame,
+            domain_width_m: s.domain_width_m,
+            fluid_nu: s.fluid_nu,
+            fluid_rho: s.fluid_rho,
+            ref_width: s.ref_width,
+            solver: s.solver,
+            mach: s.mach,
+            fluid_a: s.fluid_a,
+            ranges: s.ranges,
+            probes: s.probes,
+            probe_quantity: s.probe_quantity,
+            probe_show_plot: s.probe_show_plot,
+            edges: s.edges,
+            gamma: 1.4,
+        }
+    }
+}
+
 fn edge_kind_to_u32(k: EdgeKind) -> u32 {
     match k {
         EdgeKind::FarField => 0,
@@ -542,8 +600,14 @@ const SCENE_V6: u32 = 6;
 const SCENE_V7: u32 = 7;
 /// U3's format, decode-only since the second track merge.
 const SCENE_V8: u32 = 8;
-/// Current (T2-C + U3 merged): v8 absorbed, edge kinds appended.
+/// T2-C + U3 merged: v8 absorbed, edge kinds appended. Decode-only
+/// since queue item 2.
 const SCENE_V9: u32 = 9;
+/// Current (queue item 2): the v9 layout plus the Euler ratio of
+/// specific heats appended — a fluid property (combustion products are
+/// gamma ~1.2), so a save/reload must not quietly turn a scene back
+/// into air.
+const SCENE_V10: u32 = 10;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -561,9 +625,11 @@ struct FluidPreset {
     rho: f32,
     /// Physical sound speed [m/s] (anchors the compressible mode's units).
     a: f32,
+    /// Ratio of specific heats (Euler mode; the LBM path never reads it).
+    gamma: f32,
 }
 
-const FLUID_PRESETS: [FluidPreset; 7] = [
+const FLUID_PRESETS: [FluidPreset; 8] = [
     FluidPreset {
         name: "Still air",
         desc: "No wind — place fans to stir the room.",
@@ -574,6 +640,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         nu: 1.5e-5,
         rho: 1.2,
         a: 343.0,
+        gamma: 1.4,
     },
     FluidPreset {
         name: "Gentle breeze (air)",
@@ -585,6 +652,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         nu: 1.5e-5,
         rho: 1.2,
         a: 343.0,
+        gamma: 1.4,
     },
     FluidPreset {
         name: "Wind tunnel (air)",
@@ -596,6 +664,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         nu: 1.5e-5,
         rho: 1.2,
         a: 343.0,
+        gamma: 1.4,
     },
     FluidPreset {
         name: "Storm (air, high Re)",
@@ -607,6 +676,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         nu: 1.5e-5,
         rho: 1.2,
         a: 343.0,
+        gamma: 1.4,
     },
     FluidPreset {
         name: "Water flume",
@@ -619,6 +689,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         nu: 1.0e-6,
         rho: 998.0,
         a: 1481.0,
+        gamma: 1.4,
     },
     FluidPreset {
         name: "Glycerin / syrup",
@@ -631,6 +702,7 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         nu: 1.19e-3,
         rho: 1260.0,
         a: 1904.0,
+        gamma: 1.4,
     },
     FluidPreset {
         name: "Supersonic tunnel (stylized)",
@@ -644,6 +716,24 @@ const FLUID_PRESETS: [FluidPreset; 7] = [
         nu: 1.5e-5,
         rho: 1.2,
         a: 343.0,
+        gamma: 1.4,
+    },
+    FluidPreset {
+        name: "Combustion products",
+        desc: "Hot rocket-exhaust gas for nozzle studies: gamma 1.2, \
+               sound speed ~1620 m/s. Use the compressible solver to \
+               see shocks and the exhaust plume.",
+        tunnel: true,
+        flow: 0.06,
+        visc: 0.02,
+        steps: Some(16),
+        // ~H2/O2-rich exhaust at ~3300 K, mean molar mass ~12.5 g/mol:
+        // a = sqrt(gamma R T) ~ 1620 m/s; rho at 1 atm ~ 0.05 kg/m^3;
+        // nu = mu/rho with mu ~ 1e-4 Pa s for the hot mixture.
+        nu: 2.2e-3,
+        rho: 0.05,
+        a: 1620.0,
+        gamma: 1.2,
     },
 ];
 
@@ -719,6 +809,8 @@ struct UiSnapshot {
     mode: RenderMode,
     solver: SolverMode,
     mach: f32,
+    /// Euler ratio of specific heats (queue item 2).
+    gamma: f32,
     /// CFL time step of the Euler solver (nondimensional).
     euler_dt: f32,
     /// Inlet-state CFL estimate (see GpuSim::cfl_estimate).
@@ -758,6 +850,8 @@ enum Cmd {
     ResetFlow,
     SetSolver(SolverMode),
     SetMach(f32),
+    /// Euler ratio of specific heats (queue item 2; presets carry it).
+    SetGamma(f32),
     SetWindTunnel(bool),
     /// Set one edge's boundary kind (T2-C; index in `EDGE_NAMES` order).
     SetEdgeBc(usize, EdgeKind),
@@ -1641,6 +1735,7 @@ impl eframe::App for FlowPaintApp {
                 mode: sim.settings.render_mode,
                 solver: sim.settings.solver,
                 mach: sim.settings.mach,
+                gamma: sim.settings.gamma,
                 euler_dt: sim.euler_dt(),
                 cfl: sim.cfl_estimate(),
                 display_gain: sim.settings.display_gain,
@@ -1733,6 +1828,7 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             }
         }
         Cmd::SetMach(v) => sim.settings.mach = v,
+        Cmd::SetGamma(v) => sim.settings.gamma = v,
         Cmd::SetWindTunnel(on) => {
             sim.set_wind_tunnel(on);
             app.model.mark_all_dirty();
@@ -2842,8 +2938,8 @@ impl FlowPaintApp {
         // Commit any in-flight gesture so the file doesn't capture a
         // polyline's cursor-tracking rubber vertex.
         self.finish_gesture();
-        let scene = SceneV9 {
-            version: SCENE_V9,
+        let scene = SceneV10 {
+            version: SCENE_V10,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -2872,6 +2968,7 @@ impl FlowPaintApp {
                 .unwrap_or(0) as u32,
             probe_show_plot: self.probe_ui.show_plot,
             edges: snap.edges.0.map(edge_kind_to_u32),
+            gamma: snap.gamma,
         };
         match bincode::serialize(&scene) {
             Ok(bytes) => {
@@ -2897,7 +2994,7 @@ impl FlowPaintApp {
         } else {
             0
         };
-        if !(SCENE_V3..=SCENE_V9).contains(&version) {
+        if !(SCENE_V3..=SCENE_V10).contains(&version) {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
@@ -2908,22 +3005,27 @@ impl FlowPaintApp {
         // objects decode via the SketchObjectV5 mirror; v7 appends the
         // color ranges; v8 (U3) appends parent links / group nodes and
         // the probe set — pre-v8 objects decode via the SketchObjectV7
-        // mirror; v9 (T2-C, current) appends the edge kinds, derived
-        // from wind_tunnel for anything older. Everything funnels
-        // upward: … → v6 → v7 → v8 → v9.
-        let decoded = if version >= SCENE_V9 {
-            bincode::deserialize::<SceneV9>(&bytes)
+        // mirror; v9 (T2-C) appends the edge kinds, derived from
+        // wind_tunnel for anything older; v10 (queue item 2, current)
+        // appends the Euler gamma — air (1.4) for anything older.
+        // Everything funnels upward: … → v6 → v7 → v8 → v9 → v10.
+        let decoded = if version >= SCENE_V10 {
+            bincode::deserialize::<SceneV10>(&bytes)
+        } else if version >= SCENE_V9 {
+            bincode::deserialize::<SceneV9>(&bytes).map(SceneV10::from_v9)
         } else if version >= SCENE_V8 {
-            bincode::deserialize::<SceneV8>(&bytes).map(SceneV9::from_v8)
+            bincode::deserialize::<SceneV8>(&bytes)
+                .map(|s| SceneV10::from_v9(SceneV9::from_v8(s)))
         } else if version >= SCENE_V7 {
             bincode::deserialize::<SceneV7>(&bytes)
-                .map(|s| SceneV9::from_v8(SceneV8::from_v7(s)))
+                .map(|s| SceneV10::from_v9(SceneV9::from_v8(SceneV8::from_v7(s))))
         } else if version >= SCENE_V6 {
-            bincode::deserialize::<SceneV6>(&bytes)
-                .map(|s| SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(s))))
+            bincode::deserialize::<SceneV6>(&bytes).map(|s| {
+                SceneV10::from_v9(SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(s))))
+            })
         } else if version >= SCENE_V4 {
             bincode::deserialize::<SceneV4>(&bytes).map(|s| {
-                SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
+                SceneV10::from_v9(SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
                     version: s.version,
                     objects: s.objects.into_iter().map(Into::into).collect(),
                     wind_tunnel: s.wind_tunnel,
@@ -2937,11 +3039,11 @@ impl FlowPaintApp {
                     solver: s.solver,
                     mach: s.mach,
                     fluid_a: s.fluid_a,
-                })))
+                }))))
             })
         } else {
             bincode::deserialize::<SceneV3>(&bytes).map(|s| {
-                SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
+                SceneV10::from_v9(SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
                     version: s.version,
                     objects: s.objects.into_iter().map(Into::into).collect(),
                     wind_tunnel: s.wind_tunnel,
@@ -2955,7 +3057,7 @@ impl FlowPaintApp {
                     solver: 0,
                     mach: 1.6,
                     fluid_a: 343.0,
-                })))
+                }))))
             })
         };
         match decoded {
@@ -3030,6 +3132,9 @@ impl FlowPaintApp {
                     SolverMode::Lbm
                 }));
                 cmds.push(Cmd::SetMach(sane_f32(scene.mach, 0.3, 3.0, 1.6)));
+                // Monatomic 5/3 down to hot polyatomic mixtures; pre-v10
+                // files carry the from_v9 default (air, 1.4).
+                cmds.push(Cmd::SetGamma(sane_f32(scene.gamma, 1.05, 1.67, 1.4)));
                 cmds.push(Cmd::SetWindTunnel(scene.wind_tunnel));
                 // After the tunnel preset re-arm: the saved edge set
                 // wins (v9; legacy-derived for older files, where it
@@ -3581,6 +3686,51 @@ mod scene_tests {
         let decoded = EdgeBcs(back.edges.map(edge_kind_from_u32));
         assert_eq!(decoded.0[0], EdgeKind::Inlet);
         assert_eq!(decoded.0[2], EdgeKind::Wall);
+        // And a v9 file funnels into v10 as air: gamma was not in the
+        // format, so the default must be exactly 1.4.
+        let v10 = SceneV10::from_v9(back);
+        assert_eq!(v10.gamma, 1.4);
+    }
+
+    /// v10 (queue item 2) round-trips the appended Euler gamma with the
+    /// whole v9 payload intact — a combustion-products scene must not
+    /// reload as air.
+    #[test]
+    fn v10_roundtrip_persists_gamma() {
+        let mut child: SketchObject = SketchObjectV7::from(v5_obj(21)).into();
+        child.parent = Some(20);
+        let scene = SceneV10 {
+            version: SCENE_V10,
+            objects: vec![child, group_obj(20)],
+            wind_tunnel: true,
+            flow_speed: 0.06,
+            viscosity: 0.02,
+            steps_per_frame: 16,
+            domain_width_m: 1.0,
+            fluid_nu: 2.2e-3,
+            fluid_rho: 0.05,
+            ref_width: 1920,
+            solver: 1,
+            mach: 1.6,
+            fluid_a: 1620.0,
+            ranges: locked_ranges(),
+            probes: vec![SceneProbe { id: 3, pos: [120.0, 240.0] }],
+            probe_quantity: 2,
+            probe_show_plot: true,
+            edges: [1, 2, 3, 0],
+            gamma: 1.2,
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(version, SCENE_V10);
+        let back = bincode::deserialize::<SceneV10>(&bytes).unwrap();
+        assert_eq!(back.gamma, 1.2);
+        assert_eq!(back.fluid_a, 1620.0);
+        assert_eq!(back.objects[0].parent, Some(20));
+        assert_eq!(back.probes.len(), 1);
+        let r = back.ranges[RenderMode::Speed as usize];
+        assert_eq!((r.mode, r.sat_phys, r.map), (1, 12.5, 1));
+        assert_eq!(back.edges, [1, 2, 3, 0]);
     }
 
     /// A v8 FIXTURE (bytes written on the U3 branch pre-merge) loads

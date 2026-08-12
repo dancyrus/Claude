@@ -26,6 +26,18 @@ pub const MARGIN_CHOICES: [(&str, f32); 3] = [
 ];
 pub const DEFAULT_MARGIN_INDEX: usize = 1;
 
+/// Fan drive multiplier range for the UI (queue item 2). LBM keeps the
+/// legacy 2x ceiling — the shader's 0.3-lattice inlet cap binds well
+/// before that, so more range would only lie. Euler's only bound is the
+/// in-kernel Mach-8 inlet clamp, so 8x reaches it from M 1; requests
+/// past the clamp saturate and the Engine readout names the limit.
+pub fn fan_mult_range(solver: SolverMode) -> std::ops::RangeInclusive<f32> {
+    match solver {
+        SolverMode::Lbm => 0.2..=2.0,
+        SolverMode::Euler => 0.2..=8.0,
+    }
+}
+
 pub const PARTICLE_CHOICES: [(&str, u32); 4] = [
     ("100 k", 100_000),
     ("500 k", 500_000),
@@ -456,6 +468,9 @@ pub struct Settings {
     pub solver: SolverMode,
     /// Euler mode: inlet Mach number (freestream speed / sound speed).
     pub mach: f32,
+    /// Euler mode: ratio of specific heats (queue item 2). Air 1.4;
+    /// combustion products ~1.2. The LBM path never reads it.
+    pub gamma: f32,
     pub flow_speed: f32,   // lattice inlet speed
     pub viscosity: f32,    // lattice kinematic viscosity
     pub steps_per_frame: u32,
@@ -496,6 +511,7 @@ impl Default for Settings {
             edges: EdgeBcs::WIND_TUNNEL,
             solver: SolverMode::Lbm,
             mach: 1.6,
+            gamma: 1.4,
             flow_speed: 0.09,
             viscosity: 0.015,
             steps_per_frame: 8,
@@ -699,6 +715,11 @@ pub struct GpuSim {
     pub mapping: ViewportMapping,
 
     frame_counter: u32,
+    /// Strongest painted fan drive (|fan_dir.xy|, a multiple of the
+    /// inlet speed) currently in the geometry; rescanned by
+    /// `flush_geometry`. Feeds the Euler CFL envelope in `euler_dt`
+    /// (queue item 2: the Euler fan range now exceeds the legacy 2x).
+    max_fan_env: f32,
     /// mach * euler_dt as of the last frame that wrote the velocity
     /// buffer (see render_inlet_speed).
     euler_render_ref: f32,
@@ -1087,6 +1108,7 @@ impl GpuSim {
             settings: Settings::default(),
             mapping: ViewportMapping::default(),
             frame_counter: 0,
+            max_fan_env: 0.0,
             euler_render_ref: 0.1,
             lattice_time: 0.0,
             total_steps: 0.0,
@@ -1299,10 +1321,17 @@ impl GpuSim {
     /// Budgeted for the unsplit 2D update, dt * (Sx + Sy) <= CFL, against
     /// the fastest state the solver DESIGN permits: fans boosted to 2x the
     /// inlet Mach (|u| up to 2*mach) plus post-shock sound speeds up to
-    /// ~1.7 a_inf for M <= 3 — hence 2*mach + 3.5. States beyond that
-    /// envelope are caught by the in-kernel guard instead.
+    /// ~1.7 a_inf for M <= 3 — hence 2*mach + 3.5. Queue item 2 widened
+    /// the Euler fan range past 2x, so the u envelope now follows the
+    /// strongest painted fan (`max_fan_env`), capped by the in-kernel
+    /// Mach-8 inlet clamp; past the legacy design point (u = 6) the
+    /// acoustic margin grows with the jet, since post-shock sound speed
+    /// keeps rising with jet Mach. Scenes with no fan above 2x keep the
+    /// legacy dt exactly. Gust overshoot (up to +45%) and states beyond
+    /// the envelope are caught by the in-kernel guard, as before.
     pub fn euler_dt(&self) -> f32 {
-        0.35 / (2.0 * self.settings.mach.max(0.3) + 3.5)
+        let u_env = (self.max_fan_env.max(2.0) * self.settings.mach.max(0.3)).min(8.0);
+        0.35 / (u_env + 3.5 + (u_env - 6.0).max(0.0))
     }
 
     /// Inlet-state CFL estimate for the status strip. Euler: the Courant
@@ -1495,6 +1524,15 @@ impl GpuSim {
                 bytemuck::cast_slice(&self.geo.dye_src[a..b]),
             );
         }
+        // Rescan the fan envelope whenever geometry changed: an erase can
+        // lower the maximum, so the dirty rect alone is not enough. Full
+        // pass, but only on edit frames — steady frames never get here.
+        self.max_fan_env = self
+            .geo
+            .fan
+            .iter()
+            .map(|f| (f[0] * f[0] + f[1] * f[1]).sqrt())
+            .fold(0.0f32, f32::max);
     }
 
     // --- Frame encoding (called from the egui paint callback) --------
@@ -1557,7 +1595,7 @@ impl GpuSim {
             let mut ep = EulerParamsRaw {
                 width: w as u32,
                 height: h as u32,
-                gamma: 1.4,
+                gamma: self.settings.gamma,
                 mach: self.settings.mach,
                 dt: dt_e,
                 blend: 0.0,

@@ -146,7 +146,7 @@ impl FlowPaintApp {
                         } else if let Some(id) = self.single_sel() {
                             self.object_panel(ui, id, snap, cmds);
                         } else {
-                            self.defaults_panel(ui, cmds);
+                            self.defaults_panel(ui, snap, cmds);
                         }
                     });
             });
@@ -271,7 +271,13 @@ impl FlowPaintApp {
             changed |= self.engine_group(ui, snap, &mut obj, stamp_fan_mag);
         } else if obj.material == ObjMaterial::Fan {
             changed |= ui
-                .add(egui::Slider::new(&mut obj.fan_mult, 0.2..=2.0).text("fan speed ×"))
+                .add(
+                    egui::Slider::new(
+                        &mut obj.fan_mult,
+                        crate::sim::fan_mult_range(snap.solver),
+                    )
+                    .text("fan speed ×"),
+                )
                 .on_hover_text("Multiplier on the global flow speed")
                 .changed();
             changed |= ui
@@ -751,7 +757,7 @@ impl FlowPaintApp {
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut obj.fan_mult)
-                        .range(0.2..=2.0)
+                        .range(crate::sim::fan_mult_range(snap.solver))
                         .speed(0.01)
                         .suffix(" ×"),
                 )
@@ -830,9 +836,9 @@ impl FlowPaintApp {
         ui.label(
             egui::RichText::new(
                 "The LBM solver limits inlet cells to 0.3 lattice speed. The \
-                 Euler solver limits them at Mach 8, which almost never binds. \
-                 In compressible mode the bell accelerates the jet through the \
-                 throat.",
+                 Euler solver limits them at Mach 8; a strong drive at a high \
+                 inlet Mach can reach that limit. In compressible mode the \
+                 bell accelerates the jet through the throat.",
             )
             .small()
             .weak(),
@@ -841,7 +847,12 @@ impl FlowPaintApp {
     }
 
     /// Defaults applied to newly drawn objects.
-    pub(in crate::app) fn defaults_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+    pub(in crate::app) fn defaults_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        snap: UiSnapshot,
+        cmds: &mut Vec<Cmd>,
+    ) {
         ui.label(super::theme::heading("New objects"));
         let mats: [(ObjMaterial, &str); 4] = [
             (ObjMaterial::Wall, "Solid, no-slip"),
@@ -879,7 +890,11 @@ impl FlowPaintApp {
             .on_hover_text("Off = SolidWorks-style outlines at the set thickness");
         if self.def_material == ObjMaterial::Fan {
             ui.add(
-                egui::Slider::new(&mut self.def_fan_mult, 0.2..=2.0).text("fan speed ×"),
+                egui::Slider::new(
+                    &mut self.def_fan_mult,
+                    crate::sim::fan_mult_range(snap.solver),
+                )
+                .text("fan speed ×"),
             );
             ui.add(
                 egui::Slider::new(&mut self.def_fan_gust, 0.0..=1.0).text("gustiness"),

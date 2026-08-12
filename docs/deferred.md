@@ -85,15 +85,17 @@ at the bottom before adding anything back.
 
 ### Editable chamber-fan speed cap
 - A user-editable field for the nozzle chamber jet's speed limit.
-- **CUT.**
+- **CUT** (entry corrected at queue item 2 — the old text cited the
+  shader freeze, which lifted 2026-08-12).
 - Why: the binding limits are shader constants — LBM
-  `MAX_LATTICE_SPEED = 0.3` (`lbm.wgsl`) binds almost always, Euler's
-  Mach-8 sanity clamp effectively never — and shaders are frozen. The
-  shipped form is a readout naming which layer binds
-  (`ui/inspector.rs`, Engine group), not a field.
-- Unblocks: in principle the shader freeze lifting, but no intent to
-  revisit is recorded anywhere — the cap-is-a-readout design stands on
-  its own.
+  `MAX_LATTICE_SPEED = 0.3` (`lbm.wgsl`) binds almost always; Euler's
+  Mach-8 inlet clamp is now reachable since queue item 2 widened the
+  Euler fan range to 8x. The shipped form is a readout naming which
+  layer binds (`ui/inspector.rs`, Engine group), not a field — that
+  design stands on its own and does not depend on the freeze.
+- Unblocks: nothing pending. The freeze is no longer the blocker; the
+  cap-is-a-readout design is the recorded decision
+  (`docs/unit-decisions.md` §U3, §Queue item 2).
 - Reasoning: `docs/flowpaint-ui-overhaul-plan-v3.md` §Phase 5 (the
   six-clamp table); `docs/ui-inventory.md` item 3;
   `docs/unit-decisions.md` §U3 (clamp layers).

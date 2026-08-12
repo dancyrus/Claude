@@ -544,3 +544,41 @@ Branch `claude/queue-1-ribbon-home-x42vvi`. Files: `ui/ribbon.rs`,
 - No bench: only `ui/ribbon.rs` and `ui/theme.rs` changed; no
   perf-sensitive file (`ui/canvas.rs`, `model.rs`, `geomops.rs`,
   `sim.rs`) touched.
+
+## Queue item 2 (gas properties)
+
+- **Gamma is solver state**: `Settings.gamma` (default 1.4) feeds the
+  existing `P.gamma` uniform in `euler.wgsl` — the shader was already
+  parameterized, so NO shader edit happened. `Cmd::SetGamma` is the
+  only writer; presets carry a `gamma` field; the LBM path never
+  reads it.
+- **Existing presets stay 1.4** — including Water flume and Glycerin,
+  where an ideal-gas gamma is physically meaningless anyway. Changing
+  them would alter saved Euler scenes' results; don't, without an
+  escalated decision.
+- **Combustion products preset**: gamma 1.2, a 1620 m/s (~H2/O2-rich
+  exhaust at ~3300 K, mean molar mass ~12.5 g/mol), rho 0.05 kg/m^3
+  (1 atm), nu 2.2e-3 m^2/s (mu ~1e-4 Pa s over that rho), lattice
+  side 0.06/0.02 with 16 sub-steps (the Supersonic precedent).
+- **Scene v10 = v9 + gamma appended** (decode-only v9 now; pre-v10
+  loads as 1.4 via `SceneV10::from_v9`; load sanity clamp
+  1.05..=1.67). Without it a save/reload silently turned combustion
+  scenes back into air. Bumps start at v11.
+- **Fan drive range is solver-aware** (`sim::fan_mult_range`): LBM
+  keeps 0.2..=2.0 — the 0.3-lattice inlet cap binds far below 2x, so
+  more range would only lie; Euler gets 0.2..=8.0, which reaches the
+  in-kernel Mach-8 inlet clamp from M 1. The Engine readout still
+  names the binding layer; the nozzle auto formula keeps its output
+  (chamber ~M 0.3) and only its Euler clamp widened.
+- **`euler_dt` is now fan-aware**: `GpuSim.max_fan_env` (strongest
+  |fan_dir.xy| in the geometry, rescanned in `flush_geometry` on edit
+  frames only) sets the u envelope, floored at the legacy 2x and
+  capped by the Mach-8 clamp; past the legacy design point (u = 6)
+  the acoustic margin grows 1:1 with the jet. Scenes with no fan
+  above 2x keep the legacy dt BYTE-IDENTICAL — that is the guard
+  against the escalation trigger on solver defaults.
+- **Lane extension, recorded**: the queue named sim.rs, generators,
+  inspector; the preset table, `Cmd`, snapshot and scene IO live in
+  app.rs (unavoidable), and ONE line went into ribbon.rs's preset
+  click (`Cmd::SetGamma`) while item 1 holds that file — kept to a
+  single line to minimize the merge surface.

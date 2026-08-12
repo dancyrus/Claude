@@ -108,7 +108,7 @@ impl FlowPaintApp {
                     let resp = ui
                         .add(
                             egui::DragValue::new(&mut p.fan_mult)
-                                .range(0.2..=2.0)
+                                .range(crate::sim::fan_mult_range(snap.solver))
                                 .speed(0.01)
                                 .suffix(" ×"),
                         )
@@ -227,7 +227,7 @@ fn nozzle_auto_fan_mult(snap: &UiSnapshot, chamber_ratio: f32) -> f32 {
         }
         // Compressible: feed the chamber at ~Mach 0.3 like a real engine —
         // the converging-diverging geometry does the accelerating.
-        SolverMode::Euler => (0.3 / snap.mach.max(0.1)).clamp(0.2, 2.0),
+        SolverMode::Euler => (0.3 / snap.mach.max(0.1)).clamp(0.2, 8.0),
     }
 }
 

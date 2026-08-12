@@ -373,6 +373,7 @@ impl FlowPaintApp {
                                 }
                                 cmds.push(Cmd::SetFlowSpeed(p.flow));
                                 cmds.push(Cmd::SetViscosity(p.visc));
+                                cmds.push(Cmd::SetGamma(p.gamma));
                                 // Presets own the sub-step count too, so
                                 // e.g. Supersonic's 16 steps don't leak
                                 // into the next regime.
