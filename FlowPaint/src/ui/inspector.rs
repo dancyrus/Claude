@@ -195,6 +195,9 @@ impl FlowPaintApp {
             Shape::Ellipse { .. } => "Ellipse",
             Shape::Stamp { .. } => "Generated part",
             Shape::Group { .. } => "Group", // routed to group_panel
+            Shape::Arc { .. } => "Arc",
+            Shape::Spline { closed: true, .. } => "Closed spline",
+            Shape::Spline { .. } => "Spline",
         };
         ui.label(super::theme::heading(format!("Object — {kind}")));
 
@@ -203,7 +206,10 @@ impl FlowPaintApp {
         // what a fill tool needs to be").
         let can_fill = matches!(
             obj.shape,
-            Shape::Rect { .. } | Shape::Ellipse { .. } | Shape::Poly { closed: true, .. }
+            Shape::Rect { .. }
+                | Shape::Ellipse { .. }
+                | Shape::Poly { closed: true, .. }
+                | Shape::Spline { closed: true, .. }
         );
         let ps = self.phys_cache;
 

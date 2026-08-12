@@ -150,6 +150,17 @@ pub enum Shape {
     /// Children reference it via `SketchObject::parent`. NOTE: appended
     /// last so bincode variant indices of older scene files hold.
     Group { t: [f32; 2], rot: f32, scale: f32 },
+    /// Circular arc (queue item 8): centre, radius, start angle and a
+    /// SIGNED sweep, radians (positive = counter-clockwise in cell
+    /// space). Similarity transforms keep circles circular — the same
+    /// fact that pinned group scaling to uniform at U3. Appended after
+    /// `Group` so every older file's variant indices hold; files that
+    /// may contain one save as scene v11.
+    Arc { c: [f32; 2], r: f32, start: f32, sweep: f32 },
+    /// Catmull-Rom spline through `pts` (queue item 8): the stored
+    /// points stay the live, draggable truth; curve samples are derived
+    /// on demand and never persisted. Appended after `Arc`.
+    Spline { pts: Vec<[f32; 2]>, closed: bool },
 }
 
 impl Shape {
@@ -160,6 +171,109 @@ impl Shape {
             _ => Sim2::IDENTITY,
         }
     }
+}
+
+/// Sample an arc into a chain of points, adaptively: roughly one point
+/// per 1.5 cells of arc length, clamped so a tiny arc still draws round
+/// (8) and a huge one stays bounded (256). Shared by every consumer —
+/// rasterizer, hit tests, eraser conversion — so they all see the same
+/// curve.
+pub fn sample_arc(c: [f32; 2], r: f32, start: f32, sweep: f32) -> Vec<[f32; 2]> {
+    let len = (r.abs() * sweep.abs()).max(1e-3);
+    let n = ((len / 1.5).ceil() as usize).clamp(8, 256);
+    (0..=n)
+        .map(|i| {
+            let a = start + sweep * (i as f32 / n as f32);
+            [c[0] + r * a.cos(), c[1] + r * a.sin()]
+        })
+        .collect()
+}
+
+/// Circle through three points → (centre, radius, start, sweep), the
+/// sweep signed so the arc runs a → mid → b. `None` when the points
+/// are (near-)collinear or the fit degenerates — callers keep the old
+/// geometry in that case.
+pub fn arc_from_three(
+    a: [f32; 2],
+    mid: [f32; 2],
+    b: [f32; 2],
+) -> Option<([f32; 2], f32, f32, f32)> {
+    let d = 2.0
+        * (a[0] * (mid[1] - b[1]) + mid[0] * (b[1] - a[1]) + b[0] * (a[1] - mid[1]));
+    if d.abs() < 1e-6 {
+        return None;
+    }
+    let sq = |p: [f32; 2]| p[0] * p[0] + p[1] * p[1];
+    let ux = (sq(a) * (mid[1] - b[1]) + sq(mid) * (b[1] - a[1]) + sq(b) * (a[1] - mid[1])) / d;
+    let uy = (sq(a) * (b[0] - mid[0]) + sq(mid) * (a[0] - b[0]) + sq(b) * (mid[0] - a[0])) / d;
+    let r = ((a[0] - ux).powi(2) + (a[1] - uy).powi(2)).sqrt();
+    if !r.is_finite() || !(0.25..=1e6).contains(&r) {
+        return None;
+    }
+    let ang = |p: [f32; 2]| (p[1] - uy).atan2(p[0] - ux);
+    let tau = std::f32::consts::TAU;
+    // CCW distance from `from` to `to` in [0, tau).
+    let ccw = |from: f32, to: f32| {
+        let mut dd = to - from;
+        while dd < 0.0 {
+            dd += tau;
+        }
+        dd % tau
+    };
+    let (sa, ma, ba) = (ang(a), ang(mid), ang(b));
+    let sweep_ccw = ccw(sa, ba);
+    let sweep = if ccw(sa, ma) <= sweep_ccw { sweep_ccw } else { sweep_ccw - tau };
+    if sweep.abs() < 1e-3 {
+        return None;
+    }
+    Some(([ux, uy], r, sa, sweep))
+}
+
+/// Sample a Catmull-Rom spline through `pts` (8 segments per span,
+/// centripetal-free uniform parameterization — visibly smooth at cell
+/// scale without the degenerate-knot bookkeeping). Endpoints are
+/// clamped (open) or wrapped (closed); fewer than 3 points fall back
+/// to the polyline itself.
+pub fn sample_spline(pts: &[[f32; 2]], closed: bool) -> Vec<[f32; 2]> {
+    let n = pts.len();
+    if n < 3 {
+        return pts.to_vec();
+    }
+    let at = |i: isize| -> [f32; 2] {
+        if closed {
+            pts[i.rem_euclid(n as isize) as usize]
+        } else {
+            pts[i.clamp(0, n as isize - 1) as usize]
+        }
+    };
+    let spans = if closed { n } else { n - 1 };
+    let mut out = Vec::with_capacity(spans * 8 + 1);
+    for s in 0..spans {
+        let (p0, p1, p2, p3) = (
+            at(s as isize - 1),
+            at(s as isize),
+            at(s as isize + 1),
+            at(s as isize + 2),
+        );
+        let steps = 8;
+        let last_span = s + 1 == spans;
+        let top = if last_span && !closed { steps } else { steps - 1 };
+        for k in 0..=top {
+            let t = k as f32 / steps as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            let f = |a: f32, b: f32, c2: f32, d: f32| {
+                0.5 * ((2.0 * b)
+                    + (-a + c2) * t
+                    + (2.0 * a - 5.0 * b + 4.0 * c2 - d) * t2
+                    + (-a + 3.0 * b - 3.0 * c2 + d) * t3)
+            };
+            out.push([
+                f(p0[0], p1[0], p2[0], p3[0]),
+                f(p0[1], p1[1], p2[1], p3[1]),
+            ]);
+        }
+    }
+    out
 }
 
 /// One sketch object: shape + physical properties.
@@ -253,6 +367,28 @@ impl SketchObject {
             // A group has no geometry; its world footprint is the
             // subtree's (SketchModel::world_bounds).
             Shape::Group { .. } => return GridRect { x0: 0, y0: 0, x1: 0, y1: 0 },
+            Shape::Arc { c, r, start, sweep } => {
+                let mut min = [f32::MAX, f32::MAX];
+                let mut max = [f32::MIN, f32::MIN];
+                for p in sample_arc(m.apply(*c), *r * m.s, *start + m.rot, *sweep) {
+                    min = [min[0].min(p[0]), min[1].min(p[1])];
+                    max = [max[0].max(p[0]), max[1].max(p[1])];
+                }
+                (min, max)
+            }
+            Shape::Spline { pts, closed } => {
+                if pts.is_empty() {
+                    return GridRect { x0: 0, y0: 0, x1: 0, y1: 0 };
+                }
+                let mut min = [f32::MAX, f32::MAX];
+                let mut max = [f32::MIN, f32::MIN];
+                for p in sample_spline(pts, *closed) {
+                    let p = m.apply(p);
+                    min = [min[0].min(p[0]), min[1].min(p[1])];
+                    max = [max[0].max(p[0]), max[1].max(p[1])];
+                }
+                (min, max)
+            }
         };
         GridRect {
             x0: (min[0] - pad) as i32,
@@ -279,7 +415,19 @@ impl SketchObject {
                 [c[0] / pts.len() as f32, c[1] / pts.len() as f32]
             }
             Shape::Rect { c, .. } | Shape::Ellipse { c, .. } | Shape::Stamp { c, .. } => *c,
+            Shape::Arc { c, .. } => *c,
             Shape::Group { t, .. } => *t,
+            Shape::Spline { pts, .. } => {
+                if pts.is_empty() {
+                    return [0.0, 0.0];
+                }
+                let mut c = [0.0f32, 0.0];
+                for p in pts {
+                    c[0] += p[0];
+                    c[1] += p[1];
+                }
+                [c[0] / pts.len() as f32, c[1] / pts.len() as f32]
+            }
         }
     }
 
@@ -297,13 +445,22 @@ impl SketchObject {
                     p[1] += d[1];
                 }
             }
-            Shape::Rect { c, .. } | Shape::Ellipse { c, .. } | Shape::Stamp { c, .. } => {
+            Shape::Rect { c, .. }
+            | Shape::Ellipse { c, .. }
+            | Shape::Stamp { c, .. }
+            | Shape::Arc { c, .. } => {
                 c[0] += d[0];
                 c[1] += d[1];
             }
             Shape::Group { t, .. } => {
                 t[0] += d[0];
                 t[1] += d[1];
+            }
+            Shape::Spline { pts, .. } => {
+                for p in pts {
+                    p[0] += d[0];
+                    p[1] += d[1];
+                }
             }
         }
     }
@@ -343,6 +500,15 @@ impl SketchObject {
             Shape::Group { t, rot: g_rot, .. } => {
                 rot(t);
                 *g_rot += da;
+            }
+            Shape::Arc { c, start, .. } => {
+                rot(c);
+                *start += da;
+            }
+            Shape::Spline { pts, .. } => {
+                for p in pts {
+                    rot(p);
+                }
             }
         }
         self.fan_angle += da;
@@ -401,6 +567,15 @@ impl SketchObject {
                 sc(t);
                 *scale = (*scale * f).clamp(1e-3, 1e3);
             }
+            Shape::Arc { c, r, .. } => {
+                sc(c);
+                *r *= f;
+            }
+            Shape::Spline { pts, .. } => {
+                for p in pts {
+                    sc(p);
+                }
+            }
         }
     }
 
@@ -438,6 +613,16 @@ impl SketchObject {
                 *t = m.apply(*t);
                 *rot += m.rot;
                 *scale *= m.s;
+            }
+            Shape::Arc { c, r, start, .. } => {
+                *c = m.apply(*c);
+                *r *= m.s;
+                *start += m.rot;
+            }
+            Shape::Spline { pts, .. } => {
+                for p in pts {
+                    *p = m.apply(*p);
+                }
             }
         }
         self.thickness *= m.s;
@@ -488,6 +673,18 @@ impl SketchObject {
                 *t = m.apply(g.apply(m.apply([0.0, 0.0])));
                 *rot = -*rot;
             }
+            Shape::Arc { c, start, sweep, .. } => {
+                // A point at angle x maps to 2θ − x, so the start
+                // conjugates and the sweep flips direction.
+                *c = m.apply(*c);
+                *start = two_theta - *start;
+                *sweep = -*sweep;
+            }
+            Shape::Spline { pts, .. } => {
+                for p in pts {
+                    *p = m.apply(*p);
+                }
+            }
         }
         // A reflection is an isometry: thickness holds; the fan aim
         // conjugates like any other stored angle.
@@ -529,6 +726,15 @@ impl SketchObject {
             // their own objects, so the composed world result scales
             // uniformly as intended.
             Shape::Group { t, .. } => sc(t),
+            Shape::Arc { c, r, .. } => {
+                sc(c);
+                *r *= f;
+            }
+            Shape::Spline { pts, .. } => {
+                for p in pts {
+                    sc(p);
+                }
+            }
         }
         self.thickness *= f;
     }
@@ -591,6 +797,29 @@ impl SketchObject {
             // Groups are picked through their members (the model's
             // hit_test maps a member hit to its outermost group).
             Shape::Group { .. } => false,
+            Shape::Arc { c, r, start, sweep } => {
+                let pts = sample_arc(*c, *r, *start, *sweep);
+                (0..pts.len() - 1).any(|i| seg_dist(p, pts[i], pts[i + 1]) <= t)
+            }
+            Shape::Spline { pts, closed } => {
+                if pts.is_empty() {
+                    return false;
+                }
+                if pts.len() == 1 {
+                    return dist(p, pts[0]) <= t;
+                }
+                let s = sample_spline(pts, *closed);
+                if self.filled
+                    && *closed
+                    && s.len() >= 3
+                    && crate::geomops::point_in_polygon(p, &s)
+                {
+                    return true;
+                }
+                let n = s.len();
+                let segs = if *closed { n } else { n - 1 };
+                (0..segs).any(|i| seg_dist(p, s[i], s[(i + 1) % n]) <= t)
+            }
         }
     }
 
@@ -623,6 +852,13 @@ impl SketchObject {
             }
             // Stamps and groups: move/rotate/scale via panel or gizmo.
             Shape::Stamp { .. } | Shape::Group { .. } => Vec::new(),
+            // Arc: start, bulge (mid-arc), end — dragging any re-fits
+            // the circle through the three (set_handle).
+            Shape::Arc { c, r, start, sweep } => {
+                let at = |a: f32| [c[0] + r * a.cos(), c[1] + r * a.sin()];
+                vec![at(*start), at(*start + sweep * 0.5), at(*start + *sweep)]
+            }
+            Shape::Spline { pts, .. } => pts.clone(),
         }
     }
 
@@ -668,6 +904,27 @@ impl SketchObject {
                 *half = new_half;
             }
             Shape::Stamp { .. } | Shape::Group { .. } => {}
+            Shape::Arc { c, r, start, sweep } => {
+                let at = |a: f32| [c[0] + *r * a.cos(), c[1] + *r * a.sin()];
+                let (mut a, mut mid, mut b) =
+                    (at(*start), at(*start + *sweep * 0.5), at(*start + *sweep));
+                match idx {
+                    0 => a = p,
+                    1 => mid = p,
+                    _ => b = p,
+                }
+                if let Some((nc, nr, ns, nw)) = arc_from_three(a, mid, b) {
+                    *c = nc;
+                    *r = nr;
+                    *start = ns;
+                    *sweep = nw;
+                }
+            }
+            Shape::Spline { pts, .. } => {
+                if let Some(v) = pts.get_mut(idx) {
+                    *v = p;
+                }
+            }
         }
     }
 
@@ -707,6 +964,22 @@ impl SketchObject {
                 (0..n).any(|i| seg_hits(pt(i), pt((i + 1) % n)))
             }
             Shape::Group { .. } => false, // early-returned above
+            Shape::Arc { c, r, start, sweep } => {
+                let pts = sample_arc(*c, *r, *start, *sweep);
+                (0..pts.len() - 1).any(|i| seg_hits(pts[i], pts[i + 1]))
+            }
+            Shape::Spline { pts, closed } => {
+                if pts.is_empty() {
+                    return false;
+                }
+                if pts.len() == 1 {
+                    return point_in_aabb(pts[0], min, max);
+                }
+                let s = sample_spline(pts, *closed);
+                let n = s.len();
+                let segs = if *closed { n } else { n - 1 };
+                (0..segs).any(|i| seg_hits(s[i], s[(i + 1) % n]))
+            }
         };
         // Containment fallbacks: band inside a filled shape, or shape
         // centre inside a band larger than the outline sampling caught.
@@ -1860,6 +2133,86 @@ impl SketchModel {
 
 // --- Object rasterizers (all clipped to `clip`, full-grid coords) ----
 
+/// Shared open/closed chain rasterizer: single point → dot, filled
+/// closed ring → even-odd scanline (thickness ignored, like filled
+/// Rect/Ellipse — U4), otherwise capsule per segment. Polys pass their
+/// stored vertices; arcs and splines pass their curve samples, so a
+/// chained Fan blows along the curve exactly as drawn.
+fn rasterize_chain(
+    geo: &mut Geometry,
+    obj: &SketchObject,
+    pts: &[[f32; 2]],
+    closed: bool,
+    clip: GridRect,
+    m: i32,
+    t_r: f32,
+) {
+    let mf = m as f32;
+    let n = pts.len();
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        rasterize_capsule(
+            geo,
+            obj,
+            [pts[0][0] + mf, pts[0][1] + mf],
+            [pts[0][0] + mf, pts[0][1] + mf],
+            t_r,
+            clip,
+        );
+        return;
+    }
+    if obj.filled && closed && n >= 3 {
+        // Filled ring: even-odd scanline over the cell centres.
+        let rect = obj.bounds();
+        let rect = GridRect {
+            x0: rect.x0 + m,
+            y0: rect.y0 + m,
+            x1: rect.x1 + m,
+            y1: rect.y1 + m,
+        }
+        .intersect(clip);
+        let w = geo.w;
+        let mut write = cell_writer(geo, obj);
+        let mut xs: Vec<f32> = Vec::with_capacity(8);
+        for y in rect.y0..rect.y1 {
+            let yc = y as f32 + 0.5 - mf;
+            xs.clear();
+            for i in 0..n {
+                let a = pts[i];
+                let b = pts[(i + 1) % n];
+                if (a[1] <= yc) != (b[1] <= yc) {
+                    xs.push(a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1]));
+                }
+            }
+            xs.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            for pair in xs.chunks_exact(2) {
+                // Cells whose centre lies inside the span.
+                let x0 = ((pair[0] + mf - 0.5).ceil() as i32).max(rect.x0);
+                let x1 = ((pair[1] + mf - 0.5).floor() as i32).min(rect.x1 - 1);
+                for x in x0..=x1 {
+                    write((y as usize) * w + x as usize, None);
+                }
+            }
+        }
+        return;
+    }
+    let segs = if closed { n } else { n.saturating_sub(1) };
+    for i in 0..segs {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        rasterize_capsule(
+            geo,
+            obj,
+            [a[0] + mf, a[1] + mf],
+            [b[0] + mf, b[1] + mf],
+            t_r,
+            clip,
+        );
+    }
+}
+
 fn cell_writer<'a>(
     geo: &'a mut Geometry,
     obj: &'a SketchObject,
@@ -1964,68 +2317,15 @@ fn rasterize_object(geo: &mut Geometry, obj: &SketchObject, clip: GridRect, m: i
             );
         }
         Shape::Poly { pts, closed } => {
-            let n = pts.len();
-            if n == 1 {
-                rasterize_capsule(
-                    geo,
-                    obj,
-                    [pts[0][0] + mf, pts[0][1] + mf],
-                    [pts[0][0] + mf, pts[0][1] + mf],
-                    t_r,
-                    clip,
-                );
-                return;
-            }
-            if obj.filled && *closed && n >= 3 {
-                // Filled polygon: even-odd scanline over the cell
-                // centres (thickness is ignored, like filled
-                // Rect/Ellipse — U4).
-                let rect = obj.bounds();
-                let rect = GridRect {
-                    x0: rect.x0 + m,
-                    y0: rect.y0 + m,
-                    x1: rect.x1 + m,
-                    y1: rect.y1 + m,
-                }
-                .intersect(clip);
-                let w = geo.w;
-                let mut write = cell_writer(geo, obj);
-                let mut xs: Vec<f32> = Vec::with_capacity(8);
-                for y in rect.y0..rect.y1 {
-                    let yc = y as f32 + 0.5 - mf;
-                    xs.clear();
-                    for i in 0..n {
-                        let a = pts[i];
-                        let b = pts[(i + 1) % n];
-                        if (a[1] <= yc) != (b[1] <= yc) {
-                            xs.push(a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1]));
-                        }
-                    }
-                    xs.sort_by(|p, q| p.partial_cmp(q).unwrap());
-                    for pair in xs.chunks_exact(2) {
-                        // Cells whose centre lies inside the span.
-                        let x0 = ((pair[0] + mf - 0.5).ceil() as i32).max(rect.x0);
-                        let x1 = ((pair[1] + mf - 0.5).floor() as i32).min(rect.x1 - 1);
-                        for x in x0..=x1 {
-                            write((y as usize) * w + x as usize, None);
-                        }
-                    }
-                }
-                return;
-            }
-            let segs = if *closed { n } else { n.saturating_sub(1) };
-            for i in 0..segs {
-                let a = pts[i];
-                let b = pts[(i + 1) % n];
-                rasterize_capsule(
-                    geo,
-                    obj,
-                    [a[0] + mf, a[1] + mf],
-                    [b[0] + mf, b[1] + mf],
-                    t_r,
-                    clip,
-                );
-            }
+            rasterize_chain(geo, obj, pts, *closed, clip, m, t_r);
+        }
+        Shape::Arc { c, r, start, sweep } => {
+            let pts = sample_arc(*c, *r, *start, *sweep);
+            rasterize_chain(geo, obj, &pts, false, clip, m, t_r);
+        }
+        Shape::Spline { pts, closed } => {
+            let sampled = sample_spline(pts, *closed);
+            rasterize_chain(geo, obj, &sampled, *closed, clip, m, t_r);
         }
         Shape::Rect { c, half, angle } => {
             if obj.filled {
@@ -2787,5 +3087,134 @@ mod tests {
         assert!((geo_cpy.fan[fi][0] - 0.5).abs() < 1e-4);
         assert!((geo_cpy.fan[fi][1] + 0.25).abs() < 1e-4);
         let _ = keep;
+    }
+
+    /// Arc geometry invariants (queue item 8): the 3-point fit passes
+    /// through all three points with the sweep running through the
+    /// middle one, and a double reflection restores the original.
+    #[test]
+    fn arc_fit_and_reflect_roundtrip() {
+        let (a, mid, b) = ([10.0f32, 0.0], [0.0, 10.0], [-10.0, 0.0]);
+        let (c, r, start, sweep) = arc_from_three(a, mid, b).expect("fit");
+        assert!((c[0]).abs() < 1e-3 && (c[1]).abs() < 1e-3);
+        assert!((r - 10.0).abs() < 1e-3);
+        let at = |t: f32| [c[0] + r * (start + sweep * t).cos(), c[1] + r * (start + sweep * t).sin()];
+        let d = |p: [f32; 2], q: [f32; 2]| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+        assert!(d(at(0.0), a) < 1e-2);
+        assert!(d(at(0.5), mid) < 1e-2);
+        assert!(d(at(1.0), b) < 1e-2);
+        // Collinear points refuse instead of producing a huge circle.
+        assert!(arc_from_three([0.0, 0.0], [5.0, 0.0], [10.0, 0.0]).is_none());
+
+        // Reflecting an Arc object twice across the same line restores
+        // its endpoints (reflection is an involution).
+        let mut o = SketchObject {
+            id: 1,
+            shape: Shape::Arc { c: [30.0, 40.0], r: 12.0, start: 0.7, sweep: 1.9 },
+            material: ObjMaterial::Wall,
+            thickness: 2.0,
+            filled: false,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: None,
+        };
+        let ends = |o: &SketchObject| o.handles();
+        let before = ends(&o);
+        let m = Reflect2::across([0.0, 0.0], [1.0, 2.0]).expect("line");
+        o.reflect(m);
+        o.reflect(m);
+        let after = ends(&o);
+        for (p, q) in before.iter().zip(after.iter()) {
+            assert!(d(*p, *q) < 1e-2, "{p:?} vs {q:?}");
+        }
+    }
+
+    /// Spline sampling passes through every stored point (Catmull-Rom
+    /// interpolates, it does not approximate) and the closed form wraps.
+    #[test]
+    fn spline_samples_interpolate_control_points() {
+        let pts = vec![[0.0f32, 0.0], [20.0, 10.0], [40.0, -10.0], [60.0, 5.0]];
+        let sam = sample_spline(&pts, false);
+        let d = |p: [f32; 2], q: [f32; 2]| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+        for cp in &pts {
+            assert!(
+                sam.iter().any(|sp| d(*sp, *cp) < 1e-3),
+                "control point {cp:?} not on the sampled curve"
+            );
+        }
+        assert!(d(sam[0], pts[0]) < 1e-6);
+        assert!(d(*sam.last().unwrap(), pts[3]) < 1e-3);
+        let closed = sample_spline(&pts, true);
+        assert_eq!(closed.len(), pts.len() * 8);
+    }
+
+    /// Arcs and splines rasterize into the solver grid (queue item 8):
+    /// an arc lays wall cells along its curve — not along its chord —
+    /// and a filled closed spline fills its interior.
+    #[test]
+    fn arc_and_spline_rasterize_to_walls() {
+        let mut m = SketchModel::default();
+        let id = m.fresh_id();
+        m.add(SketchObject {
+            id,
+            // Upper semicircle, radius 12 around (24, 24).
+            shape: Shape::Arc { c: [24.0, 24.0], r: 12.0, start: 0.0, sweep: std::f32::consts::PI },
+            material: ObjMaterial::Wall,
+            thickness: 2.0,
+            filled: false,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: None,
+        });
+        let mut geo = Geometry::new(48, 48);
+        m.rasterize_region(&mut geo, GridRect::full(48, 48), 0, false);
+        // On the curve (apex of the semicircle):
+        assert_eq!(geo.cell[(24 + 12) * 48 + 24], CELL_WALL, "apex");
+        // On the chord midpoint — must be FLUID (an arc is not a line):
+        assert_eq!(geo.cell[24 * 48 + 24], CELL_FLUID, "chord midpoint");
+        // Ends:
+        assert_eq!(geo.cell[24 * 48 + 36], CELL_WALL, "start end");
+        assert_eq!(geo.cell[24 * 48 + 12], CELL_WALL, "far end");
+
+        // A filled closed spline fills its interior.
+        let mut m2 = SketchModel::default();
+        let id2 = m2.fresh_id();
+        m2.add(SketchObject {
+            id: id2,
+            shape: Shape::Spline {
+                pts: vec![[24.0, 8.0], [40.0, 24.0], [24.0, 40.0], [8.0, 24.0]],
+                closed: true,
+            },
+            material: ObjMaterial::Wall,
+            thickness: 2.0,
+            filled: true,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: None,
+        });
+        let mut geo2 = Geometry::new(48, 48);
+        m2.rasterize_region(&mut geo2, GridRect::full(48, 48), 0, false);
+        assert_eq!(geo2.cell[24 * 48 + 24], CELL_WALL, "spline interior");
+        assert_eq!(geo2.cell[2 * 48 + 2], CELL_FLUID, "outside stays fluid");
+        // The curve bulges OUTSIDE the control quad (Catmull-Rom
+        // overshoot): the fill follows the curve, so a point just
+        // outside the quad's edge midpoint is still wall.
+        let walls = geo2.cell.iter().filter(|&&c| c == CELL_WALL).count();
+        assert!(walls > 400, "filled spline area {walls}");
     }
 }

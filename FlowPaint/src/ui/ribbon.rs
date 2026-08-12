@@ -179,6 +179,8 @@ impl FlowPaintApp {
             Tool::Ellipse => ph::CIRCLE,
             Tool::Polyline => ph::POLYGON,
             Tool::Pencil => ph::PENCIL_SIMPLE,
+            Tool::Arc => ph::CIRCLE_HALF_TILT,
+            Tool::Spline => ph::BEZIER_CURVE,
             Tool::Bucket => ph::PAINT_BUCKET,
             Tool::Eraser => ph::ERASER,
             Tool::Measure => ph::RULER,
@@ -197,9 +199,30 @@ impl FlowPaintApp {
 
     fn ribbon_geometry(&mut self, ui: &mut egui::Ui) {
         group(ui, "Sketch tools", |ui| {
-            for (tool, label, key) in Tool::ALL.into_iter().take(6) {
+            for (tool, label, key) in Tool::ALL.into_iter().take(5) {
                 self.tool_button(ui, tool, label, format!("Key: {key}"));
             }
+            // Pencil, Arc, Spline as a compact vertical trio (the
+            // Modify-group precedent): three big buttons would push
+            // Geometry past the 900 px minimum; one column costs about
+            // one button's width.
+            ui.vertical(|ui| {
+                for (tool, icon, label, key) in [
+                    (Tool::Pencil, ph::PENCIL_SIMPLE, "Pencil", "B"),
+                    (Tool::Arc, ph::CIRCLE_HALF_TILT, "Arc", "A"),
+                    (Tool::Spline, ph::BEZIER_CURVE, "Spline", "C"),
+                ] {
+                    let on = self.tool == tool;
+                    if theme::toggle(ui, on, format!("{icon} {label}"))
+                        .on_hover_text(format!("Key: {key}"))
+                        .clicked()
+                        && !on
+                    {
+                        self.finish_gesture();
+                        self.tool = tool;
+                    }
+                }
+            });
         });
         // Compact verticals, not ribbon_buttons: with three more tools
         // the Geometry tab has no horizontal room left at the 900 px

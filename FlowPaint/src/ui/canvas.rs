@@ -354,6 +354,8 @@ impl FlowPaintApp {
                 | Tool::Rect
                 | Tool::Ellipse
                 | Tool::Polyline
+                | Tool::Arc
+                | Tool::Spline
                 | Tool::Measure
                 | Tool::Mirror
         ) || matches!(self.gesture, Gesture::HandleDrag { .. });
@@ -372,16 +374,21 @@ impl FlowPaintApp {
                 let exclude = match &self.gesture {
                     Gesture::DrawShape { id, .. }
                     | Gesture::DrawPoly { id }
+                    | Gesture::ArcChord { id, .. }
+                    | Gesture::ArcBulge { id, .. }
                     | Gesture::HandleDrag { id, .. } => Some(*id),
                     _ => None,
                 };
                 let anchor = match &self.gesture {
                     Gesture::DrawShape { anchor, .. } => Some(*anchor),
                     Gesture::Measure { a, .. } | Gesture::MirrorLine { a, .. } => Some(*a),
+                    Gesture::ArcChord { a, .. } => Some(*a),
                     Gesture::DrawPoly { id } => {
                         self.model.find(*id).and_then(|i| {
                             match &self.model.objects[i].shape {
-                                Shape::Poly { pts, .. } if pts.len() >= 2 => {
+                                Shape::Poly { pts, .. } | Shape::Spline { pts, .. }
+                                    if pts.len() >= 2 =>
+                                {
                                     Some(pts[pts.len() - 2])
                                 }
                                 _ => None,
@@ -446,14 +453,17 @@ impl FlowPaintApp {
             }
         }
 
-        // Live polyline rubber vertex follows the cursor between clicks.
+        // Live polyline/spline rubber vertex follows the cursor between
+        // clicks.
         if let Gesture::DrawPoly { id } = &self.gesture {
             let id = *id;
             if let Some(pos) = response.hover_pos() {
                 let raw = to_cell(pos);
                 let prev = self.model.find(id).and_then(|i| {
                     match &self.model.objects[i].shape {
-                        Shape::Poly { pts, .. } if pts.len() >= 2 => {
+                        Shape::Poly { pts, .. } | Shape::Spline { pts, .. }
+                            if pts.len() >= 2 =>
+                        {
                             Some(pts[pts.len() - 2])
                         }
                         _ => None,
@@ -468,7 +478,9 @@ impl FlowPaintApp {
                     self.snap_active(raw)
                 };
                 self.mutate_live(id, |o| {
-                    if let Shape::Poly { pts, .. } = &mut o.shape {
+                    if let Shape::Poly { pts, .. } | Shape::Spline { pts, .. } =
+                        &mut o.shape
+                    {
                         if let Some(last) = pts.last_mut() {
                             *last = p;
                         }
@@ -477,12 +489,44 @@ impl FlowPaintApp {
             }
         }
 
+        // Arc phase 1: the chord's far end rubber-bands on the cursor.
+        if let Gesture::ArcChord { id, a } = &self.gesture {
+            let (id, a) = (*id, *a);
+            if let Some(pos) = response.hover_pos() {
+                let raw = to_cell(pos);
+                let b = if shift { self.angle_snap(a, raw) } else { self.snap_active(raw) };
+                self.mutate_live(id, |o| {
+                    if let Shape::Line { b: bb, .. } = &mut o.shape {
+                        *bb = b;
+                    }
+                });
+            }
+        }
+
+        // Arc phase 2: the bulge follows the cursor; collinear cursors
+        // fall back to the straight chord so the preview never jumps.
+        if let Gesture::ArcBulge { id, a, b } = &self.gesture {
+            let (id, a, b) = (*id, *a, *b);
+            if let Some(pos) = response.hover_pos() {
+                let mid = self.snap_active(to_cell(pos));
+                match crate::model::arc_from_three(a, mid, b) {
+                    Some((c, r, start, sweep)) => self.mutate_live(id, |o| {
+                        o.shape = Shape::Arc { c, r, start, sweep };
+                    }),
+                    None => self.mutate_live(id, |o| {
+                        o.shape = Shape::Line { a, b };
+                    }),
+                }
+            }
+        }
+
         // --- Presses --------------------------------------------------
 
         if response.drag_started_by(egui::PointerButton::Secondary) {
             match self.tool {
-                // Right-click finishes the polyline, CAD-style.
-                Tool::Polyline => self.finish_gesture(),
+                // Right-click finishes the polyline, CAD-style (and a
+                // spline or an in-progress arc the same way).
+                Tool::Polyline | Tool::Spline | Tool::Arc => self.finish_gesture(),
                 Tool::Select => {
                     if matches!(self.gesture, Gesture::None) {
                         self.deselect_all();
@@ -553,6 +597,63 @@ impl FlowPaintApp {
                         self.model.add(obj);
                         self.gesture = Gesture::DrawPencil { id };
                         self.select_only(id);
+                    }
+                    Tool::Arc => match self.gesture {
+                        Gesture::ArcChord { id, a } => {
+                            let b = if shift {
+                                self.angle_snap(a, raw)
+                            } else {
+                                self.snap_active(raw)
+                            };
+                            if Self::dist(a, b) < 1.5 {
+                                // Zero chord: stay in phase 1.
+                            } else {
+                                self.mutate_live(id, |o| {
+                                    if let Shape::Line { b: bb, .. } = &mut o.shape {
+                                        *bb = b;
+                                    }
+                                });
+                                self.gesture = Gesture::ArcBulge { id, a, b };
+                                self.status =
+                                    "Arc: move to bow the arc, click to place it."
+                                        .into();
+                            }
+                        }
+                        Gesture::ArcBulge { .. } => {
+                            // The hover already shaped the arc; commit.
+                            self.finish_gesture();
+                        }
+                        _ => {
+                            self.finish_gesture();
+                            let a = self.snap_active(raw);
+                            let obj = self.new_object(Shape::Line { a, b: a });
+                            let id = obj.id;
+                            self.model.add(obj);
+                            self.gesture = Gesture::ArcChord { id, a };
+                            self.select_only(id);
+                            self.status =
+                                "Arc: click the other end of the chord.".into();
+                        }
+                    },
+                    Tool::Spline => {
+                        if let Gesture::DrawPoly { id } = &self.gesture {
+                            let id = *id;
+                            self.poly_click(id, raw, shift, handle_r);
+                        } else {
+                            self.finish_gesture();
+                            let p = self.snap_active(raw);
+                            let obj = self.new_object(Shape::Spline {
+                                pts: vec![p, p],
+                                closed: false,
+                            });
+                            let id = obj.id;
+                            self.model.add(obj);
+                            self.gesture = Gesture::DrawPoly { id };
+                            self.select_only(id);
+                            self.status =
+                                "Spline: click to add points, Enter/right-click to                                  finish, click the first point to close."
+                                    .into();
+                        }
                     }
                     Tool::Bucket => {
                         self.finish_gesture();
@@ -818,6 +919,39 @@ impl FlowPaintApp {
                         );
                         if pool.len() < POOL_CAP {
                             pool.push((o.id, aw, bw));
+                        }
+                    }
+                    if *closed {
+                        consider(OsnapKind::Center, ap(o.center()));
+                    }
+                }
+                Shape::Arc { c, r, start, sweep } => {
+                    // Ends and mid-arc snap like vertices; the circle
+                    // centre snaps like an ellipse centre. Segment pool
+                    // entries come from the shared samples so
+                    // intersection snaps land on the drawn curve.
+                    let at = |a: f32| ap([c[0] + r * a.cos(), c[1] + r * a.sin()]);
+                    consider(OsnapKind::Endpoint, at(*start));
+                    consider(OsnapKind::Endpoint, at(*start + *sweep));
+                    consider(OsnapKind::Midpoint, at(*start + *sweep * 0.5));
+                    consider(OsnapKind::Center, ap(*c));
+                    let pts = crate::model::sample_arc(*c, *r, *start, *sweep);
+                    for w in pts.windows(2) {
+                        if pool.len() < POOL_CAP {
+                            pool.push((o.id, ap(w[0]), ap(w[1])));
+                        }
+                    }
+                }
+                Shape::Spline { pts, closed } => {
+                    for p in pts {
+                        consider(OsnapKind::Endpoint, ap(*p));
+                    }
+                    let sam = crate::model::sample_spline(pts, *closed);
+                    let n = sam.len();
+                    let segs = if *closed { n } else { n.saturating_sub(1) };
+                    for k in 0..segs {
+                        if pool.len() < POOL_CAP {
+                            pool.push((o.id, ap(sam[k]), ap(sam[(k + 1) % n])));
                         }
                     }
                     if *closed {
@@ -1213,7 +1347,7 @@ impl FlowPaintApp {
             return;
         };
         let (first, prev, len) = match &self.model.objects[i].shape {
-            Shape::Poly { pts, .. } => (
+            Shape::Poly { pts, .. } | Shape::Spline { pts, .. } => (
                 pts.first().copied().unwrap_or(raw),
                 if pts.len() >= 2 { pts[pts.len() - 2] } else { raw },
                 pts.len(),
@@ -1225,22 +1359,30 @@ impl FlowPaintApp {
         };
         let p = if shift { self.angle_snap(prev, raw) } else { self.snap_active(raw) };
         if len >= 4 && Self::dist(p, first) <= handle_r {
-            // Close the polygon: drop the rubber vertex and mark closed.
+            // Close the ring: drop the rubber vertex and mark closed.
+            let was_spline =
+                matches!(self.model.objects[i].shape, Shape::Spline { .. });
             self.gesture = Gesture::None;
             self.mutate_live(id, |o| {
-                if let Shape::Poly { pts, closed } = &mut o.shape {
+                if let Shape::Poly { pts, closed } | Shape::Spline { pts, closed } =
+                    &mut o.shape
+                {
                     pts.pop();
                     *closed = true;
                 }
             });
             self.model.finalize_last_add(id);
             self.select_only(id);
-            self.status = "Closed the polygon.".into();
+            self.status = if was_spline {
+                "Closed the spline.".into()
+            } else {
+                "Closed the polygon.".into()
+            };
             return;
         }
         // Fix the rubber vertex at p and start the next one.
         self.mutate_live(id, |o| {
-            if let Shape::Poly { pts, .. } = &mut o.shape {
+            if let Shape::Poly { pts, .. } | Shape::Spline { pts, .. } = &mut o.shape {
                 if let Some(last) = pts.last_mut() {
                     *last = p;
                 }
@@ -1665,6 +1807,21 @@ impl FlowPaintApp {
                 fmt_len(ps.len_m((raster.rect.3 - raster.rect.1) as f32 * scale * s))
             ),
             Shape::Group { .. } => String::new(),
+            Shape::Arc { r, sweep, .. } => format!(
+                "R {}   ∠ {}",
+                fmt_len(ps.len_m(*r * s)),
+                fmt_angle(sweep.to_degrees().abs())
+            ),
+            Shape::Spline { pts, closed } => {
+                let sam = crate::model::sample_spline(pts, *closed);
+                let n = sam.len();
+                let segs = if *closed { n } else { n.saturating_sub(1) };
+                let mut l = 0.0;
+                for k in 0..segs {
+                    l += Self::dist(sam[k], sam[(k + 1) % n]);
+                }
+                format!("{} pts   L {}", pts.len(), fmt_len(ps.len_m(l * s)))
+            }
         };
         if dims.is_empty() {
             return;
@@ -1803,6 +1960,24 @@ impl FlowPaintApp {
             }
             Shape::Poly { pts, closed } => {
                 let path: Vec<egui::Pos2> = pts.iter().map(|p| to_screen(*p)).collect();
+                if *closed {
+                    painter.add(egui::Shape::closed_line(path, stroke));
+                } else {
+                    painter.add(egui::Shape::line(path, stroke));
+                }
+            }
+            Shape::Arc { c, r, start, sweep } => {
+                let path: Vec<egui::Pos2> = crate::model::sample_arc(*c, *r, *start, *sweep)
+                    .iter()
+                    .map(|p| to_screen(*p))
+                    .collect();
+                painter.add(egui::Shape::line(path, stroke));
+            }
+            Shape::Spline { pts, closed } => {
+                let path: Vec<egui::Pos2> = crate::model::sample_spline(pts, *closed)
+                    .iter()
+                    .map(|p| to_screen(*p))
+                    .collect();
                 if *closed {
                     painter.add(egui::Shape::closed_line(path, stroke));
                 } else {

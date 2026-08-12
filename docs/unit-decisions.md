@@ -722,3 +722,44 @@ Internal debt from the T2-A/T2-B concurrent tracks, paid. Branch
 - No bench: none of `ui/canvas.rs`, `model.rs`, `geomops.rs`,
   `sim.rs`, or shaders touched — legend/status/units are panel code
   off the per-frame solver path.
+
+## Queue item 8 (arcs and splines)
+
+- **The parametric truth persists; samples are derived.**
+  `Shape::Arc { c, r, start, sweep }` (signed sweep, similarity-safe —
+  the same fact that pinned group scaling to uniform) and
+  `Shape::Spline { pts, closed }` (Catmull-Rom THROUGH the points).
+  Appended after `Group` so every older file's bincode variant
+  indices hold. All consumers share ONE pair of samplers
+  (`model::sample_arc`, ~1.5 cells/step, 8..=256 pts;
+  `model::sample_spline`, 8 steps/span), so hit tests, band select,
+  osnap segments, the rasterizer and the eraser all see the same
+  curve.
+- **`rasterize_chain`** is the old Poly rasterizer body extracted
+  verbatim (point → dot, filled closed ring → even-odd scanline,
+  else capsules per segment); Poly, Arc and Spline all call it. A Fan
+  arc/spline blows along its curve for free.
+- **Eraser follows the Rect/Ellipse precedent**: a miss leaves the
+  shape parametric; a real cut converts the cut pieces to polylines
+  (curve samples). A wholly-interior stroke on a filled closed spline
+  refuses like the polygon case ("spline" joins the refusal list).
+- **Arc editing**: three handles (start, mid-arc, end); dragging any
+  re-fits the circle through the three (`arc_from_three`; collinear
+  drags keep the old geometry). Reflection conjugates the start
+  (`x → 2θ − x`) and negates the sweep.
+- **Scene v11 is a marker bump**: byte layout IDENTICAL to v10; it
+  only says "objects may contain Arc/Spline", so pre-v11 builds
+  refuse cleanly at the version peek instead of erroring mid-decode.
+  Both decode in the same v10 branch. Bumps start at v12.
+- **Tools**: Arc = chord click, chord click, bulge click (Esc cancels;
+  right-click/Enter commits a real arc, cancels a collinear one).
+  Spline shares `Gesture::DrawPoly`, `poly_click` and the polyline
+  finish/close flow wholesale — the chain-shape gesture logic exists
+  once. Keys: A (arc), C (spline).
+- **Ribbon**: Pencil left the big-button row; Pencil/Arc/Spline are a
+  compact vertical trio in Sketch tools (the Modify precedent) —
+  verified by screenshot at exactly 900x600 under Xvfb, nothing
+  clipped, all three tabs' groups intact.
+- The mode boundary carried from item 6 stands: the perpendicular
+  osnap needs an anchor and arcs/splines contribute endpoints,
+  mid-arc, centres and sampled segments like any chain.

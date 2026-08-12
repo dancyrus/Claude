@@ -86,6 +86,9 @@ impl FlowPaintApp {
                         Shape::Ellipse { .. } => "ellipse",
                         Shape::Stamp { .. } => "generated part",
                         Shape::Group { .. } => unreachable!(),
+                        Shape::Arc { .. } => "arc",
+                        Shape::Spline { closed: true, .. } => "closed spline",
+                        Shape::Spline { .. } => "spline",
                     };
                     (format!("{} #{:02} ({kind})", o.material.label(), o.id), false)
                 }

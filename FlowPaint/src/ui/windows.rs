@@ -57,6 +57,7 @@ impl FlowPaintApp {
                             "S / L / R / E / P / B",
                             "select / line / rect / ellipse / polyline / pencil",
                         ),
+                        ("A / C", "arc (two ends, then bulge) / spline"),
                         ("F / X / M", "fill (paint bucket) / eraser / measure"),
                         ("Ctrl while drawing", "suspend object snaps"),
                         ("Shift+click", "add to / remove from the selection"),
@@ -72,7 +73,7 @@ impl FlowPaintApp {
                         ("Shift on the rotate handle", "snap to the angle-snap step"),
                         ("Shift while drawing", "angle-snapped lines · squares · circles"),
                         ("Alt while drawing", "rect/ellipse from centre"),
-                        ("Enter / right-click", "finish the polyline"),
+                        ("Enter / right-click", "finish the polyline / spline / arc"),
                         ("Esc", "cancel gesture / leave group / deselect"),
                     ] {
                         ui.label(k);

@@ -27,6 +27,12 @@ enum Tool {
     Ellipse,
     Polyline,
     Pencil,
+    /// Three-point circular arc (queue item 8): click both ends, then
+    /// click to set the bulge.
+    Arc,
+    /// Catmull-Rom spline (queue item 8): polyline-style clicks, the
+    /// curve passes through every point.
+    Spline,
     /// Paint bucket: flood-fill an enclosed region, trace the contour,
     /// emit a filled polygon (U4).
     Bucket,
@@ -45,13 +51,15 @@ enum Tool {
 }
 
 impl Tool {
-    const ALL: [(Tool, &'static str, &'static str); 9] = [
+    const ALL: [(Tool, &'static str, &'static str); 11] = [
         (Tool::Select, "Select", "S"),
         (Tool::Line, "Line", "L"),
         (Tool::Rect, "Rectangle", "R"),
         (Tool::Ellipse, "Ellipse", "E"),
         (Tool::Polyline, "Polyline", "P"),
         (Tool::Pencil, "Pencil", "B"),
+        (Tool::Arc, "Arc", "A"),
+        (Tool::Spline, "Spline", "C"),
         (Tool::Bucket, "Fill", "F"),
         (Tool::Eraser, "Eraser", "X"),
         (Tool::Measure, "Measure", "M"),
@@ -126,9 +134,16 @@ enum Gesture {
     None,
     /// Rubber-banding a new line/rect/ellipse from its anchor.
     DrawShape { id: u64, anchor: [f32; 2] },
-    /// Building a polyline; persists across clicks until Enter/right-click.
-    /// The last vertex is a "rubber" point that follows the cursor.
+    /// Building a polyline OR a spline (both point-chain shapes share
+    /// the flow); persists across clicks until Enter/right-click. The
+    /// last vertex is a "rubber" point that follows the cursor.
     DrawPoly { id: u64 },
+    /// Arc, phase 1: the chord — `a` is fixed, the far end rubber-bands
+    /// (the object is a Line while the chord is picked).
+    ArcChord { id: u64, a: [f32; 2] },
+    /// Arc, phase 2: both ends fixed, the bulge follows the cursor (the
+    /// object flips between Arc and the collinear-fallback Line).
+    ArcBulge { id: u64, a: [f32; 2], b: [f32; 2] },
     /// Freehand pencil stroke collecting points.
     DrawPencil { id: u64 },
     /// Moving the whole selection. `before` pairs (id, object at gesture
@@ -603,11 +618,15 @@ const SCENE_V8: u32 = 8;
 /// T2-C + U3 merged: v8 absorbed, edge kinds appended. Decode-only
 /// since queue item 2.
 const SCENE_V9: u32 = 9;
-/// Current (queue item 2): the v9 layout plus the Euler ratio of
-/// specific heats appended — a fluid property (combustion products are
-/// gamma ~1.2), so a save/reload must not quietly turn a scene back
-/// into air.
+/// Queue item 2: the v9 layout plus the Euler ratio of specific heats
+/// appended — a fluid property (combustion products are gamma ~1.2),
+/// so a save/reload must not quietly turn a scene back into air.
 const SCENE_V10: u32 = 10;
+/// Current (queue item 8). SAME byte layout as v10 — the bump only
+/// marks that objects may now contain the appended `Arc`/`Spline`
+/// shape variants, so a pre-v11 build refuses the file cleanly at the
+/// version peek instead of erroring mid-decode on an unknown variant.
+const SCENE_V11: u32 = 11;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -2182,7 +2201,9 @@ impl FlowPaintApp {
             match std::mem::replace(&mut self.gesture, Gesture::None) {
                 Gesture::DrawShape { id, .. }
                 | Gesture::DrawPoly { id }
-                | Gesture::DrawPencil { id } => {
+                | Gesture::DrawPencil { id }
+                | Gesture::ArcChord { id, .. }
+                | Gesture::ArcBulge { id, .. } => {
                     self.model.cancel_last_add(id);
                     self.deselect(id);
                 }
@@ -2343,6 +2364,8 @@ impl FlowPaintApp {
                         "F" => egui::Key::F,
                         "X" => egui::Key::X,
                         "M" => egui::Key::M,
+                        "A" => egui::Key::A,
+                        "C" => egui::Key::C,
                         _ => egui::Key::B,
                     };
                     if i.key_pressed(k) {
@@ -2627,7 +2650,9 @@ impl FlowPaintApp {
             Gesture::DrawPoly { id } => {
                 // Drop the rubber vertex that trails the cursor.
                 self.mutate_live(id, |o| {
-                    if let Shape::Poly { pts, closed } = &mut o.shape {
+                    if let Shape::Poly { pts, closed } | Shape::Spline { pts, closed } =
+                        &mut o.shape
+                    {
                         if !*closed && pts.len() > 1 {
                             pts.pop();
                         }
@@ -2637,7 +2662,9 @@ impl FlowPaintApp {
                     .model
                     .find(id)
                     .map(|i| match &self.model.objects[i].shape {
-                        Shape::Poly { pts, .. } => pts.len() < 2,
+                        Shape::Poly { pts, .. } | Shape::Spline { pts, .. } => {
+                            pts.len() < 2
+                        }
                         _ => false,
                     })
                     .unwrap_or(true);
@@ -2647,6 +2674,27 @@ impl FlowPaintApp {
                 } else {
                     self.model.finalize_last_add(id);
                     self.select_only(id);
+                }
+            }
+            Gesture::ArcChord { id, .. } => {
+                // A chord alone is not an arc; abandoning here cancels.
+                self.model.cancel_last_add(id);
+                self.deselect(id);
+            }
+            Gesture::ArcBulge { id, .. } => {
+                // Commit when a real arc exists; the collinear fallback
+                // (still a Line) cancels like an unfinished chord.
+                let is_arc = self
+                    .model
+                    .find(id)
+                    .map(|i| matches!(self.model.objects[i].shape, Shape::Arc { .. }))
+                    .unwrap_or(false);
+                if is_arc {
+                    self.model.finalize_last_add(id);
+                    self.select_only(id);
+                } else {
+                    self.model.cancel_last_add(id);
+                    self.deselect(id);
                 }
             }
             Gesture::DrawShape { id, .. } => {
@@ -2862,6 +2910,43 @@ impl FlowPaintApp {
                         }
                     }
                 }
+                Shape::Arc { c, r, start, sweep } => {
+                    // Same precedent as Rect/Ellipse: the parametric
+                    // shape survives a miss; a real cut converts the
+                    // cut pieces to polylines (its curve samples).
+                    let pts = crate::model::sample_arc(*c, *r, *start, *sweep);
+                    match clip_path(&pts, false, &caps, half_t, min_len) {
+                        ClipPath::Untouched => {}
+                        ClipPath::Erased => changes.push((id, Vec::new())),
+                        ClipPath::Runs(runs) => {
+                            let frags = self.open_fragments(i, runs);
+                            changes.push((id, frags));
+                        }
+                    }
+                }
+                Shape::Spline { pts: spts, closed } => {
+                    let sam = crate::model::sample_spline(spts, *closed);
+                    if obj.filled && *closed {
+                        match subtract_polygon(&sam, &caps, min_area) {
+                            PolySubtract::Untouched => {}
+                            PolySubtract::Erased => changes.push((id, Vec::new())),
+                            PolySubtract::WouldHole => hole_refusals.push("spline"),
+                            PolySubtract::Pieces(pieces) => {
+                                let frags = self.poly_fragments(i, pieces, true);
+                                changes.push((id, frags));
+                            }
+                        }
+                    } else {
+                        match clip_path(&sam, *closed, &caps, half_t, min_len) {
+                            ClipPath::Untouched => {}
+                            ClipPath::Erased => changes.push((id, Vec::new())),
+                            ClipPath::Runs(runs) => {
+                                let frags = self.open_fragments(i, runs);
+                                changes.push((id, frags));
+                            }
+                        }
+                    }
+                }
                 Shape::Rect { .. } | Shape::Ellipse { .. } => {
                     // Convert to a polygon ring VIRTUALLY; only commit
                     // the conversion when the stroke actually cuts it
@@ -3052,7 +3137,7 @@ impl FlowPaintApp {
         // polyline's cursor-tracking rubber vertex.
         self.finish_gesture();
         let scene = SceneV10 {
-            version: SCENE_V10,
+            version: SCENE_V11,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -3107,7 +3192,7 @@ impl FlowPaintApp {
         } else {
             0
         };
-        if !(SCENE_V3..=SCENE_V10).contains(&version) {
+        if !(SCENE_V3..=SCENE_V11).contains(&version) {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
@@ -3122,6 +3207,8 @@ impl FlowPaintApp {
         // wind_tunnel for anything older; v10 (queue item 2, current)
         // appends the Euler gamma — air (1.4) for anything older.
         // Everything funnels upward: … → v6 → v7 → v8 → v9 → v10.
+        // v11 shares v10's layout (the bump marks the new shape
+        // variants), so both land in the same decode.
         let decoded = if version >= SCENE_V10 {
             bincode::deserialize::<SceneV10>(&bytes)
         } else if version >= SCENE_V9 {
@@ -3399,6 +3486,18 @@ fn object_is_sane(o: &SketchObject) -> bool {
         }
         Shape::Group { t, rot, scale } => {
             finite2(t) && rot.is_finite() && (1e-3..=1e3).contains(scale)
+        }
+        Shape::Arc { c, r, start, sweep } => {
+            finite2(c)
+                && r.is_finite()
+                && (0.1..=1e6).contains(r)
+                && start.is_finite()
+                && sweep.is_finite()
+                && sweep.abs() > 1e-4
+                && sweep.abs() <= std::f32::consts::TAU
+        }
+        Shape::Spline { pts, .. } => {
+            !pts.is_empty() && pts.len() <= 100_000 && pts.iter().all(finite2)
         }
     }
 }
@@ -3844,6 +3943,63 @@ mod scene_tests {
         let r = back.ranges[RenderMode::Speed as usize];
         assert_eq!((r.mode, r.sat_phys, r.map), (1, 12.5, 1));
         assert_eq!(back.edges, [1, 2, 3, 0]);
+    }
+
+    /// v11 (queue item 8) round-trips the appended Arc and Spline
+    /// variants — the parametric truth persists, never curve samples.
+    #[test]
+    fn v11_roundtrip_persists_arcs_and_splines() {
+        let mut arc: SketchObject = SketchObjectV7::from(v5_obj(31)).into();
+        arc.shape = Shape::Arc { c: [50.0, 60.0], r: 22.0, start: 0.4, sweep: -2.1 };
+        let mut spline: SketchObject = SketchObjectV7::from(v5_obj(32)).into();
+        spline.shape = Shape::Spline {
+            pts: vec![[0.0, 0.0], [30.0, 10.0], [60.0, -5.0], [90.0, 20.0]],
+            closed: true,
+        };
+        spline.filled = true;
+        let scene = SceneV10 {
+            version: SCENE_V11,
+            objects: vec![arc, spline],
+            wind_tunnel: true,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 0,
+            mach: 1.6,
+            fluid_a: 343.0,
+            ranges: locked_ranges(),
+            probes: vec![],
+            probe_quantity: 0,
+            probe_show_plot: false,
+            edges: [1, 2, 3, 0],
+            gamma: 1.4,
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        assert_eq!(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            SCENE_V11
+        );
+        let back = bincode::deserialize::<SceneV10>(&bytes).unwrap();
+        assert!(matches!(
+            back.objects[0].shape,
+            Shape::Arc { c: [50.0, 60.0], r, start, sweep }
+                if r == 22.0 && start == 0.4 && sweep == -2.1
+        ));
+        match &back.objects[1].shape {
+            Shape::Spline { pts, closed } => {
+                assert_eq!(pts.len(), 4);
+                assert!(*closed);
+                assert!(back.objects[1].filled);
+            }
+            s => panic!("expected spline, got {:?}", std::mem::discriminant(s)),
+        }
+        // Both survive the load-path sanity filter.
+        assert!(object_is_sane(&back.objects[0]));
+        assert!(object_is_sane(&back.objects[1]));
     }
 
     /// A v8 FIXTURE (bytes written on the U3 branch pre-merge) loads
