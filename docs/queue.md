@@ -23,7 +23,7 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
    (`claude/agent-protocol-amendments-xskax5`)
 4. **Asymmetric manual min/max on color ranges** — now unblocked;
    needs a per-mode offset in `render.wgsl` (`render.wgsl`,
-   `ui/legend.rs`) — UNCLAIMED
+   `ui/legend.rs`) — IN PROGRESS (`claude/queue-4-range-minmax-x42vvi`)
 5. **Plot/legend inversion-factor unification** (`ui/legend.rs`,
    `ui/windows.rs`) — UNCLAIMED
 6. **Object-snap frame-cost measurement**: a bench mode that arms the
