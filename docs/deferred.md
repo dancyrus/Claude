@@ -192,19 +192,6 @@ at the bottom before adding anything back.
   egui upgrade"; API exposure detail in `docs/ui-inventory.md` item 5;
   summary in `CLAUDE.md` §Hard rules.
 
-### Periodic boundary condition
-- A fifth per-edge boundary kind: periodic wraparound.
-- **DEFERRED** (T2-C's word is "reserved").
-- Why: it needs wraparound in the LBM streaming (`lbm.wgsl`) and the
-  Euler stencil clamping (`euler.wgsl`) — a change in both kernels
-  that the shader freeze blocks. Verified on main: `EdgeKind::Periodic`
-  exists, scene v9 reserves discriminant 4 for it, the edges dialog
-  greys it out with a hover explaining the freeze, and the sim treats
-  it as far field until it lands.
-- Unblocks: the shader freeze lifting. No further scene-format bump is
-  needed — the discriminant is already reserved.
-- Reasoning: `docs/unit-decisions.md` §T2-C.
-
 ### Asymmetric manual min/max on color ranges
 - Typing both ends of a color scale, instead of one saturation value
   (Speed's min pinned at 0, Vorticity/Pressure symmetric about 0).
@@ -265,7 +252,12 @@ Verified shipped on main; do not re-add them here:
 - **Colormap picker (T2-A).** Was shader-gated in
   `docs/t2a-color-range.md`, then approved and shipped via the
   `render.wgsl` flags-bit-1 edit (no uniform added or reordered). The
-  one approved exception to the shader freeze.
+  one approved exception to the shader freeze while it held.
+- **Periodic boundary condition.** Deferred by T2-C ("reserved",
+  discriminant 4) behind the shader freeze; shipped as queue item 3
+  once the freeze lifted — per-axis wrap in both kernels plus dye and
+  particles, paired edges enforced by the dialog, no format bump
+  (`docs/unit-decisions.md` §"Periodic boundary conditions").
 - **Measure tool.** Plan v4.1 listed it as "fold in … if it fits"; it
   fit, and shipped in U4 (key M).
 - **Mirror and linear array.** Deferred out of U4 on purpose ("slot it

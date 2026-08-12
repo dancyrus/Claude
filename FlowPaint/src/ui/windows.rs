@@ -102,6 +102,11 @@ impl FlowPaintApp {
                 egui::Grid::new("edge_bc_grid").show(ui, |ui| {
                     for (i, name) in EDGE_NAMES.iter().enumerate() {
                         let cur = snap.edges.0[i];
+                        // Periodic is a property of an opposite PAIR
+                        // (left–right or top–bottom): picking it sets
+                        // both edges, leaving it clears both, so the
+                        // solver never sees an unpaired periodic edge.
+                        let opp = i ^ 1;
                         ui.label(*name);
                         egui::ComboBox::from_id_salt(("edge_bc", i))
                             .width(110.0)
@@ -118,23 +123,40 @@ impl FlowPaintApp {
                                         && cur != k
                                     {
                                         cmds.push(Cmd::SetEdgeBc(i, k));
+                                        if cur == EdgeKind::Periodic
+                                            && snap.edges.0[opp]
+                                                == EdgeKind::Periodic
+                                        {
+                                            cmds.push(Cmd::SetEdgeBc(
+                                                opp,
+                                                EdgeKind::FarField,
+                                            ));
+                                        }
                                     }
                                 }
-                                // Greyed out on purpose: not expressible
-                                // without editing both solver kernels.
-                                ui.add_enabled_ui(false, |ui| {
-                                    theme::toggle(
-                                        ui,
-                                        cur == EdgeKind::Periodic,
-                                        EdgeKind::Periodic.label(),
-                                    )
-                                    .on_disabled_hover_text(
-                                        "Needs the streaming and stencil \
-                                         indexing changed in both solver \
-                                         kernels — blocked while the \
-                                         shader freeze holds.",
-                                    );
-                                });
+                                if theme::toggle(
+                                    ui,
+                                    cur == EdgeKind::Periodic,
+                                    EdgeKind::Periodic.label(),
+                                )
+                                .on_hover_text(
+                                    "Flow that goes out through this edge \
+                                     comes in again through the opposite \
+                                     edge. The two edges of the axis \
+                                     always change together, as one pair.",
+                                )
+                                .clicked()
+                                    && cur != EdgeKind::Periodic
+                                {
+                                    cmds.push(Cmd::SetEdgeBc(
+                                        i,
+                                        EdgeKind::Periodic,
+                                    ));
+                                    cmds.push(Cmd::SetEdgeBc(
+                                        opp,
+                                        EdgeKind::Periodic,
+                                    ));
+                                }
                             });
                         ui.end_row();
                     }
@@ -147,6 +169,25 @@ impl FlowPaintApp {
                         theme::WARN,
                         "Wall edge set: the absorbing sponge layer is off \
                          (a sponged wall is not a wall).",
+                    );
+                }
+                // Wrap is per axis (EdgeBcs::wrap_bits); the sponge is
+                // excluded on a wrapped axis in the kernels.
+                let wrap = snap.edges.wrap_bits();
+                if wrap != 0 {
+                    theme::derived(
+                        ui,
+                        match wrap {
+                            1 => "Periodic pair: left–right. The sponge does \
+                                  not apply on that axis."
+                                .into(),
+                            2 => "Periodic pair: top–bottom. The sponge does \
+                                  not apply on that axis."
+                                .into(),
+                            _ => "Periodic pairs: left–right and top–bottom. \
+                                  The flow wraps on both axes."
+                                .into(),
+                        },
                     );
                 }
                 theme::derived(

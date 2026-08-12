@@ -163,7 +163,7 @@ enum ProbeStageState {
 const PROBE_SLOT_BYTES: u64 = 64;
 
 /// Which solver advances the flow.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SolverMode {
     /// D2Q9 lattice-Boltzmann: incompressible, viscous, low Mach.
     Lbm,
@@ -284,7 +284,9 @@ pub const FIELD_RANGE_DEFAULTS: [FieldRange; 4] = [
 // solvers' zero-gradient handling plus the margin sponge. Inlet, outlet
 // and wall bake 2-cell bands of the existing per-cell types at the true
 // grid edges — the same bands the legacy wind-tunnel rasterizer paints —
-// so neither shader learned anything new.
+// so neither shader learned anything new for them. Periodic (added when
+// the shader freeze lifted) paints no cells: it is per-axis index
+// arithmetic in the kernels, driven by `EdgeBcs::wrap_bits`.
 
 /// What one domain edge does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -299,10 +301,11 @@ pub enum EdgeKind {
     Outlet,
     /// A 2-cell wall band (LBM bounce-back / Euler slip mirror).
     Wall,
-    /// RESERVED (scene v9 discriminant 4, not selectable): periodic wrap
-    /// needs the streaming/stencil indexing changed in BOTH kernels,
-    /// which the shader freeze blocks. Treated as far field if a future
-    /// file carries it, so adding it later needs no format bump.
+    /// Periodic wrap (scene v9 discriminant 4): flow leaving the edge
+    /// re-enters from the opposite one. Only meaningful as an opposite
+    /// pair — wrap engages per axis when BOTH of that axis's edges are
+    /// periodic (`EdgeBcs::wrap_bits`); an unpaired periodic edge acts
+    /// as far field, which is also what pre-lift builds did with it.
     Periodic,
 }
 
@@ -370,6 +373,24 @@ impl EdgeBcs {
     pub fn disables_sponge(self) -> bool {
         self.0.iter().any(|k| matches!(k, EdgeKind::Wall))
     }
+
+    /// The periodic-wrap bits the kernels consume: bit 0 = x axis (left
+    /// AND right periodic), bit 1 = y axis (top AND bottom periodic).
+    /// Wrap is a property of an axis, not an edge — an unpaired periodic
+    /// edge sets no bit and behaves as far field. The sponge is excluded
+    /// per wrapped axis in-shader (a sponged seam is not periodic); the
+    /// wall rule (`disables_sponge`) is untouched.
+    pub fn wrap_bits(self) -> u32 {
+        let e = self.0;
+        let mut w = 0;
+        if e[0] == EdgeKind::Periodic && e[1] == EdgeKind::Periodic {
+            w |= 1;
+        }
+        if e[2] == EdgeKind::Periodic && e[3] == EdgeKind::Periodic {
+            w |= 2;
+        }
+        w
+    }
 }
 
 /// Bake the non-preset edge bands into the geometry layers, clipped to
@@ -387,7 +408,8 @@ pub fn paint_edge_bcs(
 ) {
     use crate::geometry::{CELL_INLET, CELL_OUTLET, CELL_WALL};
     // The preset's bands are the rasterizer's own; all-far-field paints
-    // nothing (Periodic acts as far field until it lands post-freeze).
+    // nothing. Periodic paints nothing either — wrap is index arithmetic
+    // in the kernels (`EdgeBcs::wrap_bits`), not a cell type.
     if edges.is_tunnel_preset()
         || !edges
             .0
@@ -547,7 +569,7 @@ struct SimParamsRaw {
     sponge_strength: f32,
     free_u: [f32; 2],
     time: f32, // lattice steps elapsed (drives fan gusts)
-    _pad1: f32,
+    wrap: u32, // periodic wrap: bit 0 = x axis, bit 1 = y axis
 }
 
 // Matches EulerParams in euler.wgsl.
@@ -565,6 +587,8 @@ struct EulerParamsRaw {
     free_u: [f32; 2],
     time: f32,
     write_render: f32,
+    wrap: u32, // periodic wrap: bit 0 = x axis, bit 1 = y axis
+    _pad2: [u32; 3],
 }
 
 #[repr(C)]
@@ -575,7 +599,7 @@ struct PartParamsRaw {
     count: u32,
     frame: u32,
     dt: f32,
-    _pad0: f32,
+    wrap: u32, // periodic wrap: bit 0 = x axis, bit 1 = y axis
     // Respawn window (full-grid cells): the visible area plus an
     // upstream band, so tracer density on screen doesn't drop as the
     // off-screen margin grows.
@@ -1567,7 +1591,7 @@ impl GpuSim {
                 [0.0, 0.0]
             },
             time: self.lattice_time,
-            _pad1: 0.0,
+            wrap: self.settings.edges.wrap_bits(),
         };
         // Advance after building the params. The wrap period is the
         // common period of the shader's gust sinusoids (all exact
@@ -1604,6 +1628,8 @@ impl GpuSim {
                 free_u,
                 time: time_now,
                 write_render: 0.0,
+                wrap: self.settings.edges.wrap_bits(),
+                _pad2: [0; 3],
             };
             self.queue
                 .write_buffer(&self.euler_uniform_s1, 0, bytemuck::bytes_of(&ep));
@@ -1623,7 +1649,7 @@ impl GpuSim {
             count: self.settings.particle_count,
             frame: self.frame_counter,
             dt: steps as f32,
-            _pad0: 0.0,
+            wrap: self.settings.edges.wrap_bits(),
             spawn_min: [(self.margin - band) as u32, self.margin as u32],
             spawn_max: [
                 (self.margin + self.vis_w) as u32,
@@ -2171,5 +2197,188 @@ mod edge_bc_tests {
     fn legacy_mapping() {
         assert!(EdgeBcs::legacy(true).is_tunnel_preset());
         assert_eq!(EdgeBcs::legacy(false), EdgeBcs::OPEN);
+    }
+
+    /// Periodic wrap engages per axis, and only when both of that
+    /// axis's edges are periodic — an unpaired periodic edge sets no
+    /// bit (it behaves as far field, matching what pre-lift builds did
+    /// with a file that carried discriminant 4).
+    #[test]
+    fn wrap_bits_require_opposite_pairs() {
+        use EdgeKind::*;
+        assert_eq!(EdgeBcs::OPEN.wrap_bits(), 0);
+        assert_eq!(EdgeBcs::WIND_TUNNEL.wrap_bits(), 0);
+        assert_eq!(EdgeBcs([Periodic, Periodic, FarField, FarField]).wrap_bits(), 1);
+        assert_eq!(EdgeBcs([FarField, FarField, Periodic, Periodic]).wrap_bits(), 2);
+        assert_eq!(EdgeBcs([Periodic; 4]).wrap_bits(), 3);
+        // Unpaired: no wrap on that axis.
+        assert_eq!(EdgeBcs([Periodic, Wall, FarField, FarField]).wrap_bits(), 0);
+        assert_eq!(EdgeBcs([FarField, Periodic, Periodic, FarField]).wrap_bits(), 0);
+        // A periodic pair on one axis coexists with bands on the other
+        // (the streamwise-periodic channel: periodic left/right, wall
+        // top/bottom).
+        assert_eq!(EdgeBcs([Periodic, Periodic, Wall, Wall]).wrap_bits(), 1);
+    }
+
+    /// A periodic edge paints no cells — wrap is index arithmetic in
+    /// the kernels, not a band of cell types.
+    #[test]
+    fn periodic_edges_paint_nothing() {
+        let (w, h) = (16usize, 12usize);
+        let mut geo = fresh_geo(w, h);
+        paint_edge_bcs(
+            &mut geo,
+            EdgeBcs([EdgeKind::Periodic; 4]),
+            GridRect::full(w, h),
+            0,
+        );
+        assert!(geo.cell.iter().all(|&c| c == CELL_FLUID));
+    }
+}
+
+// GPU-executing coverage for the periodic wrap: both solver kernels run
+// headless (compute needs no window) against Vulkan — lavapipe on the
+// project's CI hosts — so `cargo test` exercises the real streaming and
+// stencil indexing, not just naga validation. The signal is causal, not
+// numeric: a fan near the LEFT edge blows LEFT, and the pulse can only
+// reach the RIGHTMOST columns within the step budget by crossing the
+// seam. LBM information travels 1 cell/step (acoustics at ~0.577), and
+// the Euler front moves at ~(|u|+a)·dt ≈ 0.14 cells/step, so the budgets
+// below keep the direct path far out of reach while the wrapped path is
+// well inside it. The far-field control run must stay quiet.
+#[cfg(test)]
+mod periodic_gpu_tests {
+    use super::*;
+    use crate::geometry::CELL_INLET;
+
+    /// Minimal executor for wgpu's async adapter/device requests: a
+    /// no-op-waker spin loop. Test-only, so no dependency is added
+    /// (pollster is in the tree only transitively, and dependencies
+    /// need an explicit decision).
+    fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        const VTABLE: RawWakerVTable =
+            RawWakerVTable::new(|_| RawWaker::new(std::ptr::null(), &VTABLE), |_| (), |_| (), |_| ());
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: fut lives on this stack frame for the whole loop.
+        let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    // Grid for every case: 96x48 visible + 8 margin = 112x64 cells.
+    const VIS_W: usize = 96;
+    const VIS_H: usize = 48;
+    const MARGIN: usize = 8;
+    const W: usize = VIS_W + 2 * MARGIN;
+    const H: usize = VIS_H + 2 * MARGIN;
+
+    /// Run one case and return (max |vel component| over the rightmost
+    /// 10 columns, mid rows) plus a whole-field finiteness check.
+    fn run_case(sim: &mut GpuSim, solver: SolverMode, edges: EdgeBcs, frames: u32) -> f32 {
+        sim.rebuild_grid(VIS_W, VIS_H, MARGIN);
+        sim.settings.solver = solver;
+        sim.settings.edges = edges;
+        sim.settings.wind_tunnel = false; // still background: any signal is the fan's
+        sim.settings.paused = false;
+        sim.settings.particle_count = 0;
+
+        // The fan: near the LEFT edge, blowing LEFT (out through the seam).
+        for y in [H / 2 - 1, H / 2, H / 2 + 1] {
+            for x in [10usize, 11] {
+                let i = y * W + x;
+                sim.geo.cell[i] = CELL_INLET;
+                sim.geo.fan[i] = [-1.0, 0.0, 0.0, 0.0];
+            }
+        }
+        sim.geo.dirty = Some(GridRect::full(W, H));
+        sim.flush_geometry();
+
+        for _ in 0..frames {
+            let mut enc = sim
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test step") });
+            sim.encode_compute(&mut enc);
+            sim.queue.submit([enc.finish()]);
+        }
+
+        // Read the velocity buffer back.
+        let size = (W * H * 8) as u64;
+        let staging = sim.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = sim
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test copy") });
+        enc.copy_buffer_to_buffer(&sim.bufs.vel, 0, &staging, 0, size);
+        sim.queue.submit([enc.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        sim.device.poll(wgpu::Maintain::Wait);
+        rx.recv().expect("map_async dropped").expect("map failed");
+        let data = staging.slice(..).get_mapped_range();
+        let vel: &[[f32; 2]] = bytemuck::cast_slice(&data);
+
+        assert!(
+            vel.iter().all(|v| v[0].is_finite() && v[1].is_finite()),
+            "{solver:?} {edges:?}: non-finite velocity"
+        );
+        let mut peak = 0.0f32;
+        for y in (H / 2 - 8)..(H / 2 + 8) {
+            for x in (W - 10)..W {
+                let v = vel[y * W + x];
+                peak = peak.max(v[0].abs()).max(v[1].abs());
+            }
+        }
+        drop(data);
+        staging.unmap();
+        peak
+    }
+
+    #[test]
+    fn periodic_wrap_crosses_the_seam_in_both_solvers() {
+        let instance = wgpu::Instance::default();
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .expect("no wgpu adapter — the frame-time bench needs one on this host too");
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .expect("wgpu device");
+        let mut sim = GpuSim::new(
+            std::sync::Arc::new(device),
+            std::sync::Arc::new(queue),
+            wgpu::TextureFormat::Rgba8Unorm,
+            0,
+        );
+
+        let periodic_x = EdgeBcs([
+            EdgeKind::Periodic,
+            EdgeKind::Periodic,
+            EdgeKind::FarField,
+            EdgeKind::FarField,
+        ]);
+        // (solver, frames): budgets chosen so the wrapped pulse reaches
+        // the sampled columns and the direct path cannot (see module doc).
+        for (solver, frames) in [(SolverMode::Lbm, 6), (SolverMode::Euler, 45)] {
+            let wrapped = run_case(&mut sim, solver, periodic_x, frames);
+            let control = run_case(&mut sim, solver, EdgeBcs::OPEN, frames);
+            assert!(
+                wrapped > 1e-7 && wrapped > 10.0 * control.max(1e-9),
+                "{solver:?}: wrapped {wrapped:e} vs control {control:e} — \
+                 the pulse did not cross the periodic seam"
+            );
+        }
     }
 }

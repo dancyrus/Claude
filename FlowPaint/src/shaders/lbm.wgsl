@@ -15,7 +15,7 @@ struct SimParams {
     sponge_strength: f32, // absorbing-layer blend strength
     free_u: vec2f,        // freestream velocity the sponge relaxes toward
     time: f32,            // lattice steps elapsed (drives fan gusts)
-    _pad1: f32,
+    wrap: u32,            // periodic wrap: bit 0 = x axis, bit 1 = y axis
 };
 
 const CELL_FLUID: u32 = 0u;
@@ -76,11 +76,14 @@ fn collide(@builtin(global_invocation_id) gid: vec3u) {
     // --- Streaming (pull) --------------------------------------------
     // f[i] arrives from the cell one lattice vector upstream. A wall
     // upstream reflects our own opposite population (half-way bounce-back).
-    // Off-domain neighbours copy the local value (zero-gradient open edge).
+    // Off-domain neighbours copy the local value (zero-gradient open edge),
+    // except on a periodic axis, where the source index wraps around.
     var f: array<f32, 9>;
     for (var i = 0u; i < 9u; i++) {
-        let sx = i32(gid.x) - E[i].x;
-        let sy = i32(gid.y) - E[i].y;
+        var sx = i32(gid.x) - E[i].x;
+        var sy = i32(gid.y) - E[i].y;
+        if ((P.wrap & 1u) != 0u) { sx = (sx + i32(W)) % i32(W); }
+        if ((P.wrap & 2u) != 0u) { sy = (sy + i32(H)) % i32(H); }
         if (sx < 0 || sx >= i32(W) || sy < 0 || sy >= i32(H)) {
             f[i] = f_in[i * n + idx];
         } else {
@@ -166,14 +169,15 @@ fn collide(@builtin(global_invocation_id) gid: vec3u) {
     // populations toward the freestream equilibrium with a quadratic ramp,
     // so outgoing pressure waves die instead of reflecting back into the
     // visible region.
+    // A wrapped axis has no edges, so it contributes no sponge distance
+    // (a sponged periodic edge would damp the flow crossing the seam).
     var sponge = 0.0;
     if (P.sponge_width > 0.5) {
-        let dedge = f32(min(
-            min(gid.x, W - 1u - gid.x),
-            min(gid.y, H - 1u - gid.y),
-        ));
-        if (dedge < P.sponge_width) {
-            let t = 1.0 - dedge / P.sponge_width;
+        var dedge = 4294967295u;
+        if ((P.wrap & 1u) == 0u) { dedge = min(dedge, min(gid.x, W - 1u - gid.x)); }
+        if ((P.wrap & 2u) == 0u) { dedge = min(dedge, min(gid.y, H - 1u - gid.y)); }
+        if (f32(dedge) < P.sponge_width) {
+            let t = 1.0 - f32(dedge) / P.sponge_width;
             sponge = P.sponge_strength * t * t;
         }
     }

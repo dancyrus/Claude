@@ -622,3 +622,61 @@ Branch `claude/queue-1-ribbon-home-x42vvi`. Files: `ui/ribbon.rs`,
   (`ui/units.rs::unit_system_pref_str`); unknown values load as None
   and the default stands (round-trip pinned by
   `unit_pref_strings_round_trip_and_reject_unknown`).
+
+## Periodic boundary conditions (queue item 3)
+
+First shader change under the lifted freeze. Branch
+`claude/agent-protocol-amendments-xskax5`.
+
+- **Shader changes** (recorded per the lifted-freeze rule):
+  `lbm.wgsl` (streaming wraps per axis; sponge distance excludes
+  wrapped axes), `euler.wgsl` (stencil loads and the outlet
+  neighbour average wrap per axis instead of clamping; same sponge
+  exclusion; params struct grew `wrap` + 3 pad words, 48 → 64
+  bytes), `dye.wgsl` (bilinear taps and the backtrace wrap across a
+  seam), `particles.wgsl` (velocity sampling and advection wrap; a
+  tracer crossing a seam re-enters instead of respawning). The
+  LBM/dye/particles structs reused a pad slot, so their layouts did
+  not move. With `wrap == 0` every changed path reduces to the old
+  arithmetic, which is why legacy scenes are untouched.
+- **Wrap is a property of an axis, not an edge**
+  (`EdgeBcs::wrap_bits`): it engages only when BOTH edges of an axis
+  are Periodic. An unpaired periodic edge acts as far field — the
+  same thing pre-lift builds did with discriminant 4, so old and new
+  builds agree on any file. The edges dialog (`ui/windows.rs`) keeps
+  the pair invariant: picking Periodic sets both edges of the axis,
+  leaving it clears both. `ui/windows.rs` was touched for exactly
+  this (the queue item names the kernels + `sim.rs`; the greyed-out
+  selector lived in the dialog and had to be armed somewhere).
+- **Sponge x periodic: per-axis exclusion in-shader.** A wrapped
+  axis contributes no edge distance to the sponge ramp (a sponged
+  seam damps the flow crossing it — same reasoning as T2-C's "a
+  sponged wall is not a wall"). The wall rule (any wall ⇒ width 0,
+  CPU-side) is unchanged. A periodic pair on one axis therefore
+  keeps the sponge on the other axis's far-field edges — the
+  streamwise-periodic channel with sponged top/bottom works.
+- **Periodic paints no cells**: `paint_edge_bcs` still skips it;
+  wrap is index arithmetic in the kernels, not a band of cell
+  types. No scene-format change: discriminant 4 was reserved by
+  T2-C and simply became selectable.
+- **GPU-executing test**, `periodic_wrap_crosses_the_seam_in_both_solvers`
+  (sim.rs): creates a headless wgpu device and runs BOTH kernels for
+  real — a fan near the left edge blows left, and the pulse can reach
+  the right columns within the step budget only through the seam
+  (LBM information moves 1 cell/step; the Euler front ≈ 0.14
+  cells/step); the far-field control run must stay quiet. This is
+  also how "re-run both solver modes" is satisfied headlessly, as a
+  pinned test rather than a one-off eyeball. The test contains a
+  ~15-line no-op-waker `block_on` because pollster is only a
+  transitive dependency and adding a direct one needs an explicit
+  decision (escalation list) — do not "clean it up" into a Cargo.toml
+  change without that decision.
+- **Host provisioning, not a project dependency**: this container
+  had NO Vulkan ICD — the GPU test and the frame-time bench both
+  need one — so `mesa-vulkan-drivers` (lavapipe) and
+  `libxkbcommon-x11-0` (winit under Xvfb) were apt-installed.
+  Ephemeral-container setup; nothing in the repo changed for it. A
+  session on a fresh container that sees "no wgpu adapter" from the
+  test, or an xkbcommon panic from `--bench`, installs those two
+  packages.
+- `SolverMode` gained `derive(Debug)` for test diagnostics.

@@ -53,7 +53,8 @@ Per-unit decisions that must not be re-derived live in
   unit system); first-run scene = Pinball; Ctrl+E / Ctrl+Shift+E. §U5.
 - **T2-C (per-edge boundary conditions): done**, branch
   `claude/t2-c-boundary-conditions-s0iupf`. Far field / inlet /
-  outlet / wall; periodic is reserved. §T2-C.
+  outlet / wall. Periodic SHIPPED post-freeze (queue item 3):
+  per-axis paired wrap. §T2-C + §Periodic boundary conditions.
 - **T2-D (SI / decimal-inch toggle): done**, branch
   `claude/si-decimal-inch-toggle-x17w11` (off main). All conversion at
   the UI boundary (`ui/units.rs` `fmt_*` out, `InputUnit` adapters

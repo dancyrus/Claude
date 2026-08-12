@@ -33,6 +33,8 @@ undo without an explicit decision recorded in
 | A wall edge disables the sponge; inlet/outlet keep it | `sponge_disabled_only_by_walls` |
 | Scenes v3 through v9 load; v9 round-trips whole | `v5_bytes_decode_and_convert`, `v6_*`, `v7_*`, `v8_*`, `v9_roundtrip_persists_groups_probes_ranges_edges` |
 | Unknown/reserved edge kinds decode safely | `reserved_and_unknown_edge_kinds_decode_safely` |
+| Periodic wrap engages only as an opposite pair, per axis | `wrap_bits_require_opposite_pairs` |
+| A periodic pulse crosses the seam in both solvers (GPU-executing) | `periodic_wrap_crosses_the_seam_in_both_solvers` |
 | A group can never become its own descendant | `reparent_refuses_cycles`, `sanitize_parents_breaks_cycles_and_dangles` |
 | Transform composition is child first, then each ancestor outward | `composition_is_child_then_ancestors_outward` |
 | Rubber-band selection means intersect, not fully-contain | `rubber_band_intersect_semantics` |
@@ -102,6 +104,5 @@ Not violations. Do not "fix" them without a decision.
   reach.
 - Absolute bench numbers are not comparable across hosts or across
   container rebuilds. Only paired same-session A/B means anything.
-- Periodic boundaries are reserved in the format but not selectable.
 - Holes in filled polygons are unrepresentable, which is why the
   interior-erase refusal exists.

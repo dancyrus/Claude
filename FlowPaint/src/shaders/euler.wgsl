@@ -27,6 +27,10 @@ struct EulerParams {
     free_u: vec2f,        // freestream velocity ((mach, 0) in tunnel mode)
     time: f32,            // steps elapsed (drives fan gusts)
     write_render: f32,    // > 0.5 on the final RK stage: write vel/density
+    wrap: u32,            // periodic wrap: bit 0 = x axis, bit 1 = y axis
+    _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
 };
 
 const CELL_FLUID: u32 = 0u;
@@ -96,18 +100,29 @@ fn inlet_prim(idx: u32) -> vec4f {
     return vec4f(1.0, u.x, u.y, 1.0 / P.gamma);
 }
 
-// --- Loads (zero-gradient at the domain edges via clamping) ----------
+// --- Loads (zero-gradient at the domain edges via clamping; a periodic
+// axis wraps the index around instead) ---------------------------------
+
+// Stencil offsets stay within +/-2 cells, so one period of correction
+// (v + n) covers every off-domain coordinate the kernel produces.
+fn load_x(x: i32) -> i32 {
+    let w = i32(P.width);
+    if ((P.wrap & 1u) != 0u) { return (x + w) % w; }
+    return clamp(x, 0, w - 1);
+}
+
+fn load_y(y: i32) -> i32 {
+    let h = i32(P.height);
+    if ((P.wrap & 2u) != 0u) { return (y + h) % h; }
+    return clamp(y, 0, h - 1);
+}
 
 fn cell_at(x: i32, y: i32) -> u32 {
-    let cx = clamp(x, 0, i32(P.width) - 1);
-    let cy = clamp(y, 0, i32(P.height) - 1);
-    return cell_type[u32(cy) * P.width + u32(cx)];
+    return cell_type[u32(load_y(y)) * P.width + u32(load_x(x))];
 }
 
 fn prim_at(x: i32, y: i32) -> vec4f {
-    let cx = clamp(x, 0, i32(P.width) - 1);
-    let cy = clamp(y, 0, i32(P.height) - 1);
-    let idx = u32(cy) * P.width + u32(cx);
+    let idx = u32(load_y(y)) * P.width + u32(load_x(x));
     let ct = cell_type[idx];
     if (ct == CELL_INLET) { return inlet_prim(idx); }
     // Walls are handled by the caller via mirroring; fluid and outlet
@@ -205,14 +220,15 @@ fn swz(w: vec4f) -> vec4f {
     return vec4f(w.x, w.z, w.y, w.w);
 }
 
+// A wrapped axis has no edges, so it contributes no sponge distance
+// (a sponged periodic edge would damp the flow crossing the seam).
 fn sponge_factor(gx: u32, gy: u32) -> f32 {
     if (P.sponge_width <= 0.5) { return 0.0; }
-    let dedge = f32(min(
-        min(gx, P.width - 1u - gx),
-        min(gy, P.height - 1u - gy),
-    ));
-    if (dedge >= P.sponge_width) { return 0.0; }
-    let t = 1.0 - dedge / P.sponge_width;
+    var dedge = 4294967295u;
+    if ((P.wrap & 1u) == 0u) { dedge = min(dedge, min(gx, P.width - 1u - gx)); }
+    if ((P.wrap & 2u) == 0u) { dedge = min(dedge, min(gy, P.height - 1u - gy)); }
+    if (f32(dedge) >= P.sponge_width) { return 0.0; }
+    let t = 1.0 - f32(dedge) / P.sponge_width;
     return P.sponge_strength * t * t;
 }
 
@@ -256,6 +272,8 @@ fn euler_step(@builtin(global_invocation_id) gid: vec3u) {
             if (k == 1) { nx = x - 1; }
             if (k == 2) { ny = y + 1; }
             if (k == 3) { ny = y - 1; }
+            if ((P.wrap & 1u) != 0u) { nx = (nx + i32(W)) % i32(W); }
+            if ((P.wrap & 2u) != 0u) { ny = (ny + i32(H)) % i32(H); }
             if (nx < 0 || nx >= i32(W) || ny < 0 || ny >= i32(H)) { continue; }
             let nidx = u32(ny) * W + u32(nx);
             let nct = cell_type[nidx];
@@ -279,7 +297,7 @@ fn euler_step(@builtin(global_invocation_id) gid: vec3u) {
     let y = i32(gid.y);
 
     // Gather the 5-point stencils in x and y (primitive states + solid
-    // flags). Domain edges clamp (zero-gradient).
+    // flags). Domain edges clamp (zero-gradient); a periodic axis wraps.
     var wx: array<vec4f, 5>;
     var sx: array<bool, 5>;
     var wy: array<vec4f, 5>;

@@ -15,7 +15,7 @@ struct SimParams {
     sponge_strength: f32,
     free_u: vec2f,
     time: f32,
-    _pad1: f32,
+    wrap: u32,   // periodic wrap: bit 0 = x axis, bit 1 = y axis
 };
 
 const CELL_WALL: u32 = 1u;
@@ -27,16 +27,47 @@ const CELL_WALL: u32 = 1u;
 @group(0) @binding(4) var<storage, read> cell_type: array<u32>;
 @group(0) @binding(5) var<storage, read> dye_src: array<vec4f>;
 
+// Wrap a position onto a periodic axis so backtraced samples that cross
+// the seam re-enter from the other side (non-wrapped axes are untouched).
+fn wrap_pos(p: vec2f) -> vec2f {
+    var q = p;
+    let fw = f32(P.width);
+    let fh = f32(P.height);
+    if ((P.wrap & 1u) != 0u) { q.x = q.x - fw * floor(q.x / fw); }
+    if ((P.wrap & 2u) != 0u) { q.y = q.y - fh * floor(q.y / fh); }
+    return q;
+}
+
 fn sample_dye(p_in: vec2f) -> vec4f {
     let W = i32(P.width);
     let H = i32(P.height);
-    let p = clamp(p_in - 0.5, vec2f(0.0), vec2f(f32(W - 1), f32(H - 1)));
-    let x0 = i32(p.x);
-    let y0 = i32(p.y);
-    let x1 = min(x0 + 1, W - 1);
-    let y1 = min(y0 + 1, H - 1);
-    let tx = p.x - f32(x0);
-    let ty = p.y - f32(y0);
+    let p = p_in - 0.5;
+    // Per axis: bilinear taps wrap across a periodic seam, clamp at an
+    // ordinary edge (the pre-periodic behaviour).
+    var x0: i32; var x1: i32; var tx: f32;
+    if ((P.wrap & 1u) != 0u) {
+        let fx = floor(p.x);
+        tx = p.x - fx;
+        x0 = ((i32(fx) % W) + W) % W;
+        x1 = (x0 + 1) % W;
+    } else {
+        let cx = clamp(p.x, 0.0, f32(W - 1));
+        x0 = i32(cx);
+        x1 = min(x0 + 1, W - 1);
+        tx = cx - f32(x0);
+    }
+    var y0: i32; var y1: i32; var ty: f32;
+    if ((P.wrap & 2u) != 0u) {
+        let fy = floor(p.y);
+        ty = p.y - fy;
+        y0 = ((i32(fy) % H) + H) % H;
+        y1 = (y0 + 1) % H;
+    } else {
+        let cy = clamp(p.y, 0.0, f32(H - 1));
+        y0 = i32(cy);
+        y1 = min(y0 + 1, H - 1);
+        ty = cy - f32(y0);
+    }
     let d00 = dye_in[y0 * W + x0];
     let d10 = dye_in[y0 * W + x1];
     let d01 = dye_in[y1 * W + x0];
@@ -64,7 +95,7 @@ fn advect(@builtin(global_invocation_id) gid: vec3u) {
     let step = disp / f32(n);
     var pos = vec2f(gid.xy) + 0.5;
     for (var k = 0u; k < n; k++) {
-        let cand = pos - step;
+        let cand = wrap_pos(pos - step);
         let bx = clamp(i32(floor(cand.x)), 0, i32(W) - 1);
         let by = clamp(i32(floor(cand.y)), 0, i32(H) - 1);
         if (cell_type[u32(by) * W + u32(bx)] == CELL_WALL) {

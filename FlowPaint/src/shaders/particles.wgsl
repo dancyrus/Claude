@@ -12,7 +12,7 @@ struct PartParams {
     count: u32,
     frame: u32,   // frame counter, salts the respawn hash
     dt: f32,      // lattice steps advanced this frame
-    _pad0: f32,
+    wrap: u32,    // periodic wrap: bit 0 = x axis, bit 1 = y axis
     spawn_min: vec2u, // respawn window (visible area + upstream band)
     spawn_max: vec2u,
     _pad1: f32,
@@ -36,16 +36,47 @@ fn rand01(seed: u32) -> f32 {
     return f32(pcg(seed) & 0x00FFFFFFu) / 16777216.0;
 }
 
+// Wrap a position onto a periodic axis; a tracer crossing the seam
+// re-enters from the other side instead of respawning.
+fn wrap_pos(p: vec2f) -> vec2f {
+    var q = p;
+    let fw = f32(PP.width);
+    let fh = f32(PP.height);
+    if ((PP.wrap & 1u) != 0u) { q.x = q.x - fw * floor(q.x / fw); }
+    if ((PP.wrap & 2u) != 0u) { q.y = q.y - fh * floor(q.y / fh); }
+    return q;
+}
+
 fn sample_vel(p_in: vec2f) -> vec2f {
     let W = i32(PP.width);
     let H = i32(PP.height);
-    let p = clamp(p_in - 0.5, vec2f(0.0), vec2f(f32(W - 1), f32(H - 1)));
-    let x0 = i32(p.x);
-    let y0 = i32(p.y);
-    let x1 = min(x0 + 1, W - 1);
-    let y1 = min(y0 + 1, H - 1);
-    let tx = p.x - f32(x0);
-    let ty = p.y - f32(y0);
+    let p = p_in - 0.5;
+    // Per axis: bilinear taps wrap across a periodic seam, clamp at an
+    // ordinary edge (the pre-periodic behaviour).
+    var x0: i32; var x1: i32; var tx: f32;
+    if ((PP.wrap & 1u) != 0u) {
+        let fx = floor(p.x);
+        tx = p.x - fx;
+        x0 = ((i32(fx) % W) + W) % W;
+        x1 = (x0 + 1) % W;
+    } else {
+        let cx = clamp(p.x, 0.0, f32(W - 1));
+        x0 = i32(cx);
+        x1 = min(x0 + 1, W - 1);
+        tx = cx - f32(x0);
+    }
+    var y0: i32; var y1: i32; var ty: f32;
+    if ((PP.wrap & 2u) != 0u) {
+        let fy = floor(p.y);
+        ty = p.y - fy;
+        y0 = ((i32(fy) % H) + H) % H;
+        y1 = (y0 + 1) % H;
+    } else {
+        let cy = clamp(p.y, 0.0, f32(H - 1));
+        y0 = i32(cy);
+        y1 = min(y0 + 1, H - 1);
+        ty = cy - f32(y0);
+    }
     let v00 = velocity[y0 * W + x0];
     let v10 = velocity[y0 * W + x1];
     let v01 = velocity[y1 * W + x0];
@@ -88,7 +119,7 @@ fn update(@builtin(global_invocation_id) gid: vec3u) {
         var pos = p.xy;
         for (var k = 0u; k < n; k++) {
             let v = sample_vel(pos);
-            let cand = pos + v * sub_dt;
+            let cand = wrap_pos(pos + v * sub_dt);
             if (cand.x < 0.0 || cand.y < 0.0
                 || cand.x >= f32(W) || cand.y >= f32(H)) {
                 pos = cand; // off-domain: respawn logic handles it
