@@ -1,5 +1,7 @@
 # FlowPaint V2 — working notes
 
+**Read `docs/agent-protocol.md` first, before anything else here.**
+
 Rust desktop CFD paint app in `FlowPaint/` (also `FingerFlow/`, an iOS
 sibling — untouched by the UI overhaul). Two solvers: D2Q9 LBM
 (incompressible, `shaders/lbm.wgsl`) and finite-volume Euler MUSCL+HLLC
@@ -140,10 +142,8 @@ erase and polygon holes are refused (indexed in `docs/deferred.md`;
 design report `docs/u4-eraser-design.md`). Every other U4 decision:
 `docs/unit-decisions.md` §U4.
 
-## Frame-time baseline (plan working rules)
+## Frame-time bench
 
-`FlowPaint-V2 --bench`: Pinball preset, compressible mode, default
-grid (High, 1920×960 + margin), 10 warmup + 300 measured frames —
-Xvfb + Mesa lavapipe, so relative paired A/B only (history in
-`docs/theme.md`). Re-run after any change touching the canvas or
-rasterizer; mean and p99 must not regress.
+Required for any change touching `ui/canvas.rs`, `model.rs`,
+`geomops.rs`, or `sim.rs`; mean and p99 must not regress. Procedure:
+`docs/agent-protocol.md` §Frame-time bench; history: `docs/theme.md`.
