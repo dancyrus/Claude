@@ -346,3 +346,44 @@ rev: C 1898.53 / 2175.81   B 1920.41 / 3498.70   A 1893.16 / 3307.08
   mode. This session's p99s ran fat and erratic (2.2–4.2 s) across
   ALL runs including baseline — the known session-position pattern,
   not code.
+
+## Periodic-BC measurement (queue item 3 — first shader change)
+
+Fresh container (new lavapipe install — this host had NO Vulkan ICD;
+`mesa-vulkan-drivers` + `libxkbcommon-x11-0` were apt-installed, so
+absolute numbers are not comparable to any earlier record). Paired
+back-to-back A/B under Xvfb, both orders, both binaries built before
+measuring, otherwise idle host.
+
+First pass caught a real regression: the naive wrap implementation — a
+runtime `P.wrap` uniform branch in every hot stencil load — cost:
+
+```
+A = main 2821906, B = naive wrap 9d2eead             mean       p99
+pair 1 (A first): A 2965.77 / 6801.05   B 3315.47 / 4568.41
+pair 2 (B first): B 3386.33 / 7835.18   A 3007.60 / 6847.76
+```
+
+Mean +11.8 % / +12.6 % — the SAME sign in both orders, so a real
+regression, not the session-position pattern. Fix: WGSL
+`override WRAP_ENABLED` pipeline specialization — the default kernel
+variants constant-fold the wrap logic out (non-periodic scenes run the
+pre-periodic machine code); the wrap variants bind only while
+`EdgeBcs::wrap_bits != 0`. Re-run with specialization:
+
+```
+A = main 2821906, B = specialized wrap 60aae15       mean       p99
+pair 1 (A first): A 3024.86 / 5768.01   B 2950.27 / 7508.22
+pair 2 (B first): B 2914.69 / 6971.38   A 2781.25 / 3306.20
+```
+
+Mean −2.5 % / +4.8 % — the deltas flip sign with run order: the known
+session-position pattern, no regression. The p99 tail on this
+container is dominated by multi-second host stalls (max frames ran
+4.1–17.9 s across the eight runs; A's own p99 spans 3306–6848 ms on
+an unchanged binary) and is uncorrelated with the build — the naive
+B, 12 % slower on mean, recorded the session's LOWEST p99 (4568).
+Tail verdict: unusable on this container beyond order-of-magnitude;
+the mean is the signal here. The bench scene has no periodic edges,
+so B additionally runs the byte-identical default pipelines — the
+flipping mean confirms the specialization did its job.
