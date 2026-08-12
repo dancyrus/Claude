@@ -31,12 +31,13 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
    (bench harness, `docs/theme.md`) — DONE
    (`claude/agent-protocol-amendments-ohhfmn`)
 7. **Unit-system persistence across sessions**, as a user preference
-   not scene state (`ui/units.rs`, `app.rs` prefs) — IN PROGRESS
+   not scene state (`ui/units.rs`, `app.rs` prefs) — DONE
    (`claude/agent-protocol-amendments-ohhfmn`)
 
 ## Sequential — each depends on the item above it
 
-8. **Arcs and splines as `Shape` variants** — UNCLAIMED
+8. **Arcs and splines as `Shape` variants** — IN PROGRESS
+   (`claude/agent-protocol-amendments-ohhfmn`)
 9. **Holes in filled polygons** (removes the U4 interior-erase
    refusal) — depends on 8 — UNCLAIMED
 10. **Union and intersect booleans** — depends on 9 — UNCLAIMED
