@@ -387,3 +387,24 @@ Tail verdict: unusable on this container beyond order-of-magnitude;
 the mean is the signal here. The bench scene has no periodic edges,
 so B additionally runs the byte-identical default pipelines — the
 flipping mean confirms the specialization did its job.
+
+## Queue item 8 measurement (arcs and splines)
+
+Paired back-to-back A/B (same container/lavapipe install as the
+item 2 and item 6 records; both binaries built first; otherwise
+idle), both orders:
+
+```
+A = main 6dfb392, B = item 8 ff5b155                mean       p99
+pair 1 (A first): A 1884.60 / 2634.47   B 1828.96 / 2144.04
+pair 2 (B first): B 1868.66 / 2646.57   A 1888.90 / 2774.05
+```
+
+Order-independent result: mean −3.0 % / −1.1 %, B faster in both
+orders — inside host spread; no regression. Expected: the bench scene
+contains no arc or spline, so the new code contributes only match
+arms on the default paths; the shared samplers run solely for
+arc/spline objects, and rasterize_chain is the old Poly body moved,
+not changed. The A runs again carried the fat max-frame outliers
+(6.1 s / 6.2 s) in the first/last session positions — the known
+session-position pattern.
