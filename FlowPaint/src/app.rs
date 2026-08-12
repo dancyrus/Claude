@@ -626,6 +626,7 @@ const SCENE_V10: u32 = 10;
 /// objects may now contain the appended `Arc`/`Spline` shape variants,
 /// so a pre-v11 build refuses the file cleanly at the version peek
 /// instead of erroring mid-decode on an unknown variant.
+#[cfg_attr(not(test), allow(dead_code))]
 const SCENE_V11: u32 = 11;
 /// Current (queue item 9): the same marker pattern for the appended
 /// `Rings` variant (filled polygons with holes).
@@ -3049,30 +3050,9 @@ impl FlowPaintApp {
             .collect()
     }
 
-    /// Fragments for carved filled polygons: closed, filled pieces.
-    fn poly_fragments(
-        &mut self,
-        i: usize,
-        pieces: Vec<Vec<[f32; 2]>>,
-        filled: bool,
-    ) -> Vec<SketchObject> {
-        let src = self.model.objects[i].clone();
-        pieces
-            .into_iter()
-            .enumerate()
-            .map(|(k, pts)| {
-                let mut o = src.clone();
-                if k > 0 {
-                    o.id = self.model.fresh_id();
-                }
-                o.shape = Shape::Poly { pts, closed: true };
-                o.filled = filled;
-                o
-            })
-            .collect()
-    }
-
-    /// Fragments for a rings subtraction (queue item 9): one object per
+    /// Fragments for a rings subtraction (queue item 9, superseding the
+    /// U4 poly_fragments — a hole-free result is the same closed filled
+    /// Poly it always produced): one object per
     /// outermost ring; a hole-free object stays an ordinary filled
     /// polygon, one with holes becomes `Shape::Rings`.
     fn rings_fragments(

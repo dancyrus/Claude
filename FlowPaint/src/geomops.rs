@@ -360,6 +360,10 @@ pub fn clip_path(
 
 // --- Filled-polygon subtraction --------------------------------------------
 
+// Legacy single-ring subtraction (pre-queue-item-9): out of the
+// production flow — subtract_rings replaced it — but retained with its
+// tests to pin the old WouldHole semantics.
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum PolySubtract {
     Untouched,
     Erased,
@@ -378,6 +382,7 @@ pub enum PolySubtract {
 /// only a stroke whose whole footprint is interior refuses.
 /// `min_area` follows the clip_path convention: the sliver guard in
 /// the same space as `poly` (world guard divided by scale²).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn subtract_polygon(
     poly: &[[f32; 2]],
     caps: &[Capsule],
