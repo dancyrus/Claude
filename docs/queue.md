@@ -24,7 +24,8 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
    needs a per-mode offset in `render.wgsl` (`render.wgsl`,
    `ui/legend.rs`) — IN PROGRESS (`claude/queue-4-range-minmax-x42vvi`)
 5. **Plot/legend inversion-factor unification** (`ui/legend.rs`,
-   `ui/windows.rs`) — IN PROGRESS
+   `ui/status.rs`, `ui/units.rs` — the original entry said
+   `ui/windows.rs`; the probe-plot copy lived in status.rs) — DONE
    (`claude/agent-protocol-amendments-xskax5`)
 6. **Object-snap frame-cost measurement**: a bench mode that arms the
    Line tool and drives a pointer; do NOT change the default workload
