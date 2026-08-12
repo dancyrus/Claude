@@ -763,3 +763,36 @@ Internal debt from the T2-A/T2-B concurrent tracks, paid. Branch
 - The mode boundary carried from item 6 stands: the perpendicular
   osnap needs an anchor and arcs/splines contribute endpoints,
   mid-arc, centres and sampled segments like any chain.
+
+## Queue item 9 (holes in filled polygons)
+
+- **`Shape::Rings`: an even-odd ring soup** (rings[0] outermost),
+  appended after `Spline`; only the ERASER creates one — drawing
+  tools still make ordinary shapes, and a hole-free erase result
+  collapses back to a filled `Poly`. Scene v12 is the same marker
+  pattern as v11 (identical byte layout, pre-v12 builds refuse
+  cleanly).
+- **The U4 interior-erase refusal is REVERSED, deliberately** (the
+  queue item's own words: "removes the U4 interior-erase refusal").
+  The pinned test `interior_stroke_refuses_with_hole` became
+  `interior_stroke_carves_hole`; invariants.md rows updated. The
+  legacy `subtract_polygon` keeps its `WouldHole` semantics and its
+  test, but is out of the production flow.
+- **`subtract_rings` mechanics** (geomops): capsules subtract one at
+  a time. Wholly-interior capsule → its polygonized ring becomes a
+  hole (anything inside it is consumed). Capsule overlapping hole
+  rings → the holes fold INTO the clip first (`poly_union_convex`,
+  the difference walk's mirror — clip arcs traverse FORWARD), then
+  one difference against the fill rings, so even-odd parity never
+  double-counts a merge corridor. Pinched-off union pockets survive
+  as island rings — even-odd represents them for free.
+- Both Greiner–Hormann walks now test containment with
+  `point_in_polygon` (identical on convex clips, required once a
+  grown hole makes the clip non-convex). `point_in_convex` retained
+  under `#[allow(dead_code)]`.
+- Output objects group as: each outermost ring + everything nested
+  in it; largest first; single-ring groups emit `Poly` (the old
+  behavior for ordinary cuts is byte-for-byte unchanged).
+- The paint bucket is UNCHANGED: it still traces the outer contour,
+  so fluid sealed in a hollow island fills over — recorded in
+  invariants.md as the remaining known gap.

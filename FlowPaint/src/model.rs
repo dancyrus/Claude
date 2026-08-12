@@ -161,6 +161,12 @@ pub enum Shape {
     /// points stay the live, draggable truth; curve samples are derived
     /// on demand and never persisted. Appended after `Arc`.
     Spline { pts: Vec<[f32; 2]>, closed: bool },
+    /// Filled polygon with holes (queue item 9): an EVEN-ODD ring soup,
+    /// rings[0] outermost by construction. Only the eraser creates one
+    /// (carving a hole into a filled shape); it stays live and editable
+    /// like everything else. Appended after `Spline`; files that may
+    /// contain one save as scene v12.
+    Rings { rings: Vec<Vec<[f32; 2]>> },
 }
 
 impl Shape {
@@ -389,6 +395,19 @@ impl SketchObject {
                 }
                 (min, max)
             }
+            Shape::Rings { rings } => {
+                if rings.iter().all(|r| r.is_empty()) {
+                    return GridRect { x0: 0, y0: 0, x1: 0, y1: 0 };
+                }
+                let mut min = [f32::MAX, f32::MAX];
+                let mut max = [f32::MIN, f32::MIN];
+                for p in rings.iter().flatten() {
+                    let p = m.apply(*p);
+                    min = [min[0].min(p[0]), min[1].min(p[1])];
+                    max = [max[0].max(p[0]), max[1].max(p[1])];
+                }
+                (min, max)
+            }
         };
         GridRect {
             x0: (min[0] - pad) as i32,
@@ -428,6 +447,19 @@ impl SketchObject {
                 }
                 [c[0] / pts.len() as f32, c[1] / pts.len() as f32]
             }
+            Shape::Rings { rings } => {
+                let outer: &[[f32; 2]] =
+                    rings.first().map(|r| r.as_slice()).unwrap_or(&[]);
+                if outer.is_empty() {
+                    return [0.0, 0.0];
+                }
+                let mut c = [0.0f32, 0.0];
+                for p in outer {
+                    c[0] += p[0];
+                    c[1] += p[1];
+                }
+                [c[0] / outer.len() as f32, c[1] / outer.len() as f32]
+            }
         }
     }
 
@@ -458,6 +490,12 @@ impl SketchObject {
             }
             Shape::Spline { pts, .. } => {
                 for p in pts {
+                    p[0] += d[0];
+                    p[1] += d[1];
+                }
+            }
+            Shape::Rings { rings } => {
+                for p in rings.iter_mut().flatten() {
                     p[0] += d[0];
                     p[1] += d[1];
                 }
@@ -507,6 +545,11 @@ impl SketchObject {
             }
             Shape::Spline { pts, .. } => {
                 for p in pts {
+                    rot(p);
+                }
+            }
+            Shape::Rings { rings } => {
+                for p in rings.iter_mut().flatten() {
                     rot(p);
                 }
             }
@@ -576,6 +619,11 @@ impl SketchObject {
                     sc(p);
                 }
             }
+            Shape::Rings { rings } => {
+                for p in rings.iter_mut().flatten() {
+                    sc(p);
+                }
+            }
         }
     }
 
@@ -621,6 +669,11 @@ impl SketchObject {
             }
             Shape::Spline { pts, .. } => {
                 for p in pts {
+                    *p = m.apply(*p);
+                }
+            }
+            Shape::Rings { rings } => {
+                for p in rings.iter_mut().flatten() {
                     *p = m.apply(*p);
                 }
             }
@@ -685,6 +738,11 @@ impl SketchObject {
                     *p = m.apply(*p);
                 }
             }
+            Shape::Rings { rings } => {
+                for p in rings.iter_mut().flatten() {
+                    *p = m.apply(*p);
+                }
+            }
         }
         // A reflection is an isometry: thickness holds; the fan aim
         // conjugates like any other stored angle.
@@ -732,6 +790,11 @@ impl SketchObject {
             }
             Shape::Spline { pts, .. } => {
                 for p in pts {
+                    sc(p);
+                }
+            }
+            Shape::Rings { rings } => {
+                for p in rings.iter_mut().flatten() {
                     sc(p);
                 }
             }
@@ -820,6 +883,17 @@ impl SketchObject {
                 let segs = if *closed { n } else { n - 1 };
                 (0..segs).any(|i| seg_dist(p, s[i], s[(i + 1) % n]) <= t)
             }
+            Shape::Rings { rings } => {
+                // Material hits anywhere even-odd inside; the boundary
+                // hits near any ring's outline.
+                if crate::geomops::point_in_rings(p, rings) {
+                    return true;
+                }
+                rings.iter().any(|r| {
+                    let n = r.len();
+                    n >= 2 && (0..n).any(|i| seg_dist(p, r[i], r[(i + 1) % n]) <= t)
+                })
+            }
         }
     }
 
@@ -859,6 +933,7 @@ impl SketchObject {
                 vec![at(*start), at(*start + sweep * 0.5), at(*start + *sweep)]
             }
             Shape::Spline { pts, .. } => pts.clone(),
+            Shape::Rings { rings } => rings.iter().flatten().copied().collect(),
         }
     }
 
@@ -925,6 +1000,11 @@ impl SketchObject {
                     *v = p;
                 }
             }
+            Shape::Rings { rings } => {
+                if let Some(v) = rings.iter_mut().flatten().nth(idx) {
+                    *v = p;
+                }
+            }
         }
     }
 
@@ -980,6 +1060,10 @@ impl SketchObject {
                 let segs = if *closed { n } else { n - 1 };
                 (0..segs).any(|i| seg_hits(s[i], s[(i + 1) % n]))
             }
+            Shape::Rings { rings } => rings.iter().any(|r| {
+                let n = r.len();
+                n >= 2 && (0..n).any(|i| seg_hits(r[i], r[(i + 1) % n]))
+            }),
         };
         // Containment fallbacks: band inside a filled shape, or shape
         // centre inside a band larger than the outline sampling caught.
@@ -2133,6 +2217,55 @@ impl SketchModel {
 
 // --- Object rasterizers (all clipped to `clip`, full-grid coords) ----
 
+/// Even-odd scanline over a whole ring soup (queue item 9): one pass,
+/// all rings' crossings collected per row, so holes stay holes. The
+/// same cell-centre convention as the single-ring fill.
+fn rasterize_rings_filled(
+    geo: &mut Geometry,
+    obj: &SketchObject,
+    rings: &[Vec<[f32; 2]>],
+    clip: GridRect,
+    m: i32,
+) {
+    let mf = m as f32;
+    let rect = obj.bounds();
+    let rect = GridRect {
+        x0: rect.x0 + m,
+        y0: rect.y0 + m,
+        x1: rect.x1 + m,
+        y1: rect.y1 + m,
+    }
+    .intersect(clip);
+    let w = geo.w;
+    let mut write = cell_writer(geo, obj);
+    let mut xs: Vec<f32> = Vec::with_capacity(8);
+    for y in rect.y0..rect.y1 {
+        let yc = y as f32 + 0.5 - mf;
+        xs.clear();
+        for r in rings {
+            let n = r.len();
+            if n < 3 {
+                continue;
+            }
+            for i in 0..n {
+                let a = r[i];
+                let b = r[(i + 1) % n];
+                if (a[1] <= yc) != (b[1] <= yc) {
+                    xs.push(a[0] + (yc - a[1]) * (b[0] - a[0]) / (b[1] - a[1]));
+                }
+            }
+        }
+        xs.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        for pair in xs.chunks_exact(2) {
+            let x0 = ((pair[0] + mf - 0.5).ceil() as i32).max(rect.x0);
+            let x1 = ((pair[1] + mf - 0.5).floor() as i32).min(rect.x1 - 1);
+            for x in x0..=x1 {
+                write((y as usize) * w + x as usize, None);
+            }
+        }
+    }
+}
+
 /// Shared open/closed chain rasterizer: single point → dot, filled
 /// closed ring → even-odd scanline (thickness ignored, like filled
 /// Rect/Ellipse — U4), otherwise capsule per segment. Polys pass their
@@ -2326,6 +2459,15 @@ fn rasterize_object(geo: &mut Geometry, obj: &SketchObject, clip: GridRect, m: i
         Shape::Spline { pts, closed } => {
             let sampled = sample_spline(pts, *closed);
             rasterize_chain(geo, obj, &sampled, *closed, clip, m, t_r);
+        }
+        Shape::Rings { rings } => {
+            if obj.filled {
+                rasterize_rings_filled(geo, obj, rings, clip, m);
+            } else {
+                for r in rings {
+                    rasterize_chain(geo, obj, r, true, clip, m, t_r);
+                }
+            }
         }
         Shape::Rect { c, half, angle } => {
             if obj.filled {
@@ -3216,5 +3358,43 @@ mod tests {
         // outside the quad's edge midpoint is still wall.
         let walls = geo2.cell.iter().filter(|&&c| c == CELL_WALL).count();
         assert!(walls > 400, "filled spline area {walls}");
+    }
+
+    /// A Rings object rasterizes as a donut (queue item 9): material
+    /// between outer and hole, FLUID inside the hole — the whole point
+    /// of the carve.
+    #[test]
+    fn rings_rasterize_with_fluid_hole() {
+        let mut m = SketchModel::default();
+        let id = m.fresh_id();
+        m.add(SketchObject {
+            id,
+            shape: Shape::Rings {
+                rings: vec![
+                    vec![[8.0, 8.0], [40.0, 8.0], [40.0, 40.0], [8.0, 40.0]],
+                    vec![[18.0, 18.0], [30.0, 18.0], [30.0, 30.0], [18.0, 30.0]],
+                ],
+            },
+            material: ObjMaterial::Wall,
+            thickness: 2.0,
+            filled: true,
+            fan_mult: 1.0,
+            fan_gust: 0.0,
+            fan_phase: 0.0,
+            fan_angle: 0.0,
+            smoke_rgb: [0.0; 3],
+            locked: false,
+            hidden: false,
+            parent: None,
+        });
+        let mut geo = Geometry::new(48, 48);
+        m.rasterize_region(&mut geo, GridRect::full(48, 48), 0, false);
+        assert_eq!(geo.cell[12 * 48 + 12], CELL_WALL, "ring material");
+        assert_eq!(geo.cell[24 * 48 + 24], CELL_FLUID, "hole is fluid");
+        assert_eq!(geo.cell[4 * 48 + 4], CELL_FLUID, "outside is fluid");
+        // Even-odd hit test agrees with the raster.
+        let i = m.find(id).unwrap();
+        assert!(m.objects[i].hit([12.0, 12.0], 0.0));
+        assert!(!m.objects[i].hit([24.0, 24.0], 0.5));
     }
 }

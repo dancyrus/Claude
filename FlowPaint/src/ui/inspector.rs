@@ -198,6 +198,7 @@ impl FlowPaintApp {
             Shape::Arc { .. } => "Arc",
             Shape::Spline { closed: true, .. } => "Closed spline",
             Shape::Spline { .. } => "Spline",
+            Shape::Rings { .. } => "Polygon with holes",
         };
         ui.label(super::theme::heading(format!("Object — {kind}")));
 

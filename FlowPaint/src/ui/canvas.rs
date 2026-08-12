@@ -958,6 +958,26 @@ impl FlowPaintApp {
                         consider(OsnapKind::Center, ap(o.center()));
                     }
                 }
+                Shape::Rings { rings } => {
+                    for r in rings {
+                        let n = r.len();
+                        for p in r {
+                            consider(OsnapKind::Endpoint, ap(*p));
+                        }
+                        for k in 0..n {
+                            let aw = ap(r[k]);
+                            let bw = ap(r[(k + 1) % n]);
+                            consider(
+                                OsnapKind::Midpoint,
+                                [(aw[0] + bw[0]) * 0.5, (aw[1] + bw[1]) * 0.5],
+                            );
+                            if pool.len() < POOL_CAP {
+                                pool.push((o.id, aw, bw));
+                            }
+                        }
+                    }
+                    consider(OsnapKind::Center, ap(o.center()));
+                }
                 Shape::Rect { c, half, angle } => {
                     consider(OsnapKind::Center, ap(*c));
                     let (s, co) = angle.sin_cos();
@@ -1822,6 +1842,9 @@ impl FlowPaintApp {
                 }
                 format!("{} pts   L {}", pts.len(), fmt_len(ps.len_m(l * s)))
             }
+            Shape::Rings { rings } => {
+                format!("{} rings ({} holes)", rings.len(), rings.len().saturating_sub(1))
+            }
         };
         if dims.is_empty() {
             return;
@@ -1982,6 +2005,12 @@ impl FlowPaintApp {
                     painter.add(egui::Shape::closed_line(path, stroke));
                 } else {
                     painter.add(egui::Shape::line(path, stroke));
+                }
+            }
+            Shape::Rings { rings } => {
+                for r in rings {
+                    let path: Vec<egui::Pos2> = r.iter().map(|p| to_screen(*p)).collect();
+                    painter.add(egui::Shape::closed_line(path, stroke));
                 }
             }
             Shape::Rect { .. } => {

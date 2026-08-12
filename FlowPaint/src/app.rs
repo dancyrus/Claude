@@ -622,11 +622,14 @@ const SCENE_V9: u32 = 9;
 /// appended — a fluid property (combustion products are gamma ~1.2),
 /// so a save/reload must not quietly turn a scene back into air.
 const SCENE_V10: u32 = 10;
-/// Current (queue item 8). SAME byte layout as v10 — the bump only
-/// marks that objects may now contain the appended `Arc`/`Spline`
-/// shape variants, so a pre-v11 build refuses the file cleanly at the
-/// version peek instead of erroring mid-decode on an unknown variant.
+/// Queue item 8. SAME byte layout as v10 — the bump only marks that
+/// objects may now contain the appended `Arc`/`Spline` shape variants,
+/// so a pre-v11 build refuses the file cleanly at the version peek
+/// instead of erroring mid-decode on an unknown variant.
 const SCENE_V11: u32 = 11;
+/// Current (queue item 9): the same marker pattern for the appended
+/// `Rings` variant (filled polygons with holes).
+const SCENE_V12: u32 = 12;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -2793,7 +2796,7 @@ impl FlowPaintApp {
     /// STORED space (a similarity maps the world discs to exact stored
     /// discs — the U3 uniform-scale payoff). One undo entry per stroke.
     fn apply_erase_stroke(&mut self, pts: &[[f32; 2]]) {
-        use crate::geomops::{clip_path, subtract_polygon, Capsule, ClipPath, PolySubtract};
+        use crate::geomops::{clip_path, subtract_rings, Capsule, ClipPath, RingsSubtract};
         if pts.is_empty() {
             return;
         }
@@ -2821,7 +2824,7 @@ impl FlowPaintApp {
         }
 
         let mut changes: Vec<(u64, Vec<SketchObject>)> = Vec::new();
-        let mut hole_refusals: Vec<&'static str> = Vec::new();
+
         let mut stamp_touched = false;
         let candidates: Vec<u64> = self
             .model
@@ -2890,12 +2893,15 @@ impl FlowPaintApp {
                 }
                 Shape::Poly { pts: ppts, closed } => {
                     if obj.filled && *closed {
-                        match subtract_polygon(ppts, &caps, min_area) {
-                            PolySubtract::Untouched => {}
-                            PolySubtract::Erased => changes.push((id, Vec::new())),
-                            PolySubtract::WouldHole => hole_refusals.push("polygon"),
-                            PolySubtract::Pieces(pieces) => {
-                                let frags = self.poly_fragments(i, pieces, true);
+                        match subtract_rings(
+                            std::slice::from_ref(ppts),
+                            &caps,
+                            min_area,
+                        ) {
+                            RingsSubtract::Untouched => {}
+                            RingsSubtract::Erased => changes.push((id, Vec::new())),
+                            RingsSubtract::Objects(objs) => {
+                                let frags = self.rings_fragments(i, objs);
                                 changes.push((id, frags));
                             }
                         }
@@ -2927,12 +2933,12 @@ impl FlowPaintApp {
                 Shape::Spline { pts: spts, closed } => {
                     let sam = crate::model::sample_spline(spts, *closed);
                     if obj.filled && *closed {
-                        match subtract_polygon(&sam, &caps, min_area) {
-                            PolySubtract::Untouched => {}
-                            PolySubtract::Erased => changes.push((id, Vec::new())),
-                            PolySubtract::WouldHole => hole_refusals.push("spline"),
-                            PolySubtract::Pieces(pieces) => {
-                                let frags = self.poly_fragments(i, pieces, true);
+                        match subtract_rings(std::slice::from_ref(&sam), &caps, min_area)
+                        {
+                            RingsSubtract::Untouched => {}
+                            RingsSubtract::Erased => changes.push((id, Vec::new())),
+                            RingsSubtract::Objects(objs) => {
+                                let frags = self.rings_fragments(i, objs);
                                 changes.push((id, frags));
                             }
                         }
@@ -2947,6 +2953,16 @@ impl FlowPaintApp {
                         }
                     }
                 }
+                Shape::Rings { rings } => {
+                    match subtract_rings(rings, &caps, min_area) {
+                        RingsSubtract::Untouched => {}
+                        RingsSubtract::Erased => changes.push((id, Vec::new())),
+                        RingsSubtract::Objects(objs) => {
+                            let frags = self.rings_fragments(i, objs);
+                            changes.push((id, frags));
+                        }
+                    }
+                }
                 Shape::Rect { .. } | Shape::Ellipse { .. } => {
                     // Convert to a polygon ring VIRTUALLY; only commit
                     // the conversion when the stroke actually cuts it
@@ -2954,17 +2970,12 @@ impl FlowPaintApp {
                     let ring = shape_ring(&self.model.objects[i].shape);
                     let obj = &self.model.objects[i];
                     if obj.filled {
-                        match subtract_polygon(&ring, &caps, min_area) {
-                            PolySubtract::Untouched => {}
-                            PolySubtract::Erased => changes.push((id, Vec::new())),
-                            PolySubtract::WouldHole => hole_refusals.push(
-                                match obj.shape {
-                                    Shape::Rect { .. } => "rectangle",
-                                    _ => "ellipse",
-                                },
-                            ),
-                            PolySubtract::Pieces(pieces) => {
-                                let frags = self.poly_fragments(i, pieces, true);
+                        match subtract_rings(std::slice::from_ref(&ring), &caps, min_area)
+                        {
+                            RingsSubtract::Untouched => {}
+                            RingsSubtract::Erased => changes.push((id, Vec::new())),
+                            RingsSubtract::Objects(objs) => {
+                                let frags = self.rings_fragments(i, objs);
                                 changes.push((id, frags));
                             }
                         }
@@ -2995,16 +3006,7 @@ impl FlowPaintApp {
             if stamp_touched {
                 msg.push_str(" Skipped a generated part — stamps can't be erased.");
             }
-            if !hole_refusals.is_empty() {
-                msg.push_str(" Skipped a filled shape — the stroke stayed inside it.");
-            }
             self.status = msg;
-        } else if !hole_refusals.is_empty() {
-            self.status = format!(
-                "That stroke stays inside the filled {} — holes aren't supported. \
-                 Drag the stroke across the shape's edge instead.",
-                hole_refusals[0]
-            );
         } else if stamp_touched {
             self.status = "Stamps (generated parts) can't be erased in this release — \
                            delete the stamp, or overdraw it with vector walls (that's \
@@ -3065,6 +3067,33 @@ impl FlowPaintApp {
                 }
                 o.shape = Shape::Poly { pts, closed: true };
                 o.filled = filled;
+                o
+            })
+            .collect()
+    }
+
+    /// Fragments for a rings subtraction (queue item 9): one object per
+    /// outermost ring; a hole-free object stays an ordinary filled
+    /// polygon, one with holes becomes `Shape::Rings`.
+    fn rings_fragments(
+        &mut self,
+        i: usize,
+        objs: Vec<Vec<Vec<[f32; 2]>>>,
+    ) -> Vec<SketchObject> {
+        let src = self.model.objects[i].clone();
+        objs.into_iter()
+            .enumerate()
+            .map(|(k, mut rings)| {
+                let mut o = src.clone();
+                if k > 0 {
+                    o.id = self.model.fresh_id();
+                }
+                o.shape = if rings.len() == 1 {
+                    Shape::Poly { pts: rings.pop().unwrap(), closed: true }
+                } else {
+                    Shape::Rings { rings }
+                };
+                o.filled = true;
                 o
             })
             .collect()
@@ -3137,7 +3166,7 @@ impl FlowPaintApp {
         // polyline's cursor-tracking rubber vertex.
         self.finish_gesture();
         let scene = SceneV10 {
-            version: SCENE_V11,
+            version: SCENE_V12,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -3192,7 +3221,7 @@ impl FlowPaintApp {
         } else {
             0
         };
-        if !(SCENE_V3..=SCENE_V11).contains(&version) {
+        if !(SCENE_V3..=SCENE_V12).contains(&version) {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
@@ -3498,6 +3527,11 @@ fn object_is_sane(o: &SketchObject) -> bool {
         }
         Shape::Spline { pts, .. } => {
             !pts.is_empty() && pts.len() <= 100_000 && pts.iter().all(finite2)
+        }
+        Shape::Rings { rings } => {
+            !rings.is_empty()
+                && rings.iter().map(|r| r.len()).sum::<usize>() <= 100_000
+                && rings.iter().all(|r| r.len() >= 3 && r.iter().all(finite2))
         }
     }
 }
@@ -4000,6 +4034,55 @@ mod scene_tests {
         // Both survive the load-path sanity filter.
         assert!(object_is_sane(&back.objects[0]));
         assert!(object_is_sane(&back.objects[1]));
+    }
+
+    /// v12 (queue item 9) round-trips the appended Rings variant — a
+    /// carved hole must survive a save/reload.
+    #[test]
+    fn v12_roundtrip_persists_rings() {
+        let mut donut: SketchObject = SketchObjectV7::from(v5_obj(41)).into();
+        donut.shape = Shape::Rings {
+            rings: vec![
+                vec![[0.0, 0.0], [40.0, 0.0], [40.0, 40.0], [0.0, 40.0]],
+                vec![[15.0, 15.0], [25.0, 15.0], [25.0, 25.0], [15.0, 25.0]],
+            ],
+        };
+        donut.filled = true;
+        let scene = SceneV10 {
+            version: SCENE_V12,
+            objects: vec![donut],
+            wind_tunnel: true,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 0,
+            mach: 1.6,
+            fluid_a: 343.0,
+            ranges: locked_ranges(),
+            probes: vec![],
+            probe_quantity: 0,
+            probe_show_plot: false,
+            edges: [1, 2, 3, 0],
+            gamma: 1.4,
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        assert_eq!(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            SCENE_V12
+        );
+        let back = bincode::deserialize::<SceneV10>(&bytes).unwrap();
+        match &back.objects[0].shape {
+            Shape::Rings { rings } => {
+                assert_eq!(rings.len(), 2);
+                assert_eq!(rings[1].len(), 4);
+            }
+            _ => panic!("expected rings"),
+        }
+        assert!(object_is_sane(&back.objects[0]));
     }
 
     /// A v8 FIXTURE (bytes written on the U3 branch pre-merge) loads

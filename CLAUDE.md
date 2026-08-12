@@ -58,13 +58,13 @@ Per-unit decisions that must not be re-derived live in
   `claude/si-decimal-inch-toggle-x17w11` (off main). All conversion at
   the UI boundary (`ui/units.rs` `fmt_*` out, `InputUnit` adapters
   in); canonical values stay SI. §T2-D.
-- Scene format: **v11** current (v10's layout; the bump marks the
-  appended Arc/Spline shape variants, item 8; v10 appends Euler
+- Scene format: **v12** current (v10's layout; v11/v12 mark the
+  appended Arc/Spline then Rings variants, items 8-9; v10 appends Euler
   `gamma`, item 2; v9 ABSORBED v8 — U3 nodes/probes above T2-C's
   `edges`), loads v3+ (v4/v5 share a layout; v6 appends lock/hide,
   pre-v6 via `SketchObjectV5`; v7 appends color ranges; v8/v9
   decode-only, pre-v8 via `SketchObjectV7`; pre-v9 edges from
-  `wind_tunnel`; pre-v10 is air). Funnel … → v10; bumps at v12.
+  `wind_tunnel`; pre-v10 is air). Funnel … → v10; bumps at v13.
 - Track-era static debt is fully paid, three folds, no more: T2-A's
   ranges (`Settings.ranges`, v7+), T2-B's probes (`Settings.probes`,
   v8+), T2-D's unit system (`Settings.unit_system` + `Cmd`, NOT
@@ -139,8 +139,8 @@ sponge, or the tunnel preset.
 The eraser is a per-object boolean subtract committed on release (one
 undo entry per stroke); the paint bucket emits a traced filled Poly;
 both share the degenerate-case guards in `src/geomops.rs`. Stamp
-erase and polygon holes are refused (indexed in `docs/deferred.md`;
-design report `docs/u4-eraser-design.md`). Every other U4 decision:
+erase is refused; an interior stroke carves a hole (`Shape::Rings`,
+item 9; design report `docs/u4-eraser-design.md`). U4 decisions:
 `docs/unit-decisions.md` §U4.
 
 ## Frame-time bench

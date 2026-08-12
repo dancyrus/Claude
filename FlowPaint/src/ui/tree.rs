@@ -89,6 +89,7 @@ impl FlowPaintApp {
                         Shape::Arc { .. } => "arc",
                         Shape::Spline { closed: true, .. } => "closed spline",
                         Shape::Spline { .. } => "spline",
+                        Shape::Rings { .. } => "polygon with holes",
                     };
                     (format!("{} #{:02} ({kind})", o.material.label(), o.id), false)
                 }

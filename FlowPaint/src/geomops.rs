@@ -163,6 +163,7 @@ pub fn point_in_polygon(p: [f32; 2], pts: &[[f32; 2]]) -> bool {
 }
 
 /// Point strictly inside a convex CCW (positive-area) ring.
+#[allow(dead_code)]
 fn point_in_convex(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
     let n = poly.len();
     for i in 0..n {
@@ -187,6 +188,19 @@ fn path_len(pts: &[[f32; 2]]) -> f32 {
 }
 
 // --- Centerline clipping (Line, open Poly, unfilled closed Poly) --------
+
+/// Even-odd point test over a set of rings (a filled region with
+/// holes — queue item 9). Orientation-free, like the rasterizer's
+/// scanline.
+pub fn point_in_rings(p: [f32; 2], rings: &[Vec<[f32; 2]>]) -> bool {
+    let mut inside = false;
+    for r in rings {
+        if r.len() >= 3 && point_in_polygon(p, r) {
+            inside = !inside;
+        }
+    }
+    inside
+}
 
 pub enum ClipPath {
     /// The stroke never reached the path.
@@ -555,7 +569,7 @@ fn poly_minus_convex(subject: &[[f32; 2]], clip: &[[f32; 2]]) -> ConvexSub {
 
     if hits.len() < 2 {
         // No transversal crossings: containment decides.
-        if point_in_convex(subject[0], clip) {
+        if point_in_polygon(subject[0], clip) {
             return ConvexSub::Erased;
         }
         if point_in_polygon(clip[0], subject) {
@@ -593,7 +607,7 @@ fn poly_minus_convex(subject: &[[f32; 2]], clip: &[[f32; 2]]) -> ConvexSub {
         // crossing — subject arcs between crossings are uniformly
         // inside or outside, so any interior point of the arc works.
         let mid = subject_arc_midpoint(subject, &hits[h], &hits[next]);
-        is_exit[h] = !point_in_convex(mid, clip);
+        is_exit[h] = !point_in_polygon(mid, clip);
     }
 
     let mut visited = vec![false; nh];
@@ -634,7 +648,7 @@ fn poly_minus_convex(subject: &[[f32; 2]], clip: &[[f32; 2]]) -> ConvexSub {
     }
 
     if pieces.is_empty() {
-        return if point_in_convex(subject[0], clip) {
+        return if point_in_polygon(subject[0], clip) {
             ConvexSub::Erased
         } else {
             ConvexSub::Untouched
@@ -693,6 +707,156 @@ fn subject_arc_midpoint(
 
 /// Clip vertices between two crossings, walking BACKWARD along the
 /// clip winding, excluding the crossing points themselves.
+/// Simple polygon UNION with a CONVEX ring — the difference walk's
+/// mirror (queue item 9: growing a hole ring by an overlapping stroke
+/// capsule). Keeps subject arcs outside the clip and joins them with
+/// clip arcs traversed FORWARD. Both rings CCW. Extra output rings are
+/// enclosed pockets the union pinched off (material inside a hole);
+/// even-odd keeps them meaningful, so the caller keeps them all.
+enum ConvexUnion {
+    /// Clip inside subject (or disjoint): the union is the subject.
+    Untouched,
+    /// Subject inside clip: the union is the clip ring.
+    Clip,
+    Pieces(Vec<Vec<[f32; 2]>>),
+}
+
+fn poly_union_convex(subject: &[[f32; 2]], clip: &[[f32; 2]]) -> ConvexUnion {
+    let sn = subject.len();
+    let cn = clip.len();
+    if sn < 3 || cn < 3 {
+        return ConvexUnion::Untouched;
+    }
+    let mut hits: Vec<Crossing> = Vec::new();
+    for i in 0..sn {
+        let (a0, a1) = (subject[i], subject[(i + 1) % sn]);
+        for j in 0..cn {
+            let (b0, b1) = (clip[j], clip[(j + 1) % cn]);
+            if let Some((t, u)) = segs_intersect(a0, a1, b0, b1) {
+                hits.push(Crossing {
+                    pos: lerp(a0, a1, t),
+                    s_edge: i,
+                    s_t: t,
+                    c_edge: j,
+                    c_t: u,
+                });
+            }
+        }
+    }
+    hits.sort_by(|a, b| (a.s_edge, param_key(a.s_t)).cmp(&(b.s_edge, param_key(b.s_t))));
+    hits.dedup_by(|a, b| len(sub(a.pos, b.pos)) < WELD_EPS);
+    if hits.len() >= 2 {
+        let first = hits.first().unwrap().pos;
+        let last = hits.last().unwrap().pos;
+        if len(sub(first, last)) < WELD_EPS {
+            hits.pop();
+        }
+    }
+    if hits.len() < 2 {
+        if point_in_polygon(subject[0], clip) {
+            return ConvexUnion::Clip;
+        }
+        return ConvexUnion::Untouched;
+    }
+
+    let nh = hits.len();
+    let mut s_order: Vec<usize> = (0..nh).collect();
+    s_order.sort_by(|&a, &b| {
+        (hits[a].s_edge, param_key(hits[a].s_t)).cmp(&(hits[b].s_edge, param_key(hits[b].s_t)))
+    });
+    let mut s_rank = vec![0usize; nh];
+    for (k, &h) in s_order.iter().enumerate() {
+        s_rank[h] = k;
+    }
+    let mut c_order: Vec<usize> = (0..nh).collect();
+    c_order.sort_by(|&a, &b| {
+        (hits[a].c_edge, param_key(hits[a].c_t)).cmp(&(hits[b].c_edge, param_key(hits[b].c_t)))
+    });
+    let mut c_rank = vec![0usize; nh];
+    for (k, &h) in c_order.iter().enumerate() {
+        c_rank[h] = k;
+    }
+
+    let mut is_exit = vec![false; nh];
+    for h in 0..nh {
+        let next = s_order[(s_rank[h] + 1) % nh];
+        let mid = subject_arc_midpoint(subject, &hits[h], &hits[next]);
+        is_exit[h] = !point_in_polygon(mid, clip);
+    }
+
+    let mut visited = vec![false; nh];
+    let mut pieces: Vec<Vec<[f32; 2]>> = Vec::new();
+    for start in 0..nh {
+        if !is_exit[start] || visited[start] {
+            continue;
+        }
+        let mut piece: Vec<[f32; 2]> = Vec::new();
+        let mut h = start;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 2 * (sn + cn + nh) {
+                break;
+            }
+            visited[h] = true;
+            piece.push(hits[h].pos);
+            // Subject arc forward (outside the clip) to the next
+            // crossing, like the difference walk...
+            let e = s_order[(s_rank[h] + 1) % nh];
+            push_subject_arc(&mut piece, subject, &hits[h], &hits[e]);
+            visited[e] = true;
+            piece.push(hits[e].pos);
+            // ...then the clip arc FORWARD to its clip-order successor
+            // (union keeps the clip arcs that lie outside the subject,
+            // in their own direction).
+            let x = c_order[(c_rank[e] + 1) % nh];
+            push_clip_arc_forward(&mut piece, clip, &hits[e], &hits[x]);
+            h = x;
+            if h == start {
+                break;
+            }
+        }
+        dedupe_ring(&mut piece);
+        if piece.len() >= 3 {
+            pieces.push(piece);
+        }
+    }
+    if pieces.is_empty() {
+        return if point_in_polygon(subject[0], clip) {
+            ConvexUnion::Clip
+        } else {
+            ConvexUnion::Untouched
+        };
+    }
+    ConvexUnion::Pieces(pieces)
+}
+
+/// Clip vertices strictly between two crossings, walking FORWARD.
+fn push_clip_arc_forward(
+    piece: &mut Vec<[f32; 2]>,
+    clip: &[[f32; 2]],
+    from: &Crossing,
+    to: &Crossing,
+) {
+    let cn = clip.len();
+    if from.c_edge == to.c_edge && to.c_t > from.c_t {
+        return; // same edge, no vertices between
+    }
+    let mut e = (from.c_edge + 1) % cn;
+    let mut guard = 0;
+    loop {
+        piece.push(clip[e]);
+        if e == to.c_edge {
+            break;
+        }
+        e = (e + 1) % cn;
+        guard += 1;
+        if guard > cn + 1 {
+            break;
+        }
+    }
+}
+
 fn push_clip_arc_reversed(
     piece: &mut Vec<[f32; 2]>,
     clip: &[[f32; 2]],
@@ -837,6 +1001,238 @@ pub fn trace_mask(mask: &[bool], w: usize, h: usize) -> Vec<[f32; 2]> {
         }
     }
     out
+}
+
+
+// --- Multi-ring (holes) subtraction — queue item 9 -------------------
+
+/// Result of subtracting a stroke from an even-odd multi-ring region.
+pub enum RingsSubtract {
+    Untouched,
+    Erased,
+    /// Surviving material, grouped into objects: each entry is one
+    /// outermost ring followed by every ring nested inside it (holes,
+    /// then islands the union walk pinched off, and so on — even-odd).
+    Objects(Vec<Vec<Vec<[f32; 2]>>>),
+}
+
+/// Subtract the stroke footprint from a filled EVEN-ODD region given as
+/// a ring soup (queue item 9 — this is the hole-capable successor of
+/// `subtract_polygon`; that fn remains for reference and tests). The
+/// key difference: a stroke wholly interior no longer refuses — it
+/// becomes a hole ring; an interior stroke overlapping a hole grows it
+/// (union walk); a stroke bridging the outer boundary and a hole merges
+/// them by folding the crossed holes into the clip before the
+/// difference walk, so even-odd parity never double-counts.
+pub fn subtract_rings(
+    rings_in: &[Vec<[f32; 2]>],
+    caps: &[Capsule],
+    min_area: f32,
+) -> RingsSubtract {
+    // Normalize: welded, >= 3 points, CCW. Even-odd is orientation-free
+    // but the walks want CCW.
+    let mut rings: Vec<Vec<[f32; 2]>> = Vec::new();
+    for r in rings_in {
+        let mut r = r.clone();
+        dedupe_ring(&mut r);
+        if r.len() < 3 {
+            continue;
+        }
+        if signed_area(&r) < 0.0 {
+            r.reverse();
+        }
+        rings.push(r);
+    }
+    if rings.is_empty() || caps.is_empty() {
+        return RingsSubtract::Untouched;
+    }
+
+    let near_ring = |c: &Capsule, r: &[[f32; 2]]| {
+        let n = r.len();
+        (0..n).any(|i| seg_seg_dist(c.a, c.b, r[i], r[(i + 1) % n]) <= c.r)
+    };
+    if caps
+        .iter()
+        .all(|c| !point_in_rings(c.a, &rings) && !rings.iter().any(|r| near_ring(c, r)))
+    {
+        return RingsSubtract::Untouched;
+    }
+
+    let mut changed = false;
+    for (ci, cap) in caps.iter().enumerate() {
+        if rings.is_empty() {
+            break;
+        }
+        // The same tangency-breaking jitter as subtract_polygon.
+        let jitter = 1.0 + 0.004 * ((ci % 5) as f32 + 1.0) / 5.0;
+        let clip0 = Capsule { a: cap.a, b: cap.b, r: cap.r * jitter }.polygonize();
+
+        // Rings the capsule boundary actually crosses.
+        let crossed: Vec<usize> = (0..rings.len())
+            .filter(|&i| {
+                let r = &rings[i];
+                let n = r.len();
+                let cn = clip0.len();
+                (0..n).any(|a| {
+                    (0..cn).any(|b| {
+                        segs_intersect(
+                            r[a],
+                            r[(a + 1) % n],
+                            clip0[b],
+                            clip0[(b + 1) % cn],
+                        )
+                        .is_some()
+                    })
+                })
+            })
+            .collect();
+
+        if crossed.is_empty() {
+            let inside_clip: Vec<usize> = (0..rings.len())
+                .filter(|&i| point_in_polygon(rings[i][0], &clip0))
+                .collect();
+            if point_in_rings(cap.a, &rings) {
+                // Interior island: it becomes a hole. Anything wholly
+                // inside the clip (smaller holes, islands) is consumed.
+                for &i in inside_clip.iter().rev() {
+                    rings.remove(i);
+                }
+                rings.push(clip0);
+                changed = true;
+            } else if !inside_clip.is_empty() {
+                // The clip swallows whole ring(s) without crossing any
+                // (a small piece and its contents vanish).
+                for &i in inside_clip.iter().rev() {
+                    rings.remove(i);
+                }
+                changed = true;
+            }
+            continue;
+        }
+
+        // Parity under the CURRENT soup: even = a fill boundary, odd =
+        // a hole boundary.
+        let parity = |i: usize, rings: &[Vec<[f32; 2]>]| -> usize {
+            (0..rings.len())
+                .filter(|&j| j != i && point_in_polygon(rings[i][0], &rings[j]))
+                .count()
+        };
+        let crossed_holes: Vec<usize> = crossed
+            .iter()
+            .copied()
+            .filter(|&i| parity(i, &rings) % 2 == 1)
+            .collect();
+        let crossed_fills: Vec<usize> = crossed
+            .iter()
+            .copied()
+            .filter(|&i| parity(i, &rings) % 2 == 0)
+            .collect();
+
+        // Fold crossed holes into the clip (union), collecting any
+        // pinched-off pockets as island rings.
+        let mut clip = clip0.clone();
+        let mut pockets: Vec<Vec<[f32; 2]>> = Vec::new();
+        for &hi in &crossed_holes {
+            match poly_union_convex(&rings[hi], &clip) {
+                ConvexUnion::Untouched => {}
+                ConvexUnion::Clip => {}
+                ConvexUnion::Pieces(mut ps) => {
+                    // Largest piece is the merged boundary; the rest are
+                    // enclosed pockets of material.
+                    ps.sort_by(|a, b| {
+                        signed_area(b)
+                            .abs()
+                            .partial_cmp(&signed_area(a).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    clip = ps.remove(0);
+                    pockets.extend(ps);
+                }
+            }
+        }
+
+        // Anything wholly inside the merged clip is consumed. (Use the
+        // merged clip: a hole that the stroke bridges INTO is part of
+        // the void now.)
+        let consumed: Vec<usize> = (0..rings.len())
+            .filter(|&i| !crossed.contains(&i) && point_in_polygon(rings[i][0], &clip))
+            .collect();
+
+        let mut next: Vec<Vec<[f32; 2]>> = Vec::new();
+        for (i, r) in rings.iter().enumerate() {
+            if consumed.contains(&i) || crossed_holes.contains(&i) {
+                continue; // folded into the clip or swallowed by it
+            }
+            if crossed_fills.contains(&i) {
+                match poly_minus_convex(r, &clip) {
+                    ConvexSub::Untouched => next.push(r.clone()),
+                    ConvexSub::Erased => {}
+                    // Connectivity lost to float noise: keep the ring,
+                    // lose a sliver of erase (the subtract_polygon
+                    // precedent).
+                    ConvexSub::Hole => next.push(r.clone()),
+                    ConvexSub::Pieces(ps) => next.extend(ps),
+                }
+                changed = true;
+            } else {
+                next.push(r.clone());
+            }
+        }
+        if crossed_fills.is_empty() && !crossed_holes.is_empty() {
+            // Interior stroke widening hole(s): the merged clip IS the
+            // new hole boundary.
+            next.push(clip);
+            changed = true;
+        }
+        next.extend(pockets);
+        rings = next;
+    }
+
+    if !changed {
+        return RingsSubtract::Untouched;
+    }
+
+    // Guards: weld, sliver-drop, re-normalize.
+    let mut out: Vec<Vec<[f32; 2]>> = Vec::new();
+    for mut r in rings {
+        dedupe_ring(&mut r);
+        if r.len() >= 3 && signed_area(&r).abs() >= min_area {
+            if signed_area(&r) < 0.0 {
+                r.reverse();
+            }
+            out.push(r);
+        }
+    }
+    // Group into objects: each parity-0 ring plus everything nested in
+    // it. A hole with no surviving fill ring around it is void — drop.
+    let contains = |i: usize, j: usize, rings: &[Vec<[f32; 2]>]| {
+        i != j && point_in_polygon(rings[j][0], &rings[i])
+    };
+    let parity_of = |i: usize, rings: &[Vec<[f32; 2]>]| {
+        (0..rings.len()).filter(|&j| contains(j, i, rings)).count()
+    };
+    let mut objects: Vec<Vec<Vec<[f32; 2]>>> = Vec::new();
+    let outers: Vec<usize> =
+        (0..out.len()).filter(|&i| parity_of(i, &out) == 0).collect();
+    for &oi in &outers {
+        let mut obj = vec![out[oi].clone()];
+        for j in 0..out.len() {
+            if j != oi && contains(oi, j, &out) {
+                obj.push(out[j].clone());
+            }
+        }
+        objects.push(obj);
+    }
+    if objects.is_empty() {
+        return RingsSubtract::Erased;
+    }
+    objects.sort_by(|a, b| {
+        signed_area(&b[0])
+            .abs()
+            .partial_cmp(&signed_area(&a[0]).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    RingsSubtract::Objects(objects)
 }
 
 #[cfg(test)]
@@ -996,10 +1392,71 @@ mod tests {
     }
 
     #[test]
-    fn interior_stroke_refuses_with_hole() {
+    fn interior_stroke_carves_hole() {
+        // Queue item 9 REPLACES interior_stroke_refuses_with_hole: an
+        // erase wholly interior to a filled shape now carves a hole
+        // ring instead of refusing (recorded in docs/unit-decisions.md).
         let p = square(20.0);
         let caps = [cap([10.0, 10.0], [10.0, 10.0], 3.0)];
+        match subtract_rings(std::slice::from_ref(&p), &caps, MIN_AREA) {
+            RingsSubtract::Objects(objs) => {
+                assert_eq!(objs.len(), 1, "one object");
+                assert_eq!(objs[0].len(), 2, "outer + hole");
+                // The centre is void, material remains around it, and
+                // the far corner region is untouched.
+                assert!(!point_in_rings([10.0, 10.0], &objs[0]));
+                assert!(point_in_rings([1.0, 1.0], &objs[0]));
+                assert!(point_in_rings([10.0, 1.5], &objs[0]));
+            }
+            _ => panic!("expected a carved hole"),
+        }
+        // The legacy single-ring helper still reports WouldHole — it is
+        // out of the production flow but pins the old semantics.
         assert!(matches!(subtract_polygon(&p, &caps, MIN_AREA), PolySubtract::WouldHole));
+    }
+
+    #[test]
+    fn interior_stroke_widens_an_existing_hole() {
+        let p = square(20.0);
+        let hole = vec![[8.0, 8.0], [12.0, 8.0], [12.0, 12.0], [8.0, 12.0]];
+        // A dot overlapping the hole's edge, still interior overall.
+        let caps = [cap([12.5, 10.0], [12.5, 10.0], 2.0)];
+        match subtract_rings(&[p, hole], &caps, MIN_AREA) {
+            RingsSubtract::Objects(objs) => {
+                assert_eq!(objs.len(), 1);
+                assert_eq!(objs[0].len(), 2, "still outer + ONE hole");
+                assert!(!point_in_rings([10.0, 10.0], &objs[0]), "old hole");
+                assert!(!point_in_rings([13.5, 10.0], &objs[0]), "widened part");
+                assert!(point_in_rings([10.0, 2.0], &objs[0]));
+            }
+            _ => panic!("expected a widened hole"),
+        }
+    }
+
+    #[test]
+    fn stroke_bridging_edge_and_hole_merges_them() {
+        let p = square(20.0);
+        let hole = vec![[8.0, 8.0], [12.0, 8.0], [12.0, 12.0], [8.0, 12.0]];
+        // A stroke from outside the square straight into the hole.
+        let caps = [
+            cap([21.0, 10.0], [14.0, 10.0], 1.5),
+            cap([14.0, 10.0], [10.0, 10.0], 1.5),
+        ];
+        match subtract_rings(&[p, hole], &caps, MIN_AREA) {
+            RingsSubtract::Objects(objs) => {
+                // The hole opened to the outside: every surviving object
+                // is hole-free (a C shape, possibly split).
+                for o in &objs {
+                    assert_eq!(o.len(), 1, "no ring may remain nested");
+                }
+                let all = objs.concat();
+                assert!(!point_in_rings([10.0, 10.0], &all), "old hole void");
+                assert!(!point_in_rings([16.0, 10.0], &all), "corridor void");
+                assert!(point_in_rings([10.0, 2.0], &all), "material below");
+                assert!(point_in_rings([10.0, 18.0], &all), "material above");
+            }
+            _ => panic!("expected a merge"),
+        }
     }
 
     #[test]

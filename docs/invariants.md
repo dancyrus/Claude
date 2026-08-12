@@ -41,7 +41,7 @@ undo without an explicit decision recorded in
 | Locked and hidden objects are not click-selectable or rasterized | `hit_test_skips_locked_and_hidden`, `group_flags_apply_to_subtree` |
 | One user action is one undo entry, across a whole selection | `add_many_*`, `remove_many_*`, `modify_many_*`, `group_is_one_undo_entry`, `array_steps_in_world_space_one_undo_entry`, `apply_erase_split_is_one_undo_entry_*` |
 | A mirrored group is a deep copy, never an instance | `mirrored_group_is_deep_and_disentangled` |
-| An erase wholly interior to a filled shape refuses | `interior_stroke_refuses_with_hole` |
+| An erase wholly interior to a filled shape carves a hole | `interior_stroke_carves_hole` (queue item 9 reversed the U4 refusal) |
 | A flood fill open to the domain edge refuses | `flood_open_region_refuses` |
 | Inch mode round-trips to SI without drift | `inch_mode_formats_and_si_round_trip` |
 | An exported PNG carries units and names its system | `run_conditions_carry_units_and_name_the_system`, `legend_prints_locked_range_value` |
@@ -71,9 +71,9 @@ No test covers these. A checker agent must launch the build and look.
    matching the screen.
 7. **Both solvers run**: LBM incompressible and Euler compressible,
    with the scene switching between them intact.
-8. **Refusals are specific.** The eraser refuses in two unrelated
-   cases (over a stamp, wholly interior to a filled shape). Each says
-   something different and true.
+8. **Refusals are specific.** The eraser refuses over a stamp, and
+   the message says so. (The interior-stroke refusal became a carved
+   hole at queue item 9.)
 
 ## Structural
 
@@ -104,5 +104,6 @@ Not violations. Do not "fix" them without a decision.
   reach.
 - Absolute bench numbers are not comparable across hosts or across
   container rebuilds. Only paired same-session A/B means anything.
-- Holes in filled polygons are unrepresentable, which is why the
-  interior-erase refusal exists.
+- The paint bucket still covers fluid sealed inside a hollow island
+  (it fills the outer contour it traces); carving the hole afterward
+  with the eraser is the workaround.

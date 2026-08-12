@@ -250,9 +250,8 @@ impl FlowPaintApp {
                          undo step per stroke. Stamps (generated parts) \
                          can't be erased in this release — delete them or \
                          overdraw with vector walls (that's how to vent a \
-                         nozzle bell). A hole fully inside a filled shape \
-                         isn't supported — drag the stroke across the \
-                         shape's edge.",
+                         nozzle bell). A stroke fully inside a filled \
+                         shape carves a hole.",
                     ),
                     (
                         Tool::Measure,

@@ -151,18 +151,14 @@ at the bottom before adding anything back.
 ### Holes in filled polygons
 - `Shape::Poly` with interior rings — annuli, ducts with a bore,
   plates with a port.
-- **DEFERRED.**
-- Why: a hole representation touches the scene format, the fill
-  rasterizer, hit tests, handles, and every boolean. Two shipped
-  behaviors are consequences of its absence, both verified on main:
-  the eraser refuses a stroke wholly interior to a filled polygon
-  (`PolySubtract::WouldHole`, with its own status message), and the
-  paint bucket covers fluid sealed inside a hollow island. Until it
-  lands, such parts are built from outline rings or two overlapping
-  shapes.
-- Unblocks: an interior-ring representation in `Shape::Poly`, plus the
-  format bump and the rasterizer/hit-test/boolean support that comes
-  with it.
+- **SHIPPED at queue item 9** (entry retained for the history):
+  `Shape::Rings` is an even-odd ring soup the eraser creates by
+  carving a filled shape; the interior-stroke refusal is gone
+  (`subtract_rings`, scene v12). Still true from the old entry: the
+  paint bucket covers fluid sealed inside a hollow island — it traces
+  the outer contour only.
+- Unblocks: nothing pending — see `docs/unit-decisions.md`
+  §Queue item 9.
 - Reasoning: `docs/flowpaint-plan-v4.1.md` §"Deferred, on purpose";
   `docs/u4-eraser-design.md` §"The hole case";
   `docs/unit-decisions.md` §U4 (bucket caveat).
