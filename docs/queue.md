@@ -40,9 +40,10 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
 8. **Arcs and splines as `Shape` variants** — DONE
    (`claude/agent-protocol-amendments-ohhfmn`)
 9. **Holes in filled polygons** (removes the U4 interior-erase
-   refusal) — depends on 8 — IN PROGRESS
+   refusal) — depends on 8 — DONE
    (`claude/agent-protocol-amendments-ohhfmn`)
-10. **Union and intersect booleans** — depends on 9 — UNCLAIMED
+10. **Union and intersect booleans** — depends on 9 — IN PROGRESS
+    (`claude/agent-protocol-amendments-ohhfmn`)
 11. **DXF/SVG import — REPORT FIRST**: DXF is mostly arcs and
     circles. Say whether you are consuming the new arc primitive or
     flattening to polylines, and what that costs — depends on 10 —
