@@ -512,6 +512,76 @@ impl SceneV9 {
     }
 }
 
+/// Scene file (version 10): the v9 layout plus the per-mode bottom of
+/// the color scale appended (queue item 4 — asymmetric manual
+/// min/max). Kept out of `SceneRange` so the v7/v8/v9 decode layouts
+/// stay byte-exact; the lineage stays append-only.
+#[derive(Serialize, Deserialize)]
+struct SceneV10 {
+    version: u32,
+    objects: Vec<SketchObject>,
+    wind_tunnel: bool,
+    flow_speed: f32,
+    viscosity: f32,
+    steps_per_frame: u32,
+    domain_width_m: f32,
+    fluid_nu: f32,
+    fluid_rho: f32,
+    ref_width: u32,
+    /// 0 = LBM (incompressible), 1 = Euler (compressible).
+    solver: u32,
+    mach: f32,
+    fluid_a: f32,
+    /// Indexed by `RenderMode as usize`; the Dye entry is unused.
+    ranges: [SceneRange; 4],
+    probes: Vec<SceneProbe>,
+    /// `ProbeQuantity` as its ALL-index (0 Speed … 3 Smoke).
+    probe_quantity: u32,
+    probe_show_plot: bool,
+    /// Edge kinds in `EDGE_NAMES` order (left, right, top, bottom):
+    /// 0 = far field, 1 = inlet, 2 = outlet, 3 = wall, 4 = periodic
+    /// (reserved discriminant; loads as far field until it ships).
+    edges: [u32; 4],
+    /// Bottom of each mode's color scale in physical units, indexed by
+    /// `RenderMode as usize` (queue item 4). Pre-v10 files derive the
+    /// symmetric legacy bottom: 0 for Speed, −max for the rest.
+    range_min_phys: [f32; 4],
+}
+
+impl SceneV10 {
+    /// A v9-or-older scene: the bottom every pre-item-4 scale had —
+    /// 0 for Speed, symmetric −max for the diverging modes.
+    fn from_v9(s: SceneV9) -> Self {
+        let mins = [
+            0.0,
+            0.0,
+            -s.ranges[2].sat_phys,
+            -s.ranges[3].sat_phys,
+        ];
+        SceneV10 {
+            version: s.version,
+            objects: s.objects,
+            wind_tunnel: s.wind_tunnel,
+            flow_speed: s.flow_speed,
+            viscosity: s.viscosity,
+            steps_per_frame: s.steps_per_frame,
+            domain_width_m: s.domain_width_m,
+            fluid_nu: s.fluid_nu,
+            fluid_rho: s.fluid_rho,
+            ref_width: s.ref_width,
+            solver: s.solver,
+            mach: s.mach,
+            fluid_a: s.fluid_a,
+            ranges: s.ranges,
+            probes: s.probes,
+            probe_quantity: s.probe_quantity,
+            probe_show_plot: s.probe_show_plot,
+            edges: s.edges,
+            range_min_phys: mins,
+        }
+    }
+}
+
 fn edge_kind_to_u32(k: EdgeKind) -> u32 {
     match k {
         EdgeKind::FarField => 0,
@@ -542,8 +612,11 @@ const SCENE_V6: u32 = 6;
 const SCENE_V7: u32 = 7;
 /// U3's format, decode-only since the second track merge.
 const SCENE_V8: u32 = 8;
-/// Current (T2-C + U3 merged): v8 absorbed, edge kinds appended.
+/// T2-C + U3 merged (v8 absorbed, edge kinds appended); decode-only
+/// since queue item 4.
 const SCENE_V9: u32 = 9;
+/// Current: v9 plus the per-mode color-scale bottom (queue item 4).
+const SCENE_V10: u32 = 10;
 
 /// A fluid/regime preset: maps a named physical situation onto lattice
 /// parameters. (The solver is incompressible, so "supersonic" is a
@@ -780,6 +853,9 @@ enum Cmd {
     /// Color-range edits from the legend (T2-A), per render mode.
     SetRangeMode(RenderMode, RangeMode),
     SetRangeMax(RenderMode, f32),
+    /// Bottom of a Manual range (queue item 4): 0 for Speed and
+    /// −max for the diverging modes reproduce the symmetric behavior.
+    SetRangeMin(RenderMode, f32),
     SetColorMap(RenderMode, ColorMap),
     /// Probe edits (T2-B fold): the store lives in `Settings.probes`;
     /// panels read the per-frame `ProbeUi` snapshot and write these.
@@ -1781,7 +1857,19 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
         Cmd::SetParticleBrightness(v) => sim.settings.particle_brightness = v,
         Cmd::SetSpongeStrength(v) => sim.settings.sponge_strength = v,
         Cmd::SetRangeMode(m, v) => sim.settings.ranges[m as usize].mode = v,
-        Cmd::SetRangeMax(m, v) => sim.settings.ranges[m as usize].sat_phys = v.max(1e-6),
+        Cmd::SetRangeMax(m, v) => {
+            let fr = &mut sim.settings.ranges[m as usize];
+            fr.sat_phys = v.max(1e-6);
+            // The window stays non-empty: the bottom trails the top.
+            fr.min_phys = fr.min_phys.min(fr.sat_phys - 1e-6);
+        }
+        Cmd::SetRangeMin(m, v) => {
+            let fr = &mut sim.settings.ranges[m as usize];
+            // Speed is a magnitude, so its bottom cannot go below 0;
+            // the diverging modes take any bottom below the top.
+            let floor = if m == RenderMode::Speed { 0.0 } else { f32::NEG_INFINITY };
+            fr.min_phys = v.clamp(floor, (fr.sat_phys - 1e-6).max(floor));
+        }
         Cmd::SetColorMap(m, v) => sim.settings.ranges[m as usize].map = v,
         Cmd::AddProbe(pos) => {
             let pr = &mut sim.settings.probes;
@@ -2842,8 +2930,8 @@ impl FlowPaintApp {
         // Commit any in-flight gesture so the file doesn't capture a
         // polyline's cursor-tracking rubber vertex.
         self.finish_gesture();
-        let scene = SceneV9 {
-            version: SCENE_V9,
+        let scene = SceneV10 {
+            version: SCENE_V10,
             objects: self.model.objects.clone(),
             wind_tunnel: snap.tunnel,
             flow_speed: snap.flow,
@@ -2872,6 +2960,7 @@ impl FlowPaintApp {
                 .unwrap_or(0) as u32,
             probe_show_plot: self.probe_ui.show_plot,
             edges: snap.edges.0.map(edge_kind_to_u32),
+            range_min_phys: snap.ranges.map(|fr| fr.min_phys),
         };
         match bincode::serialize(&scene) {
             Ok(bytes) => {
@@ -2897,7 +2986,7 @@ impl FlowPaintApp {
         } else {
             0
         };
-        if !(SCENE_V3..=SCENE_V9).contains(&version) {
+        if !(SCENE_V3..=SCENE_V10).contains(&version) {
             self.status =
                 "Load failed: not a FlowPaint V2 scene (older .flow files aren't supported)"
                     .into();
@@ -2908,22 +2997,28 @@ impl FlowPaintApp {
         // objects decode via the SketchObjectV5 mirror; v7 appends the
         // color ranges; v8 (U3) appends parent links / group nodes and
         // the probe set — pre-v8 objects decode via the SketchObjectV7
-        // mirror; v9 (T2-C, current) appends the edge kinds, derived
-        // from wind_tunnel for anything older. Everything funnels
-        // upward: … → v6 → v7 → v8 → v9.
-        let decoded = if version >= SCENE_V9 {
-            bincode::deserialize::<SceneV9>(&bytes)
+        // mirror; v9 (T2-C) appends the edge kinds, derived from
+        // wind_tunnel for anything older; v10 (queue item 4, current)
+        // appends the color-scale bottoms, symmetric for anything
+        // older. Everything funnels upward: … → v6 → v7 → v8 → v9 →
+        // v10.
+        let decoded = if version >= SCENE_V10 {
+            bincode::deserialize::<SceneV10>(&bytes)
+        } else if version >= SCENE_V9 {
+            bincode::deserialize::<SceneV9>(&bytes).map(SceneV10::from_v9)
         } else if version >= SCENE_V8 {
-            bincode::deserialize::<SceneV8>(&bytes).map(SceneV9::from_v8)
+            bincode::deserialize::<SceneV8>(&bytes)
+                .map(|s| SceneV10::from_v9(SceneV9::from_v8(s)))
         } else if version >= SCENE_V7 {
             bincode::deserialize::<SceneV7>(&bytes)
-                .map(|s| SceneV9::from_v8(SceneV8::from_v7(s)))
+                .map(|s| SceneV10::from_v9(SceneV9::from_v8(SceneV8::from_v7(s))))
         } else if version >= SCENE_V6 {
-            bincode::deserialize::<SceneV6>(&bytes)
-                .map(|s| SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(s))))
+            bincode::deserialize::<SceneV6>(&bytes).map(|s| {
+                SceneV10::from_v9(SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(s))))
+            })
         } else if version >= SCENE_V4 {
             bincode::deserialize::<SceneV4>(&bytes).map(|s| {
-                SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
+                SceneV10::from_v9(SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
                     version: s.version,
                     objects: s.objects.into_iter().map(Into::into).collect(),
                     wind_tunnel: s.wind_tunnel,
@@ -2937,11 +3032,11 @@ impl FlowPaintApp {
                     solver: s.solver,
                     mach: s.mach,
                     fluid_a: s.fluid_a,
-                })))
+                }))))
             })
         } else {
             bincode::deserialize::<SceneV3>(&bytes).map(|s| {
-                SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
+                SceneV10::from_v9(SceneV9::from_v8(SceneV8::from_v7(SceneV7::from_v6(SceneV6 {
                     version: s.version,
                     objects: s.objects.into_iter().map(Into::into).collect(),
                     wind_tunnel: s.wind_tunnel,
@@ -2955,7 +3050,7 @@ impl FlowPaintApp {
                     solver: 0,
                     mach: 1.6,
                     fluid_a: 343.0,
-                })))
+                }))))
             })
         };
         match decoded {
@@ -3050,6 +3145,13 @@ impl FlowPaintApp {
                         },
                     ));
                     cmds.push(Cmd::SetRangeMax(mode, sane_f32(r.sat_phys, 1e-6, 1e9, 1.0)));
+                    // v10 append; `from_v9` derives the symmetric
+                    // legacy bottom for older files. Applied after the
+                    // max so the min-below-max clamp sees the real top.
+                    cmds.push(Cmd::SetRangeMin(
+                        mode,
+                        sane_f32(scene.range_min_phys[mode as usize], -1e9, 1e9, 0.0),
+                    ));
                     cmds.push(Cmd::SetColorMap(
                         mode,
                         if r.map == 1 { ColorMap::Coolwarm } else { ColorMap::Inferno },
@@ -3581,6 +3683,82 @@ mod scene_tests {
         let decoded = EdgeBcs(back.edges.map(edge_kind_from_u32));
         assert_eq!(decoded.0[0], EdgeKind::Inlet);
         assert_eq!(decoded.0[2], EdgeKind::Wall);
+    }
+
+    /// v10 round-trips an asymmetric color window (queue item 4): a
+    /// Manual bottom that is neither 0 nor −max survives save/load.
+    #[test]
+    fn v10_roundtrip_persists_asymmetric_range_min() {
+        let mut ranges = crate::sim::FIELD_RANGE_DEFAULTS.map(SceneRange::from);
+        ranges[RenderMode::Pressure as usize] =
+            SceneRange { mode: 2, sat_phys: 50.0, map: 1 };
+        let mut range_min_phys = [0.0f32; 4];
+        range_min_phys[RenderMode::Pressure as usize] = -10.0;
+        let scene = SceneV10 {
+            version: SCENE_V10,
+            objects: vec![SketchObjectV7::from(v5_obj(4)).into()],
+            wind_tunnel: true,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 0,
+            mach: 1.6,
+            fluid_a: 343.0,
+            ranges,
+            probes: Vec::new(),
+            probe_quantity: 0,
+            probe_show_plot: false,
+            edges: [0, 0, 0, 0],
+            range_min_phys,
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        let version = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(version, SCENE_V10);
+        let back = bincode::deserialize::<SceneV10>(&bytes).unwrap();
+        let r = back.ranges[RenderMode::Pressure as usize];
+        assert_eq!((r.mode, r.sat_phys), (2, 50.0));
+        assert_eq!(back.range_min_phys[RenderMode::Pressure as usize], -10.0);
+    }
+
+    /// v9 bytes funnel into v10 with the symmetric legacy bottoms:
+    /// 0 for Speed, −max for the diverging modes.
+    #[test]
+    fn v9_bytes_convert_to_v10_with_symmetric_mins() {
+        let scene = SceneV9 {
+            version: SCENE_V9,
+            objects: vec![SketchObjectV7::from(v5_obj(4)).into()],
+            wind_tunnel: false,
+            flow_speed: 0.09,
+            viscosity: 0.015,
+            steps_per_frame: 8,
+            domain_width_m: 1.0,
+            fluid_nu: 1.5e-5,
+            fluid_rho: 1.2,
+            ref_width: 1920,
+            solver: 0,
+            mach: 1.6,
+            fluid_a: 343.0,
+            ranges: locked_ranges(),
+            probes: Vec::new(),
+            probe_quantity: 0,
+            probe_show_plot: false,
+            edges: [0, 0, 0, 0],
+        };
+        let bytes = bincode::serialize(&scene).unwrap();
+        let back = SceneV10::from_v9(bincode::deserialize::<SceneV9>(&bytes).unwrap());
+        assert_eq!(back.range_min_phys[RenderMode::Speed as usize], 0.0);
+        assert_eq!(
+            back.range_min_phys[RenderMode::Vorticity as usize],
+            -back.ranges[RenderMode::Vorticity as usize].sat_phys
+        );
+        assert_eq!(
+            back.range_min_phys[RenderMode::Pressure as usize],
+            -back.ranges[RenderMode::Pressure as usize].sat_phys
+        );
     }
 
     /// A v8 FIXTURE (bytes written on the U3 branch pre-merge) loads

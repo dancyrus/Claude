@@ -248,21 +248,35 @@ pub struct FieldRange {
     /// The same point in physical units (m/s, 1/s, Pa) — what the UI
     /// shows and edits, and what a pinned range holds on to.
     pub sat_phys: f32,
+    /// Bottom of the scale in render-buffer units (queue item 4). Under
+    /// Auto this tracks the mode's natural bottom — 0 for Speed,
+    /// −`sat_render` for the diverging modes — which is also what every
+    /// pre-item-4 range was; Manual lets the user move it.
+    pub min_render: f32,
+    /// The bottom of the scale in physical units — the pinned twin.
+    pub min_phys: f32,
     /// The colormap this view draws with (user-pickable, T2-A).
     pub map: ColorMap,
 }
 
-const fn field_range_default(map: ColorMap) -> FieldRange {
-    FieldRange { mode: RangeMode::Auto, sat_render: 1.0, sat_phys: 0.0, map }
+const fn field_range_default(map: ColorMap, min_render: f32) -> FieldRange {
+    FieldRange {
+        mode: RangeMode::Auto,
+        sat_render: 1.0,
+        sat_phys: 0.0,
+        min_render,
+        min_phys: 0.0,
+        map,
+    }
 }
 
 /// The color-range defaults, indexed by `RenderMode as usize`. The Dye
 /// entry is unused — smoke is a passive tracer with no scale to lock.
 pub const FIELD_RANGE_DEFAULTS: [FieldRange; 4] = [
-    field_range_default(ColorMap::Inferno),  // Dye (unused)
-    field_range_default(ColorMap::Inferno),  // Speed
-    field_range_default(ColorMap::Coolwarm), // Vorticity
-    field_range_default(ColorMap::Coolwarm), // Pressure
+    field_range_default(ColorMap::Inferno, 0.0),   // Dye (unused)
+    field_range_default(ColorMap::Inferno, 0.0),   // Speed
+    field_range_default(ColorMap::Coolwarm, -1.0), // Vorticity
+    field_range_default(ColorMap::Coolwarm, -1.0), // Pressure
 ];
 
 // --- Per-edge boundary conditions (plan v4.1, T2-C) -------------------
@@ -587,6 +601,11 @@ struct RenderParamsRaw {
     smoke_gain: f32,
     particle_size: f32,
     particle_brightness: f32,
+    /// Offset the shader subtracts from the normalized field value
+    /// after the gain — 0 unless a pinned range has an asymmetric
+    /// min/max (queue item 4). Padded to keep the uniform 16-aligned.
+    range_offset: f32,
+    _pad_ro: [f32; 3],
 }
 
 /// Per-frame viewport mapping computed by the app from the canvas rect.
@@ -1342,25 +1361,40 @@ impl GpuSim {
         flags
     }
 
-    /// The display gain the render uniform should carry. A pinned
-    /// (Locked/Manual) range maps onto the one knob the shader exposes:
-    /// every mapping in render.wgsl is linear in `display_gain`, so a
-    /// fixed saturation point is a per-frame gain — each arm below sets
-    /// the shader's clip point to `sat_render` by inverting the
-    /// corresponding normalization. Auto passes the user's gain through.
-    fn range_display_gain(&self) -> f32 {
+    /// The display gain and range offset the render uniform should
+    /// carry. A pinned (Locked/Manual) range maps onto the two knobs
+    /// the shader exposes: every mapping in render.wgsl is linear in
+    /// `display_gain` and shifted by `range_offset`, so an arbitrary
+    /// [min, max] window is a per-frame (gain, offset) pair — each arm
+    /// below sends `min_render..sat_render` onto the map's domain
+    /// (0..1 for Speed, −1..1 for the diverging modes) by inverting
+    /// the corresponding normalization. Auto passes the user's gain
+    /// through with offset 0, which is byte-identical to the
+    /// pre-item-4 mapping.
+    fn range_gain_offset(&self) -> (f32, f32) {
         let mode = self.settings.render_mode;
         let fr = self.settings.ranges[mode as usize];
         if fr.mode == RangeMode::Auto {
-            return self.settings.display_gain;
+            return (self.settings.display_gain, 0.0);
         }
-        let sat = fr.sat_render.max(1e-9);
+        let span = (fr.sat_render - fr.min_render).max(1e-9);
         let inlet = self.render_inlet_speed();
         match mode {
-            RenderMode::Speed => (inlet * 1.6).max(1e-3) / sat,
-            RenderMode::Vorticity => inlet.max(0.02) / (4.0 * sat),
-            RenderMode::Pressure => 1.0 / (25.0 * sat),
-            RenderMode::Dye => self.settings.display_gain,
+            // t = s·gain/(inlet·1.6) − off  must equal (s − min)/span.
+            RenderMode::Speed => {
+                ((inlet * 1.6).max(1e-3) / span, fr.min_render / span)
+            }
+            // t = curl·gain·(4/inlet) − off  must equal (2v − (max+min))/span.
+            RenderMode::Vorticity => (
+                inlet.max(0.02) / (2.0 * span),
+                (fr.sat_render + fr.min_render) / span,
+            ),
+            // t = p·gain·25 − off  must equal (2p − (max+min))/span.
+            RenderMode::Pressure => (
+                2.0 / (25.0 * span),
+                (fr.sat_render + fr.min_render) / span,
+            ),
+            RenderMode::Dye => (self.settings.display_gain, 0.0),
         }
     }
 
@@ -1824,10 +1858,12 @@ impl GpuSim {
             inlet_speed: self.render_inlet_speed(),
             vis_origin,
             vis_size,
-            display_gain: self.range_display_gain(),
+            display_gain: self.range_gain_offset().0,
             smoke_gain: self.settings.smoke_gain,
             particle_size: self.settings.particle_size,
             particle_brightness: self.settings.particle_brightness,
+            range_offset: self.range_gain_offset().1,
+            _pad_ro: [0.0; 3],
         };
         self.queue.write_buffer(&self.render_uniform, 0, bytemuck::bytes_of(&p));
     }
@@ -1881,12 +1917,14 @@ impl GpuSim {
             inlet_speed: self.render_inlet_speed(),
             vis_origin: [self.margin as u32, self.margin as u32],
             vis_size: [self.vis_w as u32, self.vis_h as u32],
-            // The same effective gain as the live view, so an exported
-            // PNG of a locked range matches the screen.
-            display_gain: self.range_display_gain(),
+            // The same effective gain and offset as the live view, so an
+            // exported PNG of a pinned range matches the screen.
+            display_gain: self.range_gain_offset().0,
             smoke_gain: self.settings.smoke_gain,
             particle_size: self.settings.particle_size,
             particle_brightness: self.settings.particle_brightness,
+            range_offset: self.range_gain_offset().1,
+            _pad_ro: [0.0; 3],
         };
         self.queue.write_buffer(&self.render_uniform, 0, bytemuck::bytes_of(&p));
 

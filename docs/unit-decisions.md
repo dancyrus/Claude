@@ -136,9 +136,9 @@ Full write-up: `docs/t2a-color-range.md`.
   pinned range onto `display_gain` per frame (every `render.wgsl`
   mapping is linear in it); `render.wgsl` flags bit 1 = swap the
   view's colormap away from its default binding.
-- Asymmetric manual min/max is **deliberately unimplemented** — it
-  needs a per-mode offset in the `render.wgsl` normalization, and only
-  the flags-bit colormap edit was approved.
+- Asymmetric manual min/max was deliberately unimplemented under the
+  shader freeze; it SHIPPED post-v4.1 as queue item 4 (see that
+  section) once the freeze lifted.
 - Range/map controls live in the legend under the color bar, NOT in
   the Results ribbon (no width left at the 900 px minimum). The
   ribbon's display-gain slider disables while the mode's range is
@@ -544,3 +544,52 @@ Branch `claude/queue-1-ribbon-home-x42vvi`. Files: `ui/ribbon.rs`,
 - No bench: only `ui/ribbon.rs` and `ui/theme.rs` changed; no
   perf-sensitive file (`ui/canvas.rs`, `model.rs`, `geomops.rs`,
   `sim.rs`) touched.
+
+## Queue item 4 — asymmetric manual min/max on color ranges
+
+Branch `claude/queue-4-range-minmax-x42vvi`. The first shader edit
+under the lifted freeze.
+
+- **Shader change (`render.wgsl`)**: one uniform appended to
+  `RenderParams` — `range_offset: f32` (+3 pad floats, so the struct
+  stays 16-aligned and matches `RenderParamsRaw` in `sim.rs`) —
+  subtracted from the normalized field value after the gain in the
+  Speed, Vorticity and Pressure arms. Offset 0 reproduces the old
+  mapping bit-for-bit; Auto ranges always send 0, so nothing changes
+  until a user pins an asymmetric window.
+- **Mapping math** (`GpuSim::range_gain_offset`, replacing
+  `range_display_gain`): every mode's `t` is linear in the field
+  value, so an arbitrary `[min, max]` window is a per-frame
+  (gain, offset) pair. Speed sends `min..max` onto 0..1
+  (gain = norm/span, offset = min/span); the diverging modes send it
+  onto −1..1 (gain = norm·2/span… see the inline comments, each arm
+  states its identity). `span = max − min` is clamped ≥ 1e-9.
+- **`FieldRange` gains `min_render`/`min_phys` twins**, maintained by
+  `sync_color_ranges` exactly like the max twins: pinned modes hold
+  `min_phys` and re-derive `min_render`; Auto tracks the natural
+  bottom (0 for Speed, −max for diverging) — which is why untouched
+  scenes look identical.
+- **Constraints**: max stays ≥ 1e-6 (unchanged); min is clamped below
+  max (min ≤ max − 1e-6); Speed's min cannot go below 0 (it colors a
+  magnitude). Both clamps live in the `Cmd` apply arms, so every
+  entry path (UI, scene load) shares them.
+- **UI**: a `min` entry appears under `max` in the legend's Manual
+  mode only. Bottom-of-scale labels (legend AND export sheet) print
+  the real min: Speed keeps the bare "0" until the bottom moves; the
+  diverging modes print a signed value, so the symmetric look is
+  unchanged.
+- **Scene format v10**: v9 + appended `range_min_phys: [f32; 4]`
+  (kept OUT of `SceneRange` so the v7/v8/v9 decode layouts stay
+  byte-exact). v9 and older funnel up with the symmetric legacy
+  bottoms. Round-trip pinned by
+  `v10_roundtrip_persists_asymmetric_range_min` and
+  `v9_bytes_convert_to_v10_with_symmetric_mins`. Bumps start at v11.
+- **Lane extension, recorded**: the queue named only `render.wgsl` +
+  `ui/legend.rs`, but the offset uniform lives in `sim.rs`
+  (`RenderParamsRaw`), the command/persistence in `app.rs`, and the
+  export sheet labels (`ui/export.rs`) must keep matching the screen
+  (pinned invariant). All were touched; nothing else.
+- **Solver re-runs**: both render paths validated by the naga shader
+  tests plus live runs — the paired bench (Euler, full app loop) and
+  a timed default-scene run (LBM); the asymmetric window itself is a
+  visual feature, flagged for the next run-and-look check.

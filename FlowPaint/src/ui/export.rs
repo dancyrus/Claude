@@ -43,6 +43,9 @@ pub(in crate::app) struct ExportInfo {
     pub map: ColorMap,
     pub range_mode: RangeMode,
     pub sat_phys: f32,
+    /// Bottom of the scale (queue item 4): 0 for Speed and −max for
+    /// the diverging modes until a Manual range moves it.
+    pub min_phys: f32,
 }
 
 impl FlowPaintApp {
@@ -78,6 +81,7 @@ impl FlowPaintApp {
                     map: fr.map,
                     range_mode: fr.mode,
                     sat_phys: fr.sat_phys,
+                    min_phys: fr.min_phys,
                 };
                 compose_annotated(canvas, &info)?
             }
@@ -137,8 +141,10 @@ fn solver_title(solver: SolverMode) -> &'static str {
 }
 
 /// Legend header and the bar's end labels. Mirrors `ui/legend.rs`: the
-/// speed scale runs 0 → saturation, vorticity and pressure are
-/// symmetric about zero, and Smoke is a passive tracer with no scale.
+/// speed scale runs min (0 until a Manual range raises it) →
+/// saturation, vorticity and pressure run min → max (symmetric about
+/// zero until a Manual range moves the bottom, queue item 4), and
+/// Smoke is a passive tracer with no scale.
 fn legend_strings(info: &ExportInfo) -> (String, Option<(String, String)>) {
     let map = match info.map {
         ColorMap::Inferno => "Inferno",
@@ -149,6 +155,15 @@ fn legend_strings(info: &ExportInfo) -> (String, Option<(String, String)>) {
         RangeMode::Locked => "Locked",
         RangeMode::Manual => "Manual",
     };
+    // The same label shapes as the on-screen legend, so the sheet and
+    // the panel never disagree.
+    let signed = |v: f32, fmt: fn(f32) -> String| {
+        if v < 0.0 {
+            format!("-{}", fmt(-v))
+        } else {
+            format!("+{}", fmt(v))
+        }
+    };
     match info.mode {
         RenderMode::Dye => (
             "Smoke — passive tracer (arbitrary units)".to_string(),
@@ -156,20 +171,27 @@ fn legend_strings(info: &ExportInfo) -> (String, Option<(String, String)>) {
         ),
         RenderMode::Speed => (
             format!("Speed |u| — {map} · range {range}"),
-            Some(("0".to_string(), format!("≥ {}", fmt_speed(info.sat_phys)))),
+            Some((
+                if info.min_phys == 0.0 {
+                    "0".to_string()
+                } else {
+                    fmt_speed(info.min_phys)
+                },
+                format!("≥ {}", fmt_speed(info.sat_phys)),
+            )),
         ),
         RenderMode::Vorticity => (
             format!("Vorticity ω — {map} · range {range}"),
             Some((
-                format!("-{}", fmt_omega(info.sat_phys)),
-                format!("+{}", fmt_omega(info.sat_phys)),
+                signed(info.min_phys, fmt_omega),
+                signed(info.sat_phys, fmt_omega),
             )),
         ),
         RenderMode::Pressure => (
             format!("Pressure Δp — {map} · range {range}"),
             Some((
-                format!("-{}", fmt_pressure(info.sat_phys)),
-                format!("+{}", fmt_pressure(info.sat_phys)),
+                signed(info.min_phys, fmt_pressure),
+                signed(info.sat_phys, fmt_pressure),
             )),
         ),
     }
@@ -396,6 +418,7 @@ mod tests {
             map: ColorMap::Inferno,
             range_mode,
             sat_phys: 0.27,
+            min_phys: 0.0,
         }
     }
 

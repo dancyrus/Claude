@@ -31,7 +31,7 @@ undo without an explicit decision recorded in
 |---|---|
 | Legacy `wind_tunnel` scenes simulate byte-identically | `legacy_wind_tunnel_projection_is_unchanged` |
 | A wall edge disables the sponge; inlet/outlet keep it | `sponge_disabled_only_by_walls` |
-| Scenes v3 through v9 load; v9 round-trips whole | `v5_bytes_decode_and_convert`, `v6_*`, `v7_*`, `v8_*`, `v9_roundtrip_persists_groups_probes_ranges_edges` |
+| Scenes v3 through v10 load; v10 round-trips whole | `v5_bytes_decode_and_convert`, `v6_*`, `v7_*`, `v8_*`, `v9_*`, `v10_roundtrip_persists_asymmetric_range_min` |
 | Unknown/reserved edge kinds decode safely | `reserved_and_unknown_edge_kinds_decode_safely` |
 | A group can never become its own descendant | `reparent_refuses_cycles`, `sanitize_parents_breaks_cycles_and_dangles` |
 | Transform composition is child first, then each ancestor outward | `composition_is_child_then_ancestors_outward` |

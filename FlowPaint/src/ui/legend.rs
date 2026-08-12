@@ -74,11 +74,17 @@ impl FlowPaintApp {
             let fr = &mut snap.ranges[mode as usize];
             match fr.mode {
                 RangeMode::Locked | RangeMode::Manual => {
-                    fr.sat_render = (fr.sat_phys / k).max(1e-9)
+                    fr.sat_render = (fr.sat_phys / k).max(1e-9);
+                    fr.min_render = fr.min_phys / k;
                 }
                 RangeMode::Auto => {
                     fr.sat_render = auto;
                     fr.sat_phys = fr.sat_render * k;
+                    // The mode's natural bottom (every pre-item-4
+                    // scale): 0 for Speed, symmetric for the rest.
+                    fr.min_render =
+                        if mode == RenderMode::Speed { 0.0 } else { -auto };
+                    fr.min_phys = fr.min_render * k;
                 }
             }
         }
@@ -184,7 +190,7 @@ impl FlowPaintApp {
                     ui.label("Speed |u|");
                     Self::colormap_bar(ui, fr.map);
                     ui.horizontal(|ui| {
-                        super::theme::mono_small(ui, "0".into());
+                        super::theme::mono_small(ui, lo_label(fr.min_phys, fmt_speed));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
@@ -198,11 +204,11 @@ impl FlowPaintApp {
                     ui.label("Vorticity ω (curl)");
                     Self::colormap_bar(ui, fr.map);
                     ui.horizontal(|ui| {
-                        super::theme::mono_small(ui, format!("-{}", fmt_omega(fr.sat_phys)));
+                        super::theme::mono_small(ui, signed_label(fr.min_phys, fmt_omega));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                super::theme::mono_small(ui, format!("+{}", fmt_omega(fr.sat_phys)))
+                                super::theme::mono_small(ui, signed_label(fr.sat_phys, fmt_omega))
                             },
                         );
                     });
@@ -213,13 +219,13 @@ impl FlowPaintApp {
                     ui.label("Pressure Δp (gauge)");
                     Self::colormap_bar(ui, fr.map);
                     ui.horizontal(|ui| {
-                        super::theme::mono_small(ui, format!("-{}", fmt_pressure(fr.sat_phys)));
+                        super::theme::mono_small(ui, signed_label(fr.min_phys, fmt_pressure));
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 super::theme::mono_small(
                                     ui,
-                                    format!("+{}", fmt_pressure(fr.sat_phys)),
+                                    signed_label(fr.sat_phys, fmt_pressure),
                                 )
                             },
                         );
@@ -251,6 +257,7 @@ impl FlowPaintApp {
         // synced twins right before this frame's commands apply.
         let mut set_mode: Option<RangeMode> = None;
         let mut set_phys: Option<f32> = None;
+        let mut set_min: Option<f32> = None;
         let mut set_map: Option<ColorMap> = None;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("range").small().color(super::theme::INK_3));
@@ -310,13 +317,37 @@ impl FlowPaintApp {
                             .custom_parser(move |s| unit.parse(s))
                             .suffix(unit.suffix),
                     )
-                    .on_hover_text(match mode {
-                        RenderMode::Speed => "Speed where the scale saturates; 0 stays the bottom",
-                        _ => "Magnitude where the scale saturates, symmetric about 0",
-                    })
+                    .on_hover_text("Value where the scale ends (the last color)")
                     .changed()
                 {
                     set_phys = Some(v);
+                }
+            });
+            // The bottom of the scale (queue item 4). Its default is
+            // the legacy shape — 0 for Speed, −max for the diverging
+            // modes — so a scene that never touches it looks as before.
+            let mut lo = fr.min_phys;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("min").small().color(super::theme::INK_3));
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut lo)
+                            .range(-1e9..=1e9)
+                            .speed(((fr.sat_phys - fr.min_phys).abs() * 0.01).max(0.001))
+                            .custom_formatter(move |x, _| unit.fmt(x))
+                            .custom_parser(move |s| unit.parse(s))
+                            .suffix(unit.suffix),
+                    )
+                    .on_hover_text(match mode {
+                        RenderMode::Speed => {
+                            "Speed where the scale starts (not below 0); \
+                             lower speeds show the first color"
+                        }
+                        _ => "Value where the scale starts (the first color)",
+                    })
+                    .changed()
+                {
+                    set_min = Some(lo);
                 }
             });
         }
@@ -353,6 +384,9 @@ impl FlowPaintApp {
         if let Some(v) = set_phys {
             cmds.push(Cmd::SetRangeMax(mode, v));
         }
+        if let Some(v) = set_min {
+            cmds.push(Cmd::SetRangeMin(mode, v));
+        }
         if let Some(m) = set_map {
             cmds.push(Cmd::SetColorMap(mode, m));
         }
@@ -385,5 +419,27 @@ impl FlowPaintApp {
                 },
             );
         }
+    }
+}
+
+/// Bottom-of-scale label for Speed (queue item 4): the bare "0"
+/// everyone knows while the bottom is untouched, the formatted value
+/// once a Manual range raised it.
+fn lo_label(v: f32, fmt: impl Fn(f32) -> String) -> String {
+    if v == 0.0 {
+        "0".to_string()
+    } else {
+        fmt(v)
+    }
+}
+
+/// Signed end-of-scale label for the diverging modes: an explicit sign
+/// on a magnitude-formatted value, so the symmetric look stays
+/// "-x … +x" and an asymmetric bottom prints its own sign.
+fn signed_label(v: f32, fmt: impl Fn(f32) -> String) -> String {
+    if v < 0.0 {
+        format!("-{}", fmt(-v))
+    } else {
+        format!("+{}", fmt(v))
     }
 }

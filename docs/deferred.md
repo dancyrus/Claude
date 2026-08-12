@@ -204,19 +204,9 @@ at the bottom before adding anything back.
 - Reasoning: `docs/unit-decisions.md` §T2-C.
 
 ### Asymmetric manual min/max on color ranges
-- Typing both ends of a color scale, instead of one saturation value
-  (Speed's min pinned at 0, Vorticity/Pressure symmetric about 0).
-- **DEFERRED.**
-- Why: the shipped Manual control is the shader-expressible form. An
-  asymmetric range needs a per-mode offset in the `render.wgsl`
-  normalization (two uniforms, or a min/max pair replacing
-  `display_gain`), and only the flags-bit colormap edit was approved
-  under the shader freeze. Verified: `FieldRange` on main holds a
-  single saturation value per mode.
-- Unblocks: an approved `render.wgsl` edit adding the per-mode offset
-  (i.e. the shader freeze lifting for this one uniform).
-- Reasoning: `docs/t2a-color-range.md` §"Report: the remainder";
-  `docs/unit-decisions.md` §T2-A.
+- **SHIPPED** (queue item 4, post-v4.1) — the shader-freeze lift
+  unblocked the `render.wgsl` per-mode offset. Entry kept as a
+  pointer only: `docs/unit-decisions.md` §Queue item 4.
 
 ### Unit-system persistence across sessions
 - Remembering the SI / decimal-inch choice between app runs.

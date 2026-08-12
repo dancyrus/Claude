@@ -92,3 +92,9 @@ uniforms or a `min`/`max` pair replacing `display_gain` for these
 modes), and only the flags-bit colormap edit was approved. The shipped
 Manual control is the shader-expressible form — one max, with Speed's
 min pinned at 0 and Vorticity/Pressure symmetric about 0.
+
+**Queue-item-4 update (post-v4.1):** asymmetric manual min/max is now
+implemented — the shader freeze lifted and `render.wgsl` gained the
+per-mode `range_offset` uniform this report asked for. The min end is
+adjustable in Manual mode; details in `docs/unit-decisions.md`
+§Queue item 4. The report section below is historical.

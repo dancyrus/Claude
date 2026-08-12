@@ -27,6 +27,12 @@ struct RenderParams {
     smoke_gain: f32,   // user gain on smoke brightness
     particle_size: f32,        // half-size of a particle quad, px
     particle_brightness: f32,  // peak particle alpha
+    range_offset: f32, // subtracted from the normalized field value
+                       // after the gain; 0 unless a pinned color range
+                       // has an asymmetric min/max (queue item 4)
+    _pad_r0: f32,
+    _pad_r1: f32,
+    _pad_r2: f32,
 };
 
 const CELL_FLUID: u32 = 0u;
@@ -150,7 +156,8 @@ fn fs_field(@builtin(position) frag: vec4f) -> @location(0) vec4f {
         switch R.mode {
             case MODE_SPEED: {
                 let s = length(sample_vel(g));
-                let t = s * R.display_gain / max(R.inlet_speed * 1.6, 1e-3);
+                let t = s * R.display_gain / max(R.inlet_speed * 1.6, 1e-3)
+                    - R.range_offset;
                 if ((R.flags & 2u) != 0u) {
                     // Sequential data on the diverging map: 0..1 spans
                     // the full blue-white-red ramp.
@@ -165,7 +172,8 @@ fn fs_field(@builtin(position) frag: vec4f) -> @location(0) vec4f {
                 let vu = sample_vel(g + vec2f(0.0, 1.0));
                 let vd = sample_vel(g - vec2f(0.0, 1.0));
                 let curl = 0.5 * ((vr.y - vl.y) - (vu.x - vd.x));
-                let t = curl * R.display_gain * (4.0 / max(R.inlet_speed, 0.02));
+                let t = curl * R.display_gain * (4.0 / max(R.inlet_speed, 0.02))
+                    - R.range_offset;
                 if ((R.flags & 2u) != 0u) {
                     // Diverging data on the sequential map: -1..1 spans
                     // the inferno ramp end to end.
@@ -176,7 +184,7 @@ fn fs_field(@builtin(position) frag: vec4f) -> @location(0) vec4f {
             }
             case MODE_PRESSURE: {
                 let p = density[idx] - 1.0;
-                let t = p * R.display_gain * 25.0;
+                let t = p * R.display_gain * 25.0 - R.range_offset;
                 if ((R.flags & 2u) != 0u) {
                     col = inferno_map(t * 0.5 + 0.5);
                 } else {
