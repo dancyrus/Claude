@@ -10,7 +10,8 @@ Statuses: UNCLAIMED · IN PROGRESS (branch) · DONE.
 ## Parallel-safe — claim any
 
 1. **Ribbon quick-access + Home rebuilt as scene-lifecycle tab**
-   (`ui/ribbon.rs`, `ui/menu.rs`, `ui/theme.rs`) — UNCLAIMED
+   (`ui/ribbon.rs`, `ui/menu.rs`, `ui/theme.rs`) — IN PROGRESS
+   (`claude/queue-1-ribbon-home-x42vvi`)
 2. **Gas properties: combustion-products fluid** (gamma ~1.2,
    a0 ~1620 m/s); widen Euler's `0.2..=2.0` fan range; correct the
    stale CUT entry for the fan cap in `docs/deferred.md`
