@@ -296,3 +296,26 @@ Order-independent result: mean +1.0 % / +0.7 %, p99 −1.3 % / −1.1 %
 default keeps its 100 k tracers — the pin only restores the bench's
 recorded workload (canvas + rasterizer + solver, no tracers), keeping
 every past and future A/B like-for-like.
+
+## Queue item 2 measurement (gas properties: gamma + fan-aware Euler dt)
+
+Paired back-to-back A/B in one session (same container, otherwise
+idle; lavapipe under Xvfb — fresh runtime installs of
+libxkbcommon-x11-0 / mesa-vulkan-drivers, so absolute numbers are not
+comparable to earlier records), both orders, both binaries built
+before any measurement:
+
+```
+A = main ee27ba7, B = item 2 16857e2                mean       p99
+pair 1 (A first): A 1889.86 / 2361.58   B 1840.95 / 2093.29
+pair 2 (B first): B 1858.88 / 2064.45   A 1908.65 / 2239.58
+```
+
+Order-independent result: mean −2.6 % / −2.6 %, p99 −11.4 % / −7.8 %
+— B a touch faster in both orders, inside host spread; no regression.
+Expected: the bench scene (Pinball, tunnel bands at 1x drive) keeps
+`max_fan_env` ≤ 2, so `euler_dt` is byte-identical, and the new
+`flush_geometry` fan rescan runs only on edit frames (the bench edits
+geometry once, at its frame-1 scene build). The A runs' fat max-frame
+outliers (7.7 s / 9.9 s) sat in the first and last run positions —
+the known session-position pattern, not code.
