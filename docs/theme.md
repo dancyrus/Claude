@@ -428,3 +428,23 @@ known session-position pattern, not a regression: both binaries ran
 binary. Expected null result: the bench scene has no Rings object, so
 the new code contributes only match arms on default paths; the union
 walk and subtract_rings run exclusively inside an erase commit.
+
+## Queue item 10 measurement (union/intersect booleans)
+
+Paired back-to-back A/B (same container/lavapipe install as the
+items 2/6/8/9 records; both binaries built first; otherwise idle),
+both orders:
+
+```
+A = main 71c7fcb, B = item 10 93ed230               mean       p99
+pair 1 (A first): A 2161.33 / 10314.23  B 1968.67 / 2708.70
+pair 2 (B first): B 1863.42 / 2582.98   A 1847.27 / 2483.76
+```
+
+Mean deltas flip sign with run order (−8.9 % / +0.9 %) — the session
+-position pattern again, with the first run of the session (an A run)
+visibly disturbed (p99 10.3 s, max 15.2 s). Pair 2, the clean pair,
+is ±0.9 %. No regression — expected: the boolean walks and jitter run
+ONLY inside the inspector button handler; no per-frame path changed
+(the geomops edits are new functions plus the two GH walks' interior
+point tests, which execute only during an erase or a boolean).
