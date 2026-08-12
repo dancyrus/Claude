@@ -408,3 +408,23 @@ arc/spline objects, and rasterize_chain is the old Poly body moved,
 not changed. The A runs again carried the fat max-frame outliers
 (6.1 s / 6.2 s) in the first/last session positions — the known
 session-position pattern.
+
+## Queue item 9 measurement (holes in filled polygons)
+
+Paired back-to-back A/B (same container/lavapipe install as the
+items 2/6/8 records; both binaries built first; otherwise idle),
+both orders:
+
+```
+A = main 9c4db9b, B = item 9 bb047d7                mean       p99
+pair 1 (A first): A 1832.91 / 1976.37   B 1874.88 / 2146.94
+pair 2 (B first): B 1932.24 / 3013.81   A 1982.34 / 3753.44
+```
+
+The mean deltas FLIP SIGN with run order (+2.3 % / −2.5 %) — the
+known session-position pattern, not a regression: both binaries ran
+~4 % slower in the second pair, and the fat max-frame outliers
+(11.3 s / 13.6 s) sat in the session's last two runs regardless of
+binary. Expected null result: the bench scene has no Rings object, so
+the new code contributes only match arms on default paths; the union
+walk and subtract_rings run exclusively inside an erase commit.
