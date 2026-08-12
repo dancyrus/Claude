@@ -948,6 +948,10 @@ pub struct FlowPaintApp {
     /// Always `None` outside that mode — the default workload must not
     /// change (queue item 6).
     bench_osnap_cursor: Option<[f32; 2]>,
+    /// The saved unit-system preference, applied as a `Cmd` on the first
+    /// frame and then never read again (queue item 7). `None` when no
+    /// preference file exists or it holds no unit entry.
+    startup_unit_pref: Option<UnitSystem>,
     /// Eraser radius in cells (0.5-cell floor, the canvas precedent).
     eraser_radius: f32,
     /// Linear-array parameters (Geometry ribbon; session-scoped, not
@@ -1192,6 +1196,7 @@ impl FlowPaintApp {
                 }
             },
             bench_osnap_cursor: None,
+            startup_unit_pref: prefs::load_unit_system(),
             stats_steps_per_s: 0.0,
             stats_sim_steps: 0.0,
             sim_time_s: 0.0,
@@ -1718,6 +1723,18 @@ impl eframe::App for FlowPaintApp {
 
         let mut cmds: Vec<Cmd> = Vec::new();
 
+        // Unit-system preference (queue item 7): applied once, on the
+        // first frame — after that the ribbon toggle is the only writer
+        // and each toggle saves back. A display preference only; scene
+        // files never carry it (T2-D decision, unchanged). Bench runs
+        // drop it: a host-local inch preference would change the
+        // formatted-text workload and break like-for-like numbers.
+        if let Some(pref) = self.startup_unit_pref.take() {
+            if self.bench.is_none() {
+                cmds.push(Cmd::SetUnitSystem(pref));
+            }
+        }
+
         if self.bench.is_some() {
             self.bench_tick(ctx, &mut cmds);
         }
@@ -1964,7 +1981,62 @@ fn apply_cmd(sim: &mut GpuSim, cmd: Cmd, app: &mut FlowPaintApp) {
             sim.settings.show_extent = on;
             sim.write_render_uniform();
         }
-        Cmd::SetUnitSystem(s) => sim.settings.unit_system = s,
+        Cmd::SetUnitSystem(s) => {
+            sim.settings.unit_system = s;
+            // Persist as a user preference (queue item 7). Best-effort:
+            // a machine without a writable config dir just stays
+            // session-scoped, exactly the old behavior.
+            prefs::save_unit_system(s);
+        }
+    }
+}
+
+/// User preferences (queue item 7): a tiny std-only key=value file —
+/// deliberately NOT a dependency (no `dirs`, no eframe `persistence`
+/// feature; both would compile new crates, which is an escalation).
+/// Display preferences only; anything that changes simulation results
+/// belongs in the scene file, not here.
+mod prefs {
+    use super::UnitSystem;
+    use std::path::PathBuf;
+
+    fn path() -> Option<PathBuf> {
+        // XDG on unix, APPDATA on windows; no env var, no persistence.
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
+            })
+            .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
+        Some(base.join("flowpaint").join("prefs.txt"))
+    }
+
+    pub(super) fn load_unit_system() -> Option<UnitSystem> {
+        let text = std::fs::read_to_string(path()?).ok()?;
+        text.lines().find_map(|l| {
+            let v = l.strip_prefix("unit_system=")?.trim();
+            super::ui::units::unit_system_from_pref(v)
+        })
+    }
+
+    pub(super) fn save_unit_system(s: UnitSystem) {
+        let Some(p) = path() else { return };
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Rewrite only this key; any other line (a future preference,
+        // a hand edit) survives.
+        let mut out: String = std::fs::read_to_string(&p)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.starts_with("unit_system=") && !l.trim().is_empty())
+            .map(|l| format!("{l}\n"))
+            .collect();
+        out.push_str(&format!(
+            "unit_system={}\n",
+            super::ui::units::unit_system_pref_str(s)
+        ));
+        let _ = std::fs::write(&p, out);
     }
 }
 

@@ -46,6 +46,26 @@ pub(crate) fn set_unit_system(s: UnitSystem) {
     INCH_MODE.store(s == UnitSystem::DecimalInch, Ordering::Relaxed);
 }
 
+/// Preference-file spelling of a unit system (queue item 7). Stable
+/// strings — they live in users' config files, so renaming one is a
+/// compatibility break, not a refactor.
+pub(crate) fn unit_system_pref_str(s: UnitSystem) -> &'static str {
+    match s {
+        UnitSystem::Si => "si",
+        UnitSystem::DecimalInch => "inch",
+    }
+}
+
+/// Inverse of `unit_system_pref_str`; unknown spellings (a newer build's
+/// value, hand edits) yield None and the default stands.
+pub(crate) fn unit_system_from_pref(v: &str) -> Option<UnitSystem> {
+    match v {
+        "si" => Some(UnitSystem::Si),
+        "inch" => Some(UnitSystem::DecimalInch),
+        _ => None,
+    }
+}
+
 /// Tests that flip the process-wide mirror serialize on this (cargo
 /// runs test fns in parallel); every such test must hold it and leave
 /// the mirror on SI.
@@ -409,5 +429,19 @@ mod tests {
 
         set_unit_system(UnitSystem::Si);
         assert_eq!(fmt_len(0.0254), "2.5 cm");
+    }
+
+    /// The preference-file spellings round-trip and stay stable, and
+    /// unknown values fall back to None (the default then stands) —
+    /// queue item 7.
+    #[test]
+    fn unit_pref_strings_round_trip_and_reject_unknown() {
+        for s in [UnitSystem::Si, UnitSystem::DecimalInch] {
+            assert_eq!(unit_system_from_pref(unit_system_pref_str(s)), Some(s));
+        }
+        assert_eq!(unit_system_pref_str(UnitSystem::Si), "si");
+        assert_eq!(unit_system_pref_str(UnitSystem::DecimalInch), "inch");
+        assert_eq!(unit_system_from_pref("feet"), None);
+        assert_eq!(unit_system_from_pref(""), None);
     }
 }

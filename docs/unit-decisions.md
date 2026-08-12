@@ -601,3 +601,24 @@ Branch `claude/queue-1-ribbon-home-x42vvi`. Files: `ui/ribbon.rs`,
 - The sweep frequencies (0.037/0.023 rad per frame) are deliberately
   incommensurate with the 300-frame window so the cursor never
   settles into a short loop.
+
+## Queue item 7 (unit-system persistence)
+
+- **Std-only prefs file**, `$XDG_CONFIG_HOME|$HOME/.config|%APPDATA%
+  /flowpaint/prefs.txt`, `key=value` lines — deliberately NOT eframe's
+  `persistence` feature and NOT a `dirs` crate: both compile new
+  crates, and a new dependency is an escalation. `mod prefs` in
+  app.rs; saves rewrite only their own key so future preferences and
+  hand edits survive.
+- **Display preference only.** The scene file still never carries the
+  unit system (T2-D decision, unchanged). The saved value is applied
+  as one `Cmd::SetUnitSystem` on the first frame; every ribbon toggle
+  writes the preference back at the `apply_cmd` site.
+- **Bench runs ignore the preference** — a host-local inch setting
+  would lengthen every formatted readout and quietly change the
+  measured text workload; `--bench`/`--bench-osnap` always run the SI
+  default.
+- Pref spellings `si` / `inch` are stable file format
+  (`ui/units.rs::unit_system_pref_str`); unknown values load as None
+  and the default stands (round-trip pinned by
+  `unit_pref_strings_round_trip_and_reject_unknown`).
