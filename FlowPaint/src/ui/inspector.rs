@@ -554,6 +554,30 @@ impl FlowPaintApp {
                 self.delete_selected();
             }
         });
+        // Booleans (queue item 10): filled closed shapes only; the
+        // result takes the primary's properties, one undo step.
+        ui.horizontal(|ui| {
+            if ui
+                .button("Union")
+                .on_hover_text(
+                    "Merge the selected filled shapes into one object. \
+                     The result takes the last-selected shape's properties.",
+                )
+                .clicked()
+            {
+                self.boolean_selected(true);
+            }
+            if ui
+                .button("Intersect")
+                .on_hover_text(
+                    "Keep only the area all selected filled shapes share. \
+                     The result takes the last-selected shape's properties.",
+                )
+                .clicked()
+            {
+                self.boolean_selected(false);
+            }
+        });
         self.mirror_array_rows(ui);
         // Z-order for the set (also in the tree's context menu).
         ui.horizontal(|ui| {

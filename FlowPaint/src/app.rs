@@ -3079,6 +3079,138 @@ impl FlowPaintApp {
             .collect()
     }
 
+    /// Union / intersect the selection (queue item 10). Operands are
+    /// FILLED single-ring shapes (rect, ellipse, closed polygon, closed
+    /// spline), taken in WORLD space; the result lives at the root in
+    /// world coordinates and inherits the primary (last-selected)
+    /// operand's properties. One `apply_erase` group = one undo entry.
+    /// Shapes with holes are refused for now — deferred with reasons in
+    /// docs/deferred.md.
+    pub(in crate::app) fn boolean_selected(&mut self, union: bool) {
+        self.finish_gesture();
+        let ids = self.editable_selection();
+        let mut rings: Vec<Vec<[f32; 2]>> = Vec::new();
+        let mut used: Vec<u64> = Vec::new();
+        let mut skipped_holes = false;
+        let mut skipped_other = false;
+        for &id in &ids {
+            let Some(i) = self.model.find(id) else { continue };
+            let o = &self.model.objects[i];
+            let local: Option<Vec<[f32; 2]>> = match &o.shape {
+                Shape::Rect { .. } | Shape::Ellipse { .. } if o.filled => {
+                    Some(shape_ring(&o.shape))
+                }
+                Shape::Poly { pts, closed: true } if o.filled => Some(pts.clone()),
+                Shape::Spline { pts, closed: true } if o.filled => {
+                    Some(crate::model::sample_spline(pts, true))
+                }
+                Shape::Rings { .. } => {
+                    skipped_holes = true;
+                    None
+                }
+                _ => {
+                    skipped_other = true;
+                    None
+                }
+            };
+            if let Some(mut r) = local {
+                let abs = self.model.parent_abs(id);
+                for p in &mut r {
+                    *p = abs.apply(*p);
+                }
+                rings.push(r);
+                used.push(id);
+            }
+        }
+        if rings.len() < 2 {
+            self.status = if skipped_holes {
+                "Boolean operations do not take shapes with holes yet — \
+                 select two or more filled shapes without holes."
+                    .into()
+            } else if skipped_other {
+                "Boolean operations need two or more FILLED closed shapes \
+                 (rectangle, ellipse, polygon or closed spline)."
+                    .into()
+            } else {
+                "Select two or more filled shapes first.".into()
+            };
+            return;
+        }
+        // Primary = the last-selected usable operand: its properties
+        // carry to the result.
+        let primary = *used.last().unwrap();
+        let pi = self.model.find(primary).unwrap();
+        let template = self.model.objects[pi].clone();
+        let make = |shape: Shape, id: u64| -> SketchObject {
+            let mut o = template.clone();
+            o.id = id;
+            o.shape = shape;
+            o.filled = true;
+            o.parent = None;
+            o
+        };
+        let results: Vec<SketchObject> = if union {
+            let objs =
+                crate::geomops::union_rings(&rings, crate::geomops::MIN_AREA);
+            if objs.is_empty() {
+                self.status = "The union came out empty — nothing changed.".into();
+                return;
+            }
+            objs.into_iter()
+                .enumerate()
+                .map(|(k, mut obj_rings)| {
+                    let id = if k == 0 { primary } else { self.model.fresh_id() };
+                    if obj_rings.len() == 1 {
+                        make(
+                            Shape::Poly { pts: obj_rings.pop().unwrap(), closed: true },
+                            id,
+                        )
+                    } else {
+                        make(Shape::Rings { rings: obj_rings }, id)
+                    }
+                })
+                .collect()
+        } else {
+            let pieces =
+                crate::geomops::intersect_rings(&rings, crate::geomops::MIN_AREA);
+            if pieces.is_empty() {
+                self.status =
+                    "The shapes share no area — the intersection is empty. \
+                     Nothing changed."
+                        .into();
+                return;
+            }
+            pieces
+                .into_iter()
+                .enumerate()
+                .map(|(k, pts)| {
+                    let id = if k == 0 { primary } else { self.model.fresh_id() };
+                    make(Shape::Poly { pts, closed: true }, id)
+                })
+                .collect()
+        };
+        let n_in = used.len();
+        let n_out = results.len();
+        let mut changes: Vec<(u64, Vec<SketchObject>)> = vec![(primary, results)];
+        for &id in &used {
+            if id != primary {
+                changes.push((id, Vec::new()));
+            }
+        }
+        self.deselect_all();
+        self.model.apply_erase(changes);
+        self.select_only(primary);
+        let verb = if union { "Union" } else { "Intersection" };
+        self.status = format!(
+            "{verb} of {n_in} shapes -> {n_out} object(s). One undo step.{}",
+            if skipped_holes || skipped_other {
+                " Skipped shapes that are not filled closed outlines."
+            } else {
+                ""
+            }
+        );
+    }
+
     /// Paint bucket (U4): flood-fill the model's rasterized grid from
     /// the click, trace the contour, emit a filled polygon of the
     /// current default material. The traced boundary is a SNAPSHOT (the

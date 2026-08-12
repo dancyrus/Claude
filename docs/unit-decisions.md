@@ -796,3 +796,34 @@ Internal debt from the T2-A/T2-B concurrent tracks, paid. Branch
 - The paint bucket is UNCHANGED: it still traces the outer contour,
   so fluid sealed in a hollow island fills over — recorded in
   invariants.md as the remaining known gap.
+
+## Queue item 10 (union and intersect booleans)
+
+- **Selection ops in the inspector's multi panel** (the mirror/array
+  precedent), filled single-ring shapes only: rect, ellipse, closed
+  filled polygon, closed filled spline (its curve samples). Operands
+  convert to WORLD rings via `parent_abs`; the result lives at the
+  root with the PRIMARY (last-selected) operand's properties; commits
+  through `apply_erase`, so one undo entry — the pinned invariant
+  covers it.
+- **Hole-carrying `Rings` operands are refused** with a specific
+  message — soup-level boolean algebra (holes on the INPUT side) is
+  deferred with reasons in `docs/deferred.md`. Union can still OUTPUT
+  `Rings`: two C shapes enclose a donut void, and pinched-off islands
+  survive by even-odd.
+- **Intersect = A − (A − B), folded pairwise** — two passes of the
+  tested difference walk, no third Greiner–Hormann walk; containment
+  and grazing short-circuit first. Union folds crossing fills until
+  none cross, absorbs contained fills (except islands sitting in
+  enclosed voids), then shaves surviving voids against the operands.
+- **Operand jitter** (`jitter_ring`, 1e-4 relative about the
+  centroid, keyed by operand index) is the boolean twin of the
+  eraser's capsule-radius jitter: grid-snapped drawings put operand
+  edges exactly collinear, and coincident boundaries give the walks
+  no transversal crossings. Pinned by the collinear case inside
+  `union_merges_and_encloses_voids`.
+- **Void-shave degeneracy, solved twice over**: an enclosed void's
+  boundary coincides with its creators' boundaries, so before shaving
+  it is shrunk 2e-4 inward (`shrink_ring`) — creators then shave to a
+  no-op — and a piece-area guard (> 1.01x the void) rejects any walk
+  output that "grew", keeping the void unchanged instead.

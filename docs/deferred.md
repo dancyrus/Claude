@@ -261,3 +261,16 @@ Verified shipped on main; do not re-add them here:
 
 Out-of-scope *defects* are tracked in `docs/punchlist.md`, not here —
 this file indexes deliberately cut or deferred features and work.
+
+### Booleans on shapes that already have holes
+- Union/intersect where an operand is a `Shape::Rings` (carved) part.
+- **DEFERRED** (queue item 10 shipped single-ring operands only).
+- Why: input-side holes need boolean algebra over even-odd ring
+  soups on BOTH sides — every pairwise walk becomes a soup-vs-soup
+  composition with parity bookkeeping. The output side already
+  handles holes (a union can produce a donut); only operands are
+  restricted, and the refusal message says exactly that.
+- Unblocks: a soup-level union/difference built on the same
+  Greiner–Hormann walks (`docs/unit-decisions.md` §Queue item 10 has
+  the shape of it).
+- Reasoning: `docs/unit-decisions.md` §Queue item 10.

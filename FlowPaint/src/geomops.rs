@@ -1009,6 +1009,305 @@ pub fn trace_mask(mask: &[bool], w: usize, h: usize) -> Vec<[f32; 2]> {
 }
 
 
+// --- Union / intersect booleans — queue item 10 ----------------------
+
+/// Union of simple CCW rings (queue item 10). Input: one ring per
+/// operand, WORLD coordinates. Output: objects in the rings_fragments
+/// convention — each entry one outermost ring plus the hole rings the
+/// merge enclosed (two C shapes make a donut). Disjoint operands come
+/// out as separate objects.
+pub fn union_rings(operands: &[Vec<[f32; 2]>], min_area: f32) -> Vec<Vec<Vec<[f32; 2]>>> {
+    let mut fills: Vec<Vec<[f32; 2]>> = Vec::new();
+    for (k, r) in operands.iter().enumerate() {
+        let mut r = r.clone();
+        dedupe_ring(&mut r);
+        if r.len() >= 3 && signed_area(&r).abs() >= min_area {
+            if signed_area(&r) < 0.0 {
+                r.reverse();
+            }
+            jitter_ring(&mut r, k);
+            fills.push(r);
+        }
+    }
+    let mut holes: Vec<Vec<[f32; 2]>> = Vec::new();
+
+    // Merge any crossing pair until none cross. The pair count only
+    // shrinks, so this terminates.
+    'merge: loop {
+        for i in 0..fills.len() {
+            for j in (i + 1)..fills.len() {
+                if rings_cross(&fills[i], &fills[j]) {
+                    let b = fills.remove(j);
+                    let a = fills.remove(i);
+                    match poly_union_convex(&a, &b) {
+                        ConvexUnion::Untouched => {
+                            // b inside a (or the crossing was a graze).
+                            fills.push(a);
+                        }
+                        ConvexUnion::Clip => fills.push(b),
+                        ConvexUnion::Pieces(mut ps) => {
+                            ps.sort_by(|x, y| {
+                                signed_area(y)
+                                    .abs()
+                                    .partial_cmp(&signed_area(x).abs())
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            fills.push(ps.remove(0));
+                            // The rest are voids the merge enclosed.
+                            holes.extend(ps);
+                        }
+                    }
+                    continue 'merge;
+                }
+            }
+        }
+        break;
+    }
+    // Containment: a fill wholly inside another is absorbed — UNLESS
+    // it sits inside an enclosed void, where it survives as an island
+    // (even-odd represents it; think a disk floating in a donut hole).
+    let mut keep = vec![true; fills.len()];
+    for i in 0..fills.len() {
+        let in_a_hole = holes.iter().any(|h| point_in_polygon(fills[i][0], h));
+        if in_a_hole {
+            continue;
+        }
+        for j in 0..fills.len() {
+            if i != j && keep[i] && keep[j] && point_in_polygon(fills[i][0], &fills[j])
+            {
+                keep[i] = false;
+            }
+        }
+    }
+    let fills: Vec<Vec<[f32; 2]>> =
+        fills.into_iter().zip(keep).filter(|(_, k)| *k).map(|(f, _)| f).collect();
+    // An enclosed void survives only where no operand covers it: shave
+    // every overlapping operand off, drop it if one swallows it.
+    let jittered_ops: Vec<Vec<[f32; 2]>> = operands
+        .iter()
+        .enumerate()
+        .map(|(k, r)| {
+            let mut r = r.clone();
+            jitter_ring(&mut r, k);
+            r
+        })
+        .collect();
+    let mut final_holes: Vec<Vec<[f32; 2]>> = Vec::new();
+    for mut h in holes {
+        // The void's boundary COINCIDES with the boundaries of the
+        // operands that enclosed it — shaving against them would feed
+        // the walk pure collinear degeneracy. Shrink the void a hair
+        // (inward, off every creator's boundary): creators then neither
+        // cross nor contain it and shave to a no-op; a genuine third
+        // operand bulging into the void still crosses transversally.
+        shrink_ring(&mut h);
+        let h_area = signed_area(&h).abs();
+        let mut parts = vec![h];
+        for op in &jittered_ops {
+            let mut next = Vec::new();
+            for part in parts {
+                if rings_cross(&part, op) {
+                    match poly_minus_convex(&part, op) {
+                        ConvexSub::Untouched => next.push(part),
+                        ConvexSub::Erased => {}
+                        ConvexSub::Hole => next.push(part),
+                        ConvexSub::Pieces(ps) => {
+                            // Degeneracy guard: pieces of (void − op)
+                            // can never exceed the void. If they do,
+                            // the walk chewed on coincident edges —
+                            // keep the void unchanged.
+                            let total: f32 =
+                                ps.iter().map(|p| signed_area(p).abs()).sum();
+                            if total > h_area * 1.01 {
+                                next.push(part);
+                            } else {
+                                next.extend(ps);
+                            }
+                        }
+                    }
+                } else if point_in_polygon(part[0], op) {
+                    // Void covered whole: it was material after all.
+                } else {
+                    next.push(part);
+                }
+            }
+            parts = next;
+        }
+        final_holes.extend(parts);
+    }
+    // Group: outermost fills anchor objects; each takes the surviving
+    // voids inside it, and any island fill sitting in one of those
+    // voids rides along (even-odd nesting in one object).
+    let outermost: Vec<usize> = (0..fills.len())
+        .filter(|&i| {
+            !(0..fills.len()).any(|j| j != i && point_in_polygon(fills[i][0], &fills[j]))
+        })
+        .collect();
+    let mut objects: Vec<Vec<Vec<[f32; 2]>>> = Vec::new();
+    for &fi in &outermost {
+        let f = &fills[fi];
+        let mut obj = vec![f.clone()];
+        for h in &final_holes {
+            if h.len() >= 3
+                && signed_area(h).abs() >= min_area
+                && point_in_polygon(h[0], f)
+            {
+                obj.push(h.clone());
+                for (gi, g) in fills.iter().enumerate() {
+                    if gi != fi && point_in_polygon(g[0], h) {
+                        obj.push(g.clone());
+                    }
+                }
+            }
+        }
+        objects.push(obj);
+    }
+    objects.sort_by(|a, b| {
+        signed_area(&b[0])
+            .abs()
+            .partial_cmp(&signed_area(&a[0]).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    objects
+}
+
+/// Intersection of simple CCW rings (queue item 10), folded pairwise:
+/// the common area of ALL operands, as simple pieces (an intersection
+/// of simple rings cannot enclose a void). Empty when nothing is
+/// common.
+pub fn intersect_rings(
+    operands: &[Vec<[f32; 2]>],
+    min_area: f32,
+) -> Vec<Vec<[f32; 2]>> {
+    let mut norm: Vec<Vec<[f32; 2]>> = Vec::new();
+    for (k, r) in operands.iter().enumerate() {
+        let mut r = r.clone();
+        dedupe_ring(&mut r);
+        if r.len() < 3 {
+            return Vec::new();
+        }
+        if signed_area(&r) < 0.0 {
+            r.reverse();
+        }
+        jitter_ring(&mut r, k);
+        norm.push(r);
+    }
+    if norm.is_empty() {
+        return Vec::new();
+    }
+    let mut pieces: Vec<Vec<[f32; 2]>> = vec![norm[0].clone()];
+    for b in &norm[1..] {
+        let mut next: Vec<Vec<[f32; 2]>> = Vec::new();
+        for a in pieces {
+            if rings_cross(&a, b) {
+                // a ∩ b = a − (a − b): both steps are the tested
+                // difference walk, no third walk needed.
+                let outside: Vec<Vec<[f32; 2]>> = match poly_minus_convex(&a, b) {
+                    ConvexSub::Untouched => {
+                        // Graze only — fall back to containment.
+                        if point_in_polygon(a[0], b) {
+                            next.push(a);
+                        }
+                        continue;
+                    }
+                    ConvexSub::Erased => Vec::new(),
+                    ConvexSub::Hole => {
+                        // b strictly inside a.
+                        next.push(b.clone());
+                        continue;
+                    }
+                    ConvexSub::Pieces(ps) => ps,
+                };
+                let mut inner = vec![a];
+                for o in &outside {
+                    let mut nn = Vec::new();
+                    for piece in inner {
+                        match poly_minus_convex(&piece, o) {
+                            ConvexSub::Untouched => nn.push(piece),
+                            ConvexSub::Erased => {}
+                            ConvexSub::Hole => nn.push(piece),
+                            ConvexSub::Pieces(ps) => nn.extend(ps),
+                        }
+                    }
+                    inner = nn;
+                }
+                next.extend(inner);
+            } else if point_in_polygon(a[0], b) {
+                next.push(a); // a wholly inside b
+            } else if point_in_polygon(b[0], &a) {
+                next.push(b.clone()); // b wholly inside a
+            }
+            // else disjoint: contributes nothing
+        }
+        pieces = next;
+        if pieces.is_empty() {
+            return Vec::new();
+        }
+    }
+    let mut out: Vec<Vec<[f32; 2]>> = Vec::new();
+    for mut p in pieces {
+        dedupe_ring(&mut p);
+        if p.len() >= 3 && signed_area(&p).abs() >= min_area {
+            out.push(p);
+        }
+    }
+    out.sort_by(|a, b| {
+        signed_area(b)
+            .abs()
+            .partial_cmp(&signed_area(a).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+/// Deterministic sub-cell scale jitter about the centroid, keyed by
+/// operand index — the boolean twin of the eraser's capsule-radius
+/// jitter: snapped drawings put operand edges EXACTLY collinear, and
+/// coincident boundaries have no transversal crossings for the walks
+/// to work with. 1e-4 relative is far below a cell at any sane size
+/// and far above the weld epsilon at typical coordinates.
+fn jitter_ring(r: &mut [[f32; 2]], k: usize) {
+    let f = 1.0 + 1e-4 * ((k % 7) as f32 + 1.0);
+    let mut c = [0.0f32, 0.0];
+    for p in r.iter() {
+        c[0] += p[0];
+        c[1] += p[1];
+    }
+    let n = r.len().max(1) as f32;
+    c = [c[0] / n, c[1] / n];
+    for p in r.iter_mut() {
+        p[0] = c[0] + (p[0] - c[0]) * f;
+        p[1] = c[1] + (p[1] - c[1]) * f;
+    }
+}
+
+/// Pull a ring a hair inward about its centroid (see the void-shave
+/// note in union_rings).
+fn shrink_ring(r: &mut [[f32; 2]]) {
+    let f = 1.0 - 2e-4;
+    let mut c = [0.0f32, 0.0];
+    for p in r.iter() {
+        c[0] += p[0];
+        c[1] += p[1];
+    }
+    let n = r.len().max(1) as f32;
+    c = [c[0] / n, c[1] / n];
+    for p in r.iter_mut() {
+        p[0] = c[0] + (p[0] - c[0]) * f;
+        p[1] = c[1] + (p[1] - c[1]) * f;
+    }
+}
+
+/// True when two ring boundaries transversally cross.
+fn rings_cross(a: &[[f32; 2]], b: &[[f32; 2]]) -> bool {
+    let (an, bn) = (a.len(), b.len());
+    (0..an).any(|i| {
+        (0..bn).any(|j| {
+            segs_intersect(a[i], a[(i + 1) % an], b[j], b[(j + 1) % bn]).is_some()
+        })
+    })
+}
+
 // --- Multi-ring (holes) subtraction — queue item 9 -------------------
 
 /// Result of subtracting a stroke from an even-odd multi-ring region.
@@ -1599,5 +1898,80 @@ mod tests {
         let contour = trace_mask(&mask, w, h);
         assert!((signed_area(&contour).abs() - 1.0).abs() < 1e-3);
     }
-}
 
+    /// Queue item 10: union merges overlap, encloses voids as hole
+    /// rings, and leaves disjoint operands as separate objects.
+    #[test]
+    fn union_merges_and_encloses_voids() {
+        let a = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let b = vec![[5.0, -3.0], [15.0, -3.0], [15.0, 7.0], [5.0, 7.0]];
+        let objs = union_rings(&[a.clone(), b], MIN_AREA);
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0].len(), 1, "plain merge has no holes");
+        let area = signed_area(&objs[0][0]).abs();
+        assert!((area - 165.0).abs() < 1.5, "200 - 35 overlap: {area}");
+
+        // Grid-snapped, exactly-collinear edges (the everyday case the
+        // jitter exists for): same result shape, no degeneracy.
+        let b2 = vec![[5.0, 0.0], [15.0, 0.0], [15.0, 10.0], [5.0, 10.0]];
+        let objs = union_rings(&[a.clone(), b2], MIN_AREA);
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0].len(), 1);
+        let area = signed_area(&objs[0][0]).abs();
+        assert!((area - 150.0).abs() < 1.5, "collinear merge: {area}");
+
+        // Two interlocking shapes enclose a void: donut.
+        let c1 = vec![
+            [0.0, 0.0], [30.0, 0.0], [30.0, 30.0], [0.0, 30.0],
+            [0.0, 20.0], [20.0, 20.0], [20.0, 10.0], [0.0, 10.0],
+        ];
+        let c2 = vec![
+            [-2.0, 8.0], [8.0, 8.0], [8.0, 22.0], [-2.0, 22.0],
+        ];
+        let objs = union_rings(&[c1, c2], MIN_AREA);
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0].len(), 2, "outer + enclosed void");
+        assert!(!point_in_rings([14.0, 15.0], &objs[0]), "void stays void");
+        assert!(point_in_rings([25.0, 15.0], &objs[0]));
+        assert!(point_in_rings([4.0, 15.0], &objs[0]), "the bridging bar");
+
+        // Disjoint: two objects.
+        let d1 = vec![[0.0, 0.0], [5.0, 0.0], [5.0, 5.0], [0.0, 5.0]];
+        let d2 = vec![[20.0, 0.0], [25.0, 0.0], [25.0, 5.0], [20.0, 5.0]];
+        assert_eq!(union_rings(&[d1, d2], MIN_AREA).len(), 2);
+    }
+
+    /// Queue item 10: intersect keeps only the common area; disjoint
+    /// operands intersect to nothing; containment short-circuits.
+    #[test]
+    fn intersect_keeps_common_area() {
+        let a = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let b = vec![[5.0, -3.0], [15.0, -3.0], [15.0, 7.0], [5.0, 7.0]];
+        let ps = intersect_rings(&[a.clone(), b.clone()], MIN_AREA);
+        assert_eq!(ps.len(), 1);
+        let area = signed_area(&ps[0]).abs();
+        assert!((area - 35.0).abs() < 1.0, "5x7 overlap: {area}");
+        // Every point of the piece is in both operands.
+        assert!(point_in_polygon([7.0, 3.0], &ps[0]));
+        assert!(!point_in_polygon([2.0, 5.0], &ps[0]));
+
+        let d = vec![[40.0, 0.0], [45.0, 0.0], [45.0, 5.0], [40.0, 5.0]];
+        assert!(intersect_rings(&[a.clone(), d], MIN_AREA).is_empty());
+
+        let inner = vec![[2.0, 2.0], [8.0, 2.0], [8.0, 8.0], [2.0, 8.0]];
+        let ps = intersect_rings(&[a, inner.clone()], MIN_AREA);
+        assert_eq!(ps.len(), 1);
+        assert!((signed_area(&ps[0]).abs() - 36.0).abs() < 0.5);
+
+        // Three operands fold: only the triple-common region survives.
+        let x = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let y = vec![[4.0, -1.0], [14.0, -1.0], [14.0, 9.0], [4.0, 9.0]];
+        let z = vec![[-1.0, 4.0], [9.0, 4.0], [9.0, 14.0], [-1.0, 14.0]];
+        let ps = intersect_rings(&[x, y, z], MIN_AREA);
+        assert_eq!(ps.len(), 1);
+        let area = signed_area(&ps[0]).abs();
+        assert!((area - 25.0).abs() < 1.0, "5x5 core: {area}");
+    }
+
+
+}
